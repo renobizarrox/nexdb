@@ -18,6 +18,8 @@
 #include <string.h>
 #include <strings.h>
 #include <stdio.h>
+#include <unistd.h>
+#include <errno.h>
 #include <stdarg.h>
 #include <ctype.h>
 #include <math.h>
@@ -117,6 +119,28 @@ static double row_strength_value(const Row *row, int64_t now)
 
 /* Extra per-row score slot used by RECALL; keyed positionally by the caller. */
 static double g_score_hint = 0.0;
+
+/* Used by eval_expr to run subqueries. Set before statement execution. */
+DB *g_db = NULL;
+
+/* Reinforcement is turned off during subquery/insert-select execution. */
+static int g_reinforce = 1;
+
+/* Join context: when set, eval_expr resolves qualified column references
+ * (e.g. "t.col") against these tables/rows instead of the single Table/Row
+ * passed directly. */
+static const Table **g_join_tables = NULL;
+static const Row   **g_join_rows   = NULL;
+static const char  **g_join_aliases = NULL;
+static int          g_join_ntables = 0;
+
+void exec_set_join_ctx(const Table **tables, const Row **rows, const char **aliases, int n)
+{
+    g_join_tables  = tables;
+    g_join_rows    = rows;
+    g_join_aliases = aliases;
+    g_join_ntables = n;
+}
 
 /* Recursively evaluate an expression against one row (or aggregate context). */
 int eval_expr(const Expr *e, const Row *row, const Table *t, int64_t now,
@@ -223,6 +247,35 @@ int eval_expr(const Expr *e, const Row *row, const Table *t, int64_t now,
     }
 
     case EX_COL: {
+        /* qualified column reference: table.col */
+        if (e->col_table[0]) {
+            if (!g_join_tables || !g_join_rows) {
+                snprintf(err, MAX_ERR,
+                         "qualified column '%s.%s' used outside a join",
+                         e->col_table, e->col);
+                return -1;
+            }
+            for (int ti = 0; ti < g_join_ntables; ti++) {
+                const Table *ct = g_join_tables[ti];
+                if (strcasecmp(e->col_table, ct->name) == 0 ||
+                    (g_join_aliases && g_join_aliases[ti] &&
+                     strcasecmp(e->col_table, g_join_aliases[ti]) == 0)) {
+                    int idx = table_col_index(ct, e->col);
+                    if (idx < 0) {
+                        snprintf(err, MAX_ERR, "no column '%s' in table '%s'",
+                                 e->col, ct->name);
+                        return -1;
+                    }
+                    if (idx < g_join_rows[ti]->ncols) {
+                        *out = val_copy(&g_join_rows[ti]->v[idx]);
+                    }
+                    return 0;
+                }
+            }
+            snprintf(err, MAX_ERR, "unknown table '%s' in column reference",
+                     e->col_table);
+            return -1;
+        }
         int pc = pseudo_col(e->col);
         if (pc != -1) {
             switch (pc) {
@@ -277,19 +330,113 @@ int eval_expr(const Expr *e, const Row *row, const Table *t, int64_t now,
         Value lv;
         if (eval_expr(e->l, row, t, now, &lv, err) < 0) return -1;
         int found = 0;
-        for (int i = 0; i < e->nitems && !found; i++) {
-            Value rv;
-            if (eval_expr(e->items[i], row, t, now, &rv, err) < 0) {
-                val_clear(&lv);
-                return -1;
+
+        if (e->sub) {
+            /* IN (SELECT ...) */
+            if (!g_db) { val_clear(&lv); snprintf(err, MAX_ERR, "no database"); return -1; }
+            int save_reinforce = g_reinforce;
+            g_reinforce = 0;
+            const Value *save_agg = g_agg_values;
+            int save_agg_count = g_agg_count;
+            const Table **save_jt = g_join_tables;
+            const Row **save_jr = g_join_rows;
+            const char **save_ja = g_join_aliases;
+            int save_jn = g_join_ntables;
+            double save_score = g_score_hint;
+            g_agg_values = NULL;
+            g_agg_count = 0;
+            g_join_tables = NULL;
+            g_join_rows = NULL;
+            g_join_aliases = NULL;
+            g_join_ntables = 0;
+            g_score_hint = 0.0;
+
+            Capture cap = {0};
+            int rc = exec_select_into(g_db, e->sub, &cap, err);
+
+            g_agg_values = save_agg;
+            g_agg_count = save_agg_count;
+            g_join_tables = save_jt;
+            g_join_rows = save_jr;
+            g_join_aliases = save_ja;
+            g_join_ntables = save_jn;
+            g_score_hint = save_score;
+            g_reinforce = save_reinforce;
+
+            if (rc < 0) { val_clear(&lv); return -1; }
+            for (int i = 0; i < cap.nrows && !found; i++) {
+                int ok;
+                if (val_compare(&lv, &cap.cells[i * cap.ncols], &ok) == 0 && ok == 1)
+                    found = 1;
             }
-            int ok;
-            if (val_compare(&lv, &rv, &ok) == 0 && ok == 1) found = 1;
-            val_clear(&rv);
+            capture_free(&cap);
+        } else {
+            for (int i = 0; i < e->nitems && !found; i++) {
+                Value rv;
+                if (eval_expr(e->items[i], row, t, now, &rv, err) < 0) {
+                    val_clear(&lv);
+                    return -1;
+                }
+                int ok;
+                if (val_compare(&lv, &rv, &ok) == 0 && ok == 1) found = 1;
+                val_clear(&rv);
+            }
         }
+
         int isnull = (lv.tag == T_NULL);
         val_clear(&lv);
         *out = isnull ? val_null() : val_bit(e->negated ? !found : found);
+        return 0;
+    }
+
+    case EX_SUBQUERY: {
+        if (!e->sub || !g_db) {
+            snprintf(err, MAX_ERR, "empty subquery");
+            return -1;
+        }
+        int save_reinforce = g_reinforce;
+        g_reinforce = 0;
+        const Value *save_agg = g_agg_values;
+        int save_agg_count = g_agg_count;
+        const Table **save_jt = g_join_tables;
+        const Row **save_jr = g_join_rows;
+        const char **save_ja = g_join_aliases;
+        int save_jn = g_join_ntables;
+        double save_score = g_score_hint;
+        g_agg_values = NULL;
+        g_agg_count = 0;
+        g_join_tables = NULL;
+        g_join_rows = NULL;
+        g_join_aliases = NULL;
+        g_join_ntables = 0;
+        g_score_hint = 0.0;
+
+        Capture cap = {0};
+        int rc = exec_select_into(g_db, e->sub, &cap, err);
+
+        g_agg_values = save_agg;
+        g_agg_count = save_agg_count;
+        g_join_tables = save_jt;
+        g_join_rows = save_jr;
+        g_join_aliases = save_ja;
+        g_join_ntables = save_jn;
+        g_score_hint = save_score;
+        g_reinforce = save_reinforce;
+
+        if (rc < 0) return -1;
+
+        if (e->subq_type == SUBQ_EXISTS) {
+            *out = val_bit(cap.nrows > 0);
+            capture_free(&cap);
+            return 0;
+        }
+
+        /* scalar subquery */
+        if (cap.nrows == 0 || cap.ncols == 0)
+            *out = val_null();
+        else
+            *out = val_copy(&cap.cells[0]);
+        capture_free(&cap);
         return 0;
     }
 
@@ -410,6 +557,29 @@ int row_matches(const Expr *where, const Row *row, const Table *t,
     *match = val_truthy(&v);
     val_clear(&v);
     return 0;
+}
+
+/* Multi-table version of row_matches for joins. */
+int row_matches_join(const Expr *where, const Table **tables,
+                     const Row **rows, const char **aliases, int ntables,
+                     int64_t now, int *match, char *err)
+{
+    if (!where) { *match = 1; return 0; }
+    /* set up join context so qualified column refs resolve */
+    const Table **sav_t = g_join_tables;
+    const Row   **sav_r = g_join_rows;
+    const char  **sav_a = g_join_aliases;
+    int           sav_n = g_join_ntables;
+    exec_set_join_ctx(tables, rows, aliases, ntables);
+
+    /* evaluate using the first table as primary (qualified refs use ctx) */
+    Value v;
+    int rc = eval_expr(where, rows[0], tables[0], now, &v, err);
+    if (rc == 0) *match = val_truthy(&v);
+    val_clear(&v);
+
+    exec_set_join_ctx(sav_t, sav_r, sav_a, sav_n);
+    return rc;
 }
 
 /* --------------------------------------------------------- row set + sort */
@@ -582,7 +752,6 @@ static char *dupf(const char *fmt, ...)
 /* Observer mode. Reading normally strengthens a row, which is the whole point,
  * but it also means you cannot inspect the memory without changing it. With
  * this off, queries leave strength and associations exactly as they were. */
-static int g_reinforce = 1;
 
 void exec_set_reinforce(int on) { g_reinforce = on; }
 int  exec_reinforce_enabled(void) { return g_reinforce; }
@@ -652,11 +821,49 @@ static int lower_contains(const char *hay, const char *needle)
     return 0;
 }
 
+/* Levenshtein distance between two null-terminated strings (case-sensitive). */
+static int levenshtein(const char *a, const char *b)
+{
+    size_t na = strlen(a), nb = strlen(b);
+    /* Use a single row of (nb+1) ints for O(min(na,nb)) memory. */
+    if (na < nb) { const char *t = a; a = b; b = t; size_t n = na; na = nb; nb = n; }
+    int *row = malloc(sizeof(int) * (nb + 1));
+    if (!row) return (int)na; /* fallback: max distance */
+    for (size_t j = 0; j <= nb; j++) row[j] = (int)j;
+    for (size_t i = 1; i <= na; i++) {
+        int prev = row[0];
+        row[0] = (int)i;
+        for (size_t j = 1; j <= nb; j++) {
+            int cost = (a[i - 1] == b[j - 1]) ? 0 : 1;
+            int ins = row[j - 1] + 1;
+            int del = row[j] + 1;
+            int sub = prev + cost;
+            int best = ins < del ? ins : del;
+            if (sub < best) best = sub;
+            prev = row[j];
+            row[j] = best;
+        }
+    }
+    int dist = row[nb];
+    free(row);
+    return dist;
+}
+
+/* Maximum edit-distance threshold for fuzzy term matching. */
+static int fuzzy_thresh(int wordlen)
+{
+    if (wordlen <= 4) return 0;       /* short words: exact only */
+    if (wordlen <= 7) return 1;       /* 5-7 chars: 1 typo */
+    return 2;                          /* 8+ chars: 2 typos */
+}
+
 /* How well does this row match the phrase, on text content alone? */
 static double lexical_score(const Row *r, char terms[][64], int nterms)
 {
     double hits = 0;
     for (int ti = 0; ti < nterms; ti++) {
+        int term_len = (int)strlen(terms[ti]);
+        int thresh = fuzzy_thresh(term_len);
         for (int c = 0; c < r->ncols; c++) {
             const Value *v = &r->v[c];
             if (v->tag == T_NULL) continue;
@@ -665,6 +872,24 @@ static double lexical_score(const Row *r, char terms[][64], int nterms)
             const char *hay = (v->tag == T_TEXT && v->s) ? v->s : buf;
             if (hay == buf) val_format(v, buf, sizeof buf);
             if (lower_contains(hay, terms[ti])) { hits += 1.0; break; }
+            /* if no exact substring match, try fuzzy match against each word */
+            if (thresh > 0) {
+                int found = 0;
+                const char *p = hay;
+                while (*p && !found) {
+                    while (*p && !isalnum((unsigned char)*p)) p++;
+                    if (!*p) break;
+                    char word[64];
+                    int k = 0;
+                    while (*p && (isalnum((unsigned char)*p) || *p == '_')) {
+                        if (k < 63) word[k++] = (char)tolower((unsigned char)*p);
+                        p++;
+                    }
+                    word[k] = 0;
+                    if (k > 0 && levenshtein(terms[ti], word) <= thresh) { found = 1; }
+                }
+                if (found) { hits += 0.8; break; }
+            }
         }
     }
     return hits;
@@ -1315,7 +1540,7 @@ static int exec_truncate(DB *db, Stmt *s, char *err)
     Table *t = cat_find(db, s->table);
     if (!t) { snprintf(err, MAX_ERR, "unknown table '%s'", s->table); return -1; }
 
-    RowRef *refs = NULL;
+    /* Collect RIDs for mem_forget before freeing pages. */
     uint64_t *rids = NULL;
     int n = 0, cap = 0;
     Scan sc;
@@ -1324,21 +1549,15 @@ static int exec_truncate(DB *db, Stmt *s, char *err)
     while (scan_next(&sc, &r)) {
         if (n == cap) {
             cap = cap ? cap * 2 : 64;
-            RowRef *nr = realloc(refs, sizeof(RowRef) * (size_t)cap);
             uint64_t *ni = realloc(rids, sizeof(uint64_t) * (size_t)cap);
-            if (!nr || !ni) {
-                free(nr ? nr : refs); free(ni ? ni : rids);
-                row_clear(&r);
-                snprintf(err, MAX_ERR, "out of memory");
-                return -1;
-            }
-            refs = nr; rids = ni;
+            if (!ni) { free(rids); row_clear(&r); snprintf(err, MAX_ERR, "out of memory"); return -1; }
+            rids = ni;
         }
-        refs[n] = r.ref;
-        rids[n] = r.rid;
-        n++;
+        rids[n++] = r.rid;
         row_clear(&r);
     }
+
+    /* Destroy B-tree indexes. */
     for (int i = 0; i < t->nindexes; i++) {
         if (t->indexes[i].root) {
             btree_destroy(db, t->indexes[i].root);
@@ -1347,11 +1566,11 @@ static int exec_truncate(DB *db, Stmt *s, char *err)
         }
     }
     t->nindexes = 0;
-    for (int i = 0; i < n; i++) {
-        heap_delete(db, t, refs[i]);
-        mem_forget_row(db, rids[i]);
-    }
-    free(refs);
+
+    /* Free all heap pages. */
+    heap_free_pages(db, t);
+
+    for (int i = 0; i < n; i++) mem_forget_row(db, rids[i]);
     free(rids);
     printf("(%d row%s removed)\n", n, n == 1 ? "" : "s");
     return db_flush_catalog(db);
@@ -1367,6 +1586,53 @@ static int exec_alter(DB *db, Stmt *s, char *err)
     if (!t) { snprintf(err, MAX_ERR, "unknown table '%s'", s->table); return -1; }
 
     int adding = (s->kind == ST_ALTER_ADD);
+
+    /* RENAME COLUMN — metadata only, no data rewrite */
+    if (s->kind == ST_ALTER_RENAME) {
+        int idx = table_col_index(t, s->cols[0].name);
+        if (idx < 0) {
+            snprintf(err, MAX_ERR, "no column '%s' in table '%s'",
+                     s->cols[0].name, t->name);
+            return -1;
+        }
+        if (table_col_index(t, s->cols[1].name) >= 0) {
+            snprintf(err, MAX_ERR, "column '%s' already exists in '%s'",
+                     s->cols[1].name, t->name);
+            return -1;
+        }
+        if (s->cols[1].name[0] == '_') {
+            snprintf(err, MAX_ERR, "column names beginning with '_' are reserved");
+            return -1;
+        }
+        snprintf(t->cols[idx].name, MAX_NAME, "%s", s->cols[1].name);
+        printf("table '%s': column '%s' renamed to '%s'\n",
+               t->name, s->cols[0].name, s->cols[1].name);
+        return db_flush_catalog(db);
+    }
+
+    /* ALTER COLUMN TYPE — metadata only, no data rewrite */
+    if (s->kind == ST_ALTER_TYPE) {
+        int idx = table_col_index(t, s->cols[0].name);
+        if (idx < 0) {
+            snprintf(err, MAX_ERR, "no column '%s' in table '%s'",
+                     s->cols[0].name, t->name);
+            return -1;
+        }
+        Column *c = &t->cols[idx];
+        uint8_t old_type = c->type;
+        uint8_t old_sub  = c->sub;
+        uint32_t old_max = c->maxlen;
+        c->type   = s->cols[0].type;
+        c->sub    = s->cols[0].sub;
+        c->maxlen = s->cols[0].maxlen;
+        /* preserve is_datetime if target is TEXT */
+        if (c->type != T_TEXT) c->is_datetime = 0;
+        /* if an index exists on this column the type change may invalidate it */
+        (void)old_type; (void)old_sub; (void)old_max;
+        printf("table '%s': column '%s' type changed\n", t->name, s->cols[0].name);
+        return db_flush_catalog(db);
+    }
+
     int dropidx = -1;
 
     if (adding) {
@@ -1896,11 +2162,93 @@ static int exec_show_links(DB *db, Stmt *s)
     return 0;
 }
 
+/* ----------------------------------------------------------- VACUUM */
+
+/* Rewrite the entire database into a fresh file then atomically swap,
+ * reclaiming all free space and defragmenting pages. */
+static int exec_vacuum(DB *db, char *err)
+{
+    char tmp[512];
+    snprintf(tmp, sizeof tmp, "%s.vacuum", db->path);
+
+    /* flush everything to the current file first */
+    if (links_flush(db) < 0 || db_flush_catalog(db) < 0 || db_sync(db) < 0) {
+        snprintf(err, MAX_ERR, "%s", db->err);
+        return -1;
+    }
+
+    /* open a fresh database at the temp path */
+    DB ndb;
+    memset(&ndb, 0, sizeof ndb);
+    if (db_open(&ndb, tmp) < 0) {
+        snprintf(err, MAX_ERR, "cannot create temp database for VACUUM: %s", ndb.err);
+        return -1;
+    }
+    ndb.next_rid = db->next_rid;
+
+    /* recreate every table and copy indexes */
+    for (int i = 0; i < db->cat.ntables; i++) {
+        Table *ot = &db->cat.tables[i];
+        if (!cat_create(&ndb, ot->name, ot->cols, ot->ncols)) {
+            snprintf(err, MAX_ERR, "VACUUM: %s", ndb.err);
+            db_close(&ndb); unlink(tmp);
+            return -1;
+        }
+        Table *nt = cat_find(&ndb, ot->name);
+        for (int ki = 0; ki < ot->nindexes; ki++) {
+            if (ot->indexes[ki].valid)
+                table_ensure_index(&ndb, nt, ot->indexes[ki].col);
+        }
+        Scan sc;
+        Row r;
+        scan_init(&sc, db, ot);
+        while (scan_next(&sc, &r)) {
+            /* heap_insert will use the row's existing rid since it's non-zero */
+            if (heap_insert(&ndb, nt, &r) < 0) {
+                snprintf(err, MAX_ERR, "VACUUM: %s", ndb.err);
+                row_clear(&r); db_close(&ndb); unlink(tmp);
+                return -1;
+            }
+            row_clear(&r);
+        }
+    }
+
+    /* copy associative memory links */
+    for (uint32_t i = 0; i < db->links.n; i++) {
+        Link *lk = &db->links.e[i];
+        if (lk->a && lk->b)
+            mem_link_set(&ndb, lk->a, lk->b, lk->w);
+    }
+
+    /* close the new database (flushes its catalog and links) */
+    db_close(&ndb);
+
+    /* atomically swap files: close old, rename temp over it, reopen */
+    db_close(db);
+
+    if (rename(tmp, db->path) < 0) {
+        snprintf(err, MAX_ERR, "VACUUM: cannot swap files: %s", strerror(errno));
+        /* try to reopen the original */
+        unlink(tmp);
+        db_open(db, db->path);
+        return -1;
+    }
+
+    if (db_open(db, db->path) < 0) {
+        snprintf(err, MAX_ERR, "VACUUM: cannot reopen database: %s", db->err);
+        return -1;
+    }
+
+    printf("vacuum complete (file compacted)\n");
+    return 0;
+}
+
 /* ----------------------------------------------------------- dispatcher */
 
 /* Top-level statement dispatcher: CREATE, SELECT, RECALL, CHECKPOINT, etc. */
 int exec_stmt(DB *db, Stmt *s, char *err)
 {
+    g_db = db;
     switch (s->kind) {
     case ST_NOOP:
         return 0;
@@ -1952,7 +2300,9 @@ int exec_stmt(DB *db, Stmt *s, char *err)
     }
 
     case ST_ALTER_ADD:
-    case ST_ALTER_DROP:  return exec_alter(db, s, err);
+    case ST_ALTER_DROP:
+    case ST_ALTER_RENAME:
+    case ST_ALTER_TYPE:  return exec_alter(db, s, err);
     case ST_TRUNCATE:    return exec_truncate(db, s, err);
     case ST_INSERT:      return s->sub ? exec_insert_select(db, s, err)
                                        : exec_insert(db, s, err);
@@ -1979,6 +2329,109 @@ int exec_stmt(DB *db, Stmt *s, char *err)
         }
         printf("checkpoint complete (flushed to disk)\n");
         return 0;
+
+    case ST_BEGIN:
+        if (db->txn_active) {
+            snprintf(err, MAX_ERR, "already in a transaction");
+            return -1;
+        }
+        db->txn_active = 1;
+        db->undo_depth = 0;
+        return 0;
+
+    case ST_COMMIT:
+        if (!db->txn_active) {
+            snprintf(err, MAX_ERR, "no active transaction");
+            return -1;
+        }
+        if (links_flush(db) < 0) {
+            snprintf(err, MAX_ERR, "%s", db->err);
+            return -1;
+        }
+        if (db_flush_catalog(db) < 0) {
+            snprintf(err, MAX_ERR, "%s", db->err);
+            return -1;
+        }
+        pager_undo_commit(db);
+        return 0;
+
+    case ST_ROLLBACK:
+        if (!db->txn_active) {
+            snprintf(err, MAX_ERR, "no active transaction");
+            return -1;
+        }
+        pager_undo_rollback(db);
+        return 0;
+
+    case ST_EXPLAIN: {
+        Stmt *inner = s->sub;
+        if (!inner) {
+            printf("EXPLAIN of empty statement\n");
+            return 0;
+        }
+        printf("QUERY PLAN\n----------\n");
+        switch (inner->kind) {
+        case ST_SELECT:
+        case ST_RECALL:
+            printf("SCAN TABLE %s\n", inner->table[0] ? inner->table : "(subquery)");
+            if (inner->where) printf("WHERE (filter expression)\n");
+            if (inner->njoins > 0) {
+                for (int j = 0; j < inner->njoins; j++)
+                    printf("JOIN %s (%s)\n", inner->joins[j].table,
+                           inner->joins[j].type == JOIN_LEFT ? "LEFT" : "INNER");
+            }
+            if (inner->ngroup > 0) printf("GROUP BY %d key(s)\n", inner->ngroup);
+            if (inner->norder > 0) printf("ORDER BY %d key(s)\n", inner->norder);
+            if (inner->top >= 0)   printf("TOP %d\n", inner->top);
+            int naggs = 0;
+            for (int i = 0; i < inner->nitems; i++)
+                if (inner->items[i].e && inner->items[i].e->kind == EX_AGG) naggs++;
+            if (naggs) printf("AGGREGATE %d function(s)\n", naggs);
+            break;
+        case ST_INSERT:
+            printf("INSERT INTO %s\n", inner->table);
+            if (inner->sub) printf("  (from SELECT)\n");
+            else            printf("  %d row(s)\n", inner->nrows);
+            break;
+        case ST_UPDATE:
+            printf("UPDATE %s", inner->table);
+            if (inner->where) printf(" WHERE (filter)");
+            printf("\n");
+            break;
+        case ST_DELETE:
+            printf("DELETE FROM %s", inner->table);
+            if (inner->where) printf(" WHERE (filter)");
+            printf("\n");
+            break;
+        case ST_CREATE:
+            printf("CREATE TABLE %s (%d cols)\n", inner->table, inner->ncols);
+            break;
+        case ST_DROP:
+            printf("DROP TABLE %s\n", inner->table);
+            break;
+        case ST_TRUNCATE:
+            printf("TRUNCATE TABLE %s\n", inner->table);
+            break;
+        default:
+            printf("%s\n", inner->kind == ST_ALTER_ADD ? "ALTER TABLE ADD COLUMN" :
+                   inner->kind == ST_ALTER_DROP ? "ALTER TABLE DROP COLUMN" :
+                   inner->kind == ST_ALTER_RENAME ? "ALTER TABLE RENAME COLUMN" :
+                   inner->kind == ST_ALTER_TYPE ? "ALTER TABLE ALTER COLUMN" :
+                   inner->kind == ST_VACUUM ? "VACUUM" :
+                   inner->kind == ST_CHECKPOINT ? "CHECKPOINT" :
+                   inner->kind == ST_REMEMBER ? "REMEMBER" :
+                   inner->kind == ST_FORGET ? "FORGET" :
+                   inner->kind == ST_BEGIN ? "BEGIN" :
+                   inner->kind == ST_COMMIT ? "COMMIT" :
+                   inner->kind == ST_ROLLBACK ? "ROLLBACK" :
+                   inner->kind == ST_PRINT ? "PRINT" : "<unknown>");
+            break;
+        }
+        return 0;
+    }
+
+    case ST_VACUUM:
+        return exec_vacuum(db, err);
     }
     snprintf(err, MAX_ERR, "unimplemented statement");
     return -1;
@@ -1987,6 +2440,7 @@ int exec_stmt(DB *db, Stmt *s, char *err)
 /* Parse and execute every statement in a SQL script until EOF or error. */
 int exec_script(DB *db, const char *sql, int echo)
 {
+    g_db = db;
     Lexer lx;
     char err[MAX_ERR];
     int failures = 0;
@@ -2009,6 +2463,10 @@ int exec_script(DB *db, const char *sql, int echo)
         if (echo) printf("\n");
         if (exec_stmt(db, &st, err) < 0) {
             fprintf(stderr, "error: %s\n", err[0] ? err : "statement failed");
+            if (db->txn_active) {
+                pager_undo_rollback(db);
+                fprintf(stderr, "transaction rolled back\n");
+            }
             failures++;
         }
         stmt_free(&st);

@@ -34,6 +34,11 @@ void expr_free(Expr *e)
     expr_free(e->r);
     for (int i = 0; i < e->nitems; i++) expr_free(e->items[i]);
     for (int i = 0; i < e->nargs; i++) expr_free(e->args[i]);
+    if (e->sub) {
+        stmt_free(e->sub);
+        free(e->sub);
+        e->sub = NULL;
+    }
     val_clear(&e->lit);
     free(e);
 }
@@ -45,6 +50,8 @@ void stmt_free(Stmt *s)
     s->where = NULL;
     expr_free(s->having);
     s->having = NULL;
+    for (int i = 0; i < s->njoins; i++) expr_free(s->joins[i].on);
+    s->njoins = 0;
     for (int i = 0; i < s->nrows; i++)
         for (int j = 0; j < s->row_width[i]; j++)
             expr_free(s->rows[i][j]);
@@ -133,6 +140,11 @@ static int parse_type(Lexer *lx, Column *c, char *err);
 static int parse_select(Lexer *lx, Stmt *s, char *err);
 static Expr *parse_case(Lexer *lx, char *err);
 static Expr *parse_cast(Lexer *lx, char *err);
+
+/* Flag set by parse_primary when it encounters "table.*" — the select-list
+ * loop reads it to turn the item into a qualified star expansion. */
+static int  g_sel_star_qual = 0;
+static char g_sel_star_name[MAX_NAME];
 
 /* Map a name to AggKind, or AGG_NONE if it is not an aggregate function. */
 int agg_kind_of(const char *name)
@@ -224,6 +236,19 @@ static Expr *parse_primary(Lexer *lx, char *err)
 
     if (tok_is_punct(t, "(")) {
         if (adv(lx, err) < 0) return NULL;
+    /* subquery (SELECT ...) */
+    if (tok_is_kw(&lx->cur, "SELECT")) {
+        if (adv(lx, err) < 0) return NULL;
+        struct Stmt *sub = calloc(1, sizeof(struct Stmt));
+        if (!sub) { snprintf(err, MAX_ERR, "out of memory"); return NULL; }
+        if (parse_select(lx, sub, err) < 0) { free(sub); return NULL; }
+        if (eat_punct(lx, ")", err) < 0) { stmt_free(sub); free(sub); return NULL; }
+            Expr *e = ex_new(EX_SUBQUERY);
+            if (!e) { stmt_free(sub); free(sub); snprintf(err, MAX_ERR, "out of memory"); return NULL; }
+            e->sub = sub;
+            e->subq_type = SUBQ_SCALAR;
+            return e;
+        }
         Expr *inner = parse_or(lx, err);
         if (!inner) return NULL;
         if (eat_punct(lx, ")", err) < 0) { expr_free(inner); return NULL; }
@@ -270,6 +295,35 @@ static Expr *parse_primary(Lexer *lx, char *err)
          * kind because they cannot be evaluated one row at a time. */
         char name[MAX_NAME];
         snprintf(name, sizeof name, "%s", t->text);
+
+        /* Check for qualified column: table.col or table.* */
+        if (tok_is_punct(lex_peek(lx), ".")) {
+            char qual[MAX_NAME];
+            snprintf(qual, sizeof qual, "%s", name);
+            if (adv(lx, err) < 0) return NULL;  /* ident */
+            if (adv(lx, err) < 0) return NULL;  /* '.' */
+            if (tok_is_punct(&lx->cur, "*")) {
+                /* table.* — signal to select-list loop */
+                g_sel_star_qual = 1;
+                snprintf(g_sel_star_name, MAX_NAME, "%s", qual);
+                if (adv(lx, err) < 0) return NULL;  /* '*' */
+                Expr *d = ex_new(EX_LIT);
+                if (d) d->lit = val_null();
+                return d;
+            }
+            if (lx->cur.kind != TK_IDENT) {
+                snprintf(err, MAX_ERR, "expected column name after '%s.' on line %d",
+                         qual, lx->cur.line);
+                return NULL;
+            }
+            Expr *e = ex_new(EX_COL);
+            if (!e) { snprintf(err, MAX_ERR, "out of memory"); return NULL; }
+            snprintf(e->col_table, MAX_NAME, "%s", qual);
+            snprintf(e->col, MAX_NAME, "%s", lx->cur.text);
+            if (adv(lx, err) < 0) { expr_free(e); return NULL; }
+            return e;
+        }
+
         int is_agg = agg_kind_of(name) != AGG_NONE;
 
         if (tok_is_punct(lex_peek(lx), "(") && (is_agg || func_exists(name))) {
@@ -280,6 +334,11 @@ static Expr *parse_primary(Lexer *lx, char *err)
             if (!e) { snprintf(err, MAX_ERR, "out of memory"); return NULL; }
             snprintf(e->fname, MAX_NAME, "%s", name);
             e->agg = (uint8_t)agg_kind_of(name);
+
+            if (tok_is_kw(&lx->cur, "DISTINCT")) {
+                if (adv(lx, err) < 0) { expr_free(e); return NULL; }
+                e->agg_distinct = 1;
+            }
 
             if (is_agg && tok_is_punct(&lx->cur, "*")) {
                 if (e->agg != AGG_COUNT) {
@@ -386,6 +445,34 @@ static Expr *parse_add(Lexer *lx, char *err)
 
 static Expr *parse_pred(Lexer *lx, char *err)
 {
+    /* EXISTS (subquery) — unary prefix, doesn't consume a left operand */
+    {
+        int ex_neg = 0;
+        if (tok_is_kw(&lx->cur, "NOT") && tok_is_kw(lex_peek(lx), "EXISTS")) {
+            ex_neg = 1;
+            if (adv(lx, err) < 0) return NULL;
+        }
+        if (tok_is_kw(&lx->cur, "EXISTS")) {
+            if (adv(lx, err) < 0) return NULL;
+            if (eat_punct(lx, "(", err) < 0) return NULL;
+            if (!tok_is_kw(&lx->cur, "SELECT")) {
+                snprintf(err, MAX_ERR, "EXISTS requires a subquery (SELECT ...)");
+                return NULL;
+            }
+            if (adv(lx, err) < 0) return NULL;
+            struct Stmt *sub = calloc(1, sizeof(struct Stmt));
+            if (!sub) { snprintf(err, MAX_ERR, "out of memory"); return NULL; }
+            if (parse_select(lx, sub, err) < 0) { free(sub); return NULL; }
+            if (eat_punct(lx, ")", err) < 0) { stmt_free(sub); free(sub); return NULL; }
+            Expr *e = ex_new(EX_SUBQUERY);
+            if (!e) { stmt_free(sub); free(sub); snprintf(err, MAX_ERR, "out of memory"); return NULL; }
+            e->sub = sub;
+            e->subq_type = SUBQ_EXISTS;
+            e->negated = ex_neg;
+            return e;
+        }
+    }
+
     Expr *l = parse_add(lx, err);
     if (!l) return NULL;
 
@@ -451,6 +538,23 @@ static Expr *parse_pred(Lexer *lx, char *err)
     if (tok_is_kw(&lx->cur, "IN")) {
         if (adv(lx, err) < 0) { expr_free(l); return NULL; }
         if (eat_punct(lx, "(", err) < 0) { expr_free(l); return NULL; }
+
+        /* IN (SELECT ...) — subquery */
+        if (tok_is_kw(&lx->cur, "SELECT")) {
+            if (adv(lx, err) < 0) { expr_free(l); return NULL; }
+            struct Stmt *sub = calloc(1, sizeof(struct Stmt));
+            if (!sub) { expr_free(l); snprintf(err, MAX_ERR, "out of memory"); return NULL; }
+            if (parse_select(lx, sub, err) < 0) { free(sub); expr_free(l); return NULL; }
+            if (eat_punct(lx, ")", err) < 0) { stmt_free(sub); free(sub); expr_free(l); return NULL; }
+            Expr *e = ex_new(EX_IN);
+            if (!e) { stmt_free(sub); free(sub); expr_free(l); snprintf(err, MAX_ERR, "out of memory"); return NULL; }
+            e->l = l;
+            e->negated = negated;
+            e->sub = sub;
+            e->nitems = 0;  /* signals subquery instead of list */
+            return e;
+        }
+
         Expr *e = ex_new(EX_IN);
         if (!e) { expr_free(l); snprintf(err, MAX_ERR, "out of memory"); return NULL; }
         e->l = l;
@@ -904,15 +1008,26 @@ static int parse_select(Lexer *lx, Stmt *s, char *err)
             it->is_star = 1;
             if (adv(lx, err) < 0) return -1;
         } else {
+            /* Reset star-qualifier flag before parsing expression */
+            g_sel_star_qual = 0;
             it->e = parse_or(lx, err);
             if (!it->e) return -1;
-            label_for(it->e, it->label, MAX_NAME);
+            /* Check if parse_primary encountered "table.*" */
+            if (g_sel_star_qual) {
+                it->col_star = 1;
+                snprintf(it->col_table, MAX_NAME, "%s", g_sel_star_name);
+                expr_free(it->e);
+                it->e = NULL;
+                g_sel_star_qual = 0;
+            } else {
+                label_for(it->e, it->label, MAX_NAME);
+            }
         }
 
         if (tok_is_kw(&lx->cur, "AS")) {
             if (adv(lx, err) < 0) return -1;
             if (take_ident(lx, it->alias, MAX_NAME, err) < 0) return -1;
-        } else if (lx->cur.kind == TK_IDENT && !it->is_star &&
+        } else if (lx->cur.kind == TK_IDENT && !it->is_star && !it->col_star &&
                    !tok_is_kw(&lx->cur, "FROM") &&
                    !tok_is_kw(&lx->cur, "GROUP") &&
                    !tok_is_kw(&lx->cur, "ORDER") &&
@@ -932,6 +1047,52 @@ static int parse_select(Lexer *lx, Stmt *s, char *err)
     if (tok_is_kw(&lx->cur, "FROM")) {
         if (adv(lx, err) < 0) return -1;
         if (take_ident(lx, s->table, MAX_NAME, err) < 0) return -1;
+        /* optional alias for the primary table */
+        if (lx->cur.kind == TK_IDENT &&
+            !tok_is_kw(&lx->cur, "WHERE") &&
+            !tok_is_kw(&lx->cur, "GROUP") &&
+            !tok_is_kw(&lx->cur, "ORDER") &&
+            !tok_is_kw(&lx->cur, "HAVING") &&
+            !tok_is_kw(&lx->cur, "INNER") &&
+            !tok_is_kw(&lx->cur, "LEFT") &&
+            !tok_is_kw(&lx->cur, "JOIN") &&
+            !tok_is_kw(&lx->cur, "ON") &&
+            !tok_is_kw(&lx->cur, "GO")) {
+            if (take_ident(lx, s->alias, MAX_NAME, err) < 0) return -1;
+        }
+        /* parse JOIN clauses */
+        while (tok_is_kw(&lx->cur, "JOIN") ||
+               tok_is_kw(&lx->cur, "INNER") ||
+               tok_is_kw(&lx->cur, "LEFT")) {
+            if (s->njoins >= MAX_JOINS) FAIL("too many JOINs (max %d)", MAX_JOINS);
+            Join *j = &s->joins[s->njoins];
+
+            if (tok_is_kw(&lx->cur, "LEFT")) {
+                j->type = JOIN_LEFT;
+                if (adv(lx, err) < 0) return -1;
+            } else {
+                j->type = JOIN_INNER;
+            }
+            if (tok_is_kw(&lx->cur, "INNER")) {
+                if (adv(lx, err) < 0) return -1;
+            }
+            if (eat_kw(lx, "JOIN", err) < 0) return -1;
+            if (take_ident(lx, j->table, MAX_NAME, err) < 0) return -1;
+            /* optional alias */
+            if (lx->cur.kind == TK_IDENT &&
+                !tok_is_kw(&lx->cur, "ON") &&
+                !tok_is_kw(&lx->cur, "WHERE") &&
+                !tok_is_kw(&lx->cur, "GROUP") &&
+                !tok_is_kw(&lx->cur, "ORDER") &&
+                !tok_is_kw(&lx->cur, "HAVING") &&
+                !tok_is_kw(&lx->cur, "GO")) {
+                if (take_ident(lx, j->alias, MAX_NAME, err) < 0) return -1;
+            }
+            if (eat_kw(lx, "ON", err) < 0) return -1;
+            j->on = parse_or(lx, err);
+            if (!j->on) return -1;
+            s->njoins++;
+        }
         s->has_from = 1;
     } else {
         for (int i = 0; i < s->nitems; i++)
@@ -941,6 +1102,11 @@ static int parse_select(Lexer *lx, Stmt *s, char *err)
 
     if (parse_where(lx, s, err) < 0) return -1;
     if (parse_group_by(lx, s, err) < 0) return -1;
+    if (tok_is_kw(&lx->cur, "HAVING")) {
+        if (adv(lx, err) < 0) return -1;
+        s->having = parse_or(lx, err);
+        if (!s->having) return -1;
+    }
     if (parse_order_by(lx, s, err) < 0) return -1;
 
     if (!s->has_from && (s->where || s->ngroup || s->having))
@@ -1098,8 +1264,26 @@ int parse_stmt(Lexer *lx, Stmt *out, char *err)
             out->kind = ST_ALTER_DROP;
             rc = take_ident(lx, out->cols[0].name, MAX_NAME, err);
             out->ncols = 1;
+        } else if (tok_is_kw(&lx->cur, "RENAME")) {
+            if (adv(lx, err) < 0) return -1;
+            if (opt_kw(lx, "COLUMN", err) < 0) return -1;
+            out->kind = ST_ALTER_RENAME;
+            if (take_ident(lx, out->cols[0].name, MAX_NAME, err) < 0) return -1;
+            if (eat_kw(lx, "TO", err) < 0) return -1;
+            rc = take_ident(lx, out->cols[1].name, MAX_NAME, err);
+            out->ncols = 2;
+        } else if (tok_is_kw(&lx->cur, "ALTER")) {
+            if (adv(lx, err) < 0) return -1;
+            if (opt_kw(lx, "COLUMN", err) < 0) return -1;
+            out->kind = ST_ALTER_TYPE;
+            memset(&out->cols[0], 0, sizeof(Column));
+            if (take_ident(lx, out->cols[0].name, MAX_NAME, err) < 0) return -1;
+            if (eat_kw(lx, "TYPE", err) < 0) return -1;
+            if (parse_type(lx, &out->cols[0], err) < 0) return -1;
+            out->ncols = 1;
+            rc = 0;
         } else {
-            FAIL("ALTER TABLE supports ADD and DROP COLUMN (line %d)",
+            FAIL("ALTER TABLE supports ADD, DROP, RENAME COLUMN, and ALTER COLUMN (line %d)",
                  lx->cur.line);
         }
     }
@@ -1126,6 +1310,46 @@ int parse_stmt(Lexer *lx, Stmt *out, char *err)
         out->kind = ST_PRINT;
         rc = adv(lx, err);
     }
+    else if (tok_is_kw(t, "BEGIN")) {
+        out->kind = ST_BEGIN;
+        if (adv(lx, err) < 0) return -1;
+        /* optional "TRANSACTION" keyword */
+        if (tok_is_kw(&lx->cur, "TRANSACTION")) {
+            if (adv(lx, err) < 0) return -1;
+        }
+        rc = 0;
+    }
+    else if (tok_is_kw(t, "COMMIT")) {
+        out->kind = ST_COMMIT;
+        if (adv(lx, err) < 0) return -1;
+        if (tok_is_kw(&lx->cur, "TRANSACTION")) {
+            if (adv(lx, err) < 0) return -1;
+        }
+        rc = 0;
+    }
+    else if (tok_is_kw(t, "ROLLBACK")) {
+        out->kind = ST_ROLLBACK;
+        if (adv(lx, err) < 0) return -1;
+        if (tok_is_kw(&lx->cur, "TRANSACTION")) {
+            if (adv(lx, err) < 0) return -1;
+        }
+        rc = 0;
+    }
+    else if (tok_is_kw(t, "EXPLAIN")) {
+        if (adv(lx, err) < 0) return -1;
+        out->kind = ST_EXPLAIN;
+        /* parse the inner statement */
+        out->sub = calloc(1, sizeof(Stmt));
+        if (!out->sub) { snprintf(err, MAX_ERR, "out of memory"); return -1; }
+        rc = parse_stmt(lx, out->sub, err);
+        if (rc <= 0) { stmt_free(out); return rc; }
+        /* inner stmt already consumed its terminator; skip boundary check below */
+        rc = 1;
+    }
+    else if (tok_is_kw(t, "VACUUM")) {
+        out->kind = ST_VACUUM;
+        rc = adv(lx, err);
+    }
     else {
         snprintf(err, MAX_ERR, "unrecognised statement starting at '%s' (line %d)",
                  t->text, t->line);
@@ -1133,6 +1357,16 @@ int parse_stmt(Lexer *lx, Stmt *out, char *err)
     }
 
     if (rc < 0) { stmt_free(out); return -1; }
+
+    /* EXPLAIN skips the boundary check — its inner statement already consumed
+     * the terminator. */
+    if (out->kind == ST_EXPLAIN) {
+        /* consume an optional trailing semicolon that belongs to the inner stmt */
+        if (tok_is_punct(&lx->cur, ";")) {
+            if (adv(lx, err) < 0) { stmt_free(out); return -1; }
+        }
+        return 1;
+    }
 
     /* A statement has to end at a statement boundary: end of input, ';' or GO.
      *

@@ -273,7 +273,13 @@ check "...and updated nothing" "(0 rows)" "$out"
 out=$(run "SELECT n FROM guard ORDER BY n LIMIT 2")
 check "a trailing LIMIT on SELECT is refused" "Nothing was run" "$out"
 out=$(run "SELECT n FROM guard JOIN other ON guard.id = other.id")
-check "JOIN is refused rather than ignored" "Nothing was run" "$out"
+check "JOIN with missing table is refused" "unknown table" "$out"
+run "CREATE TABLE other (id INT, x INT)" >/dev/null
+run "INSERT INTO other (id, x) VALUES (1,10),(2,20)" >/dev/null
+out=$(run "SELECT guard.n, other.x FROM guard INNER JOIN other ON guard.id = other.id")
+check "INNER JOIN works" "1  10" "$out"
+out=$(run "SELECT COUNT(*) FROM guard LEFT JOIN other ON guard.id = other.id")
+check "LEFT JOIN works" "3" "$out"
 out=$(run "SELECT n FROM guard, other")
 check "comma join is refused rather than ignored" "Nothing was run" "$out"
 
@@ -305,10 +311,12 @@ check "the refused row was not stored" "1" "$out"
 oversize=$(awk 'BEGIN { for (i = 0; i < 409; i++) printf "0123456789" }')
 out=$(run "INSERT INTO big (id, body) VALUES (3, '$oversize')")
 check "a value longer than the column is refused" "the column holds 4000" "$out"
-# and with no declared limit, the page size is still a hard backstop
+# and with no declared limit, the page size is overflowed via chains
 run "CREATE TABLE bigmax (id INT, body NVARCHAR(MAX))" >/dev/null
 out=$(run "INSERT INTO bigmax (id, body) VALUES (3, '$oversize')")
-check "a row too big for a page is refused" "too large" "$out"
+check "a row too big for a page uses overflow chain" "1 row inserted" "$out"
+out=$(run "SELECT id, LEN(body) FROM bigmax")
+check "overflow row is stored and readable" "4090" "$out"
 run "DROP TABLE bigmax" >/dev/null
 run "DROP TABLE big" >/dev/null
 
@@ -478,9 +486,9 @@ out=$(ty "INSERT INTO t (id, id) VALUES (600, 601)")
 check "a column listed twice in INSERT is refused" "listed twice" "$out"
 out=$(ty "UPDATE t SET tiny = 1, tiny = 2 WHERE id = 500")
 check "a column assigned twice in SET is refused" "assigned twice" "$out"
-long_name=$(awk 'BEGIN { for (i = 0; i < 72; i++) printf "a" }')
+long_name=$(awk 'BEGIN { for (i = 0; i < 140; i++) printf "a" }')
 out=$(ty "CREATE TABLE ln ($long_name INT)")
-check "an over-long name is refused, not truncated" "the limit is 63" "$out"
+check "an over-long name is refused, not truncated" "the limit is 127" "$out"
 
 echo
 echo "-- comparison is numeric or an error, never accidentally alphabetical"

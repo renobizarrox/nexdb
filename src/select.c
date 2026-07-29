@@ -20,6 +20,25 @@
 #include <stdio.h>
 #include <math.h>
 
+/* ---------------------------------------------------------------- join help */
+
+typedef struct {
+    Table *table;
+    char   alias[MAX_NAME];
+    Row    row;
+    int    matched;
+} JoinTab;
+
+static int join_tab_idx(JoinTab *tabs, int ntabs, const char *name)
+{
+    for (int i = 0; i < ntabs; i++) {
+        if (strcasecmp(name, tabs[i].table->name) == 0 ||
+            strcasecmp(name, tabs[i].alias) == 0)
+            return i;
+    }
+    return -1;
+}
+
 /* ------------------------------------------------------- aggregate state */
 
 typedef struct {
@@ -29,6 +48,9 @@ typedef struct {
     int     any;        /* saw at least one non-NULL   */
     int     is_float;   /* SUM/AVG should stay integral */
     Value   best;       /* MIN / MAX                   */
+    int     distinct;   /* DISTINCT aggregate          */
+    Value  *seen;       /* heap-allocated distinct values */
+    int     nseen, cseen;
 } AggAcc;
 
 /* Reset aggregate accumulator state for one grouping pass. */
@@ -39,9 +61,38 @@ static void agg_init(AggAcc *a, AggKind k)
     a->best = val_null();
 }
 
+/* Free distinct-values storage within an AggAcc. */
+static void agg_cleanup(AggAcc *a)
+{
+    if (a->seen) {
+        for (int i = 0; i < a->nseen; i++) val_clear(&a->seen[i]);
+        free(a->seen);
+        a->seen = NULL;
+        a->nseen = a->cseen = 0;
+    }
+}
+
 /* Feed one row's value into a running aggregate; returns -1 on type errors. */
 static int agg_update(AggAcc *a, const Value *v, char *err)
 {
+    /* DISTINCT: skip values already seen */
+    if (a->distinct && v && v->tag != T_NULL) {
+        for (int i = 0; i < a->nseen; i++) {
+            int ok;
+            if (val_compare(v, &a->seen[i], &ok) == 0 && ok == 1)
+                return 0;  /* already seen, skip */
+        }
+        /* add to seen set */
+        if (a->nseen >= a->cseen) {
+            int nc = a->cseen ? a->cseen * 2 : 64;
+            Value *ns = realloc(a->seen, (size_t)nc * sizeof(Value));
+            if (!ns) { snprintf(err, MAX_ERR, "out of memory"); return -1; }
+            a->seen = ns;
+            a->cseen = nc;
+        }
+        a->seen[a->nseen++] = val_copy(v);
+    }
+
     if (a->kind == AGG_COUNT) {
         if (v == NULL || v->tag != T_NULL) a->n++;   /* NULL passed for COUNT(*) */
         return 0;
@@ -292,8 +343,6 @@ static int res_cmp(const void *xa, const void *xb)
 
 /* -------------------------------------------------------------- grouping */
 
-#define MAX_AGGS 16
-
 typedef struct {
     char    key[512];
     Row     rep;             /* a representative row, for grouped columns */
@@ -343,6 +392,57 @@ static void star_map(Stmt *s, Table *t, int *map, int ncols)
     }
 }
 
+/* For join queries: track (table_idx, col_idx) for each star output column. */
+typedef struct { int tab; int col; } ColSrc;
+
+/* Expand '*' and 'table.*' across multiple tables for joins. */
+static int output_columns_join(Stmt *s, JoinTab *tabs, int ntabs,
+                               char heads[][MAX_NAME], Expr **exprs,
+                               ColSrc *colsrc, int max, char *err)
+{
+    int n = 0;
+    for (int i = 0; i < s->nitems; i++) {
+        SelItem *it = &s->items[i];
+        if (it->is_star) {
+            for (int ti = 0; ti < ntabs; ti++) {
+                Table *t = tabs[ti].table;
+                for (int c = 0; c < t->ncols; c++) {
+                    if (n >= max) { snprintf(err, MAX_ERR, "too many output columns"); return -1; }
+                    exprs[n] = NULL;
+                    colsrc[n].tab = ti;
+                    colsrc[n].col = c;
+                    snprintf(heads[n], MAX_NAME, "%s", t->cols[c].name);
+                    n++;
+                }
+            }
+        } else if (it->col_star) {
+            int ti = join_tab_idx(tabs, ntabs, it->col_table);
+            if (ti < 0) {
+                snprintf(err, MAX_ERR, "unknown table '%s' in t.*", it->col_table);
+                return -1;
+            }
+            Table *t = tabs[ti].table;
+            for (int c = 0; c < t->ncols; c++) {
+                if (n >= max) { snprintf(err, MAX_ERR, "too many output columns"); return -1; }
+                exprs[n] = NULL;
+                colsrc[n].tab = ti;
+                colsrc[n].col = c;
+                snprintf(heads[n], MAX_NAME, "%s", t->cols[c].name);
+                n++;
+            }
+        } else {
+            if (n >= max) { snprintf(err, MAX_ERR, "too many output columns"); return -1; }
+            exprs[n] = it->e;
+            colsrc[n].tab = -1;
+            colsrc[n].col = -1;
+            snprintf(heads[n], MAX_NAME, "%s",
+                     it->alias[0] ? it->alias : it->label);
+            n++;
+        }
+    }
+    return n;
+}
+
 void capture_free(Capture *c)
 {
     for (int i = 0; i < c->nrows * c->ncols; i++) val_clear(&c->cells[i]);
@@ -375,12 +475,33 @@ int exec_select(DB *db, Stmt *s, char *err)
 /* Full SELECT pipeline; optionally capture rows into cap instead of printing. */
 int exec_select_into(DB *db, Stmt *s, Capture *capture, char *err)
 {
+    g_db = db;
     int64_t now = mem_now();
     Table *t = NULL;
 
     if (s->has_from) {
         t = cat_find(db, s->table);
         if (!t) { snprintf(err, MAX_ERR, "unknown table '%s'", s->table); return -1; }
+    }
+
+    /* ---- collect join tables (if any) */
+    JoinTab join_tabs[1 + MAX_JOINS];
+    int njoin_tabs = 0;
+    if (s->has_from && s->njoins > 0) {
+        memset(join_tabs, 0, sizeof join_tabs);
+        join_tabs[njoin_tabs].table = t;
+        snprintf(join_tabs[njoin_tabs].alias, MAX_NAME, "%s",
+                 s->alias[0] ? s->alias : s->table);
+        njoin_tabs++;
+        for (int i = 0; i < s->njoins; i++) {
+            Join *j = &s->joins[i];
+            Table *jt = cat_find(db, j->table);
+            if (!jt) { snprintf(err, MAX_ERR, "unknown table '%s' in JOIN", j->table); return -1; }
+            join_tabs[njoin_tabs].table = jt;
+            snprintf(join_tabs[njoin_tabs].alias, MAX_NAME, "%s",
+                     j->alias[0] ? j->alias : j->table);
+            njoin_tabs++;
+        }
     }
 
     /* ---- plan: find the aggregates, decide whether this is a grouped query */
@@ -398,8 +519,12 @@ int exec_select_into(DB *db, Stmt *s, Capture *capture, char *err)
     int grouped = (naggs > 0 || s->ngroup > 0);
 
     if (s->having && !grouped) {
-        snprintf(err, MAX_ERR, "HAVING needs GROUP BY or an aggregate");
-        return -1;
+        if (naggs == 0) {
+            snprintf(err, MAX_ERR, "HAVING without GROUP BY needs an aggregate");
+            return -1;
+        }
+        /* HAVING without GROUP BY: treat the entire result as one group */
+        grouped = 1;
     }
     if (grouped && !s->has_from) {
         snprintf(err, MAX_ERR, "aggregates need a FROM clause");
@@ -421,9 +546,15 @@ int exec_select_into(DB *db, Stmt *s, Capture *capture, char *err)
     char heads[MAX_OUT_COLS][MAX_NAME];
     Expr *exprs[MAX_OUT_COLS];
     int colmap[MAX_OUT_COLS];
+    ColSrc colsrc[MAX_OUT_COLS];
     int ncols;
 
-    if (s->has_from) {
+    if (s->has_from && njoin_tabs > 1) {
+        ncols = output_columns_join(s, join_tabs, njoin_tabs,
+                                    heads, exprs, colsrc, MAX_OUT_COLS, err);
+        if (ncols < 0) return -1;
+        memset(colmap, 0, sizeof colmap); /* unused for join path */
+    } else if (s->has_from) {
         ncols = output_columns(s, t, heads, exprs, MAX_OUT_COLS, err);
         if (ncols < 0) return -1;
         star_map(s, t, colmap, ncols);
@@ -503,7 +634,7 @@ int exec_select_into(DB *db, Stmt *s, Capture *capture, char *err)
     Value point_key;
     memset(&point_key, 0, sizeof point_key);
     int point_col = -1;
-    if (!grouped && s->has_from && s->where && s->where->kind == EX_BIN &&
+    if (!grouped && s->has_from && njoin_tabs <= 1 && s->where && s->where->kind == EX_BIN &&
         s->where->op == OP_EQ) {
         Expr *l = s->where->l, *r = s->where->r;
         if (l && r && l->kind == EX_COL && r->kind == EX_LIT) {
@@ -528,7 +659,278 @@ int exec_select_into(DB *db, Stmt *s, Capture *capture, char *err)
     }
 
     /* ---- scan, filter, and either project directly or fold into groups */
-    if (!grouped) {
+    if (njoin_tabs > 1) {
+        /* ---- nested-loop join execution */
+        if (grouped && s->ngroup > 0) {
+            snprintf(err, MAX_ERR, "GROUP BY with JOIN is not yet supported");
+            res_free(&res); return -1;
+        }
+
+        /* Aliases array for join context */
+        const char *alias_ptrs[1 + MAX_JOINS];
+        for (int i = 0; i < njoin_tabs; i++) alias_ptrs[i] = join_tabs[i].alias;
+
+        if (grouped) {
+            /* Aggregate-only (no GROUP BY) join: fold all joined rows into
+             * a single aggregate group. */
+            AggAcc jaccs[MAX_AGGS];
+            memset(jaccs, 0, sizeof jaccs);
+            for (int ai = 0; ai < naggs; ai++) {
+                agg_init(&jaccs[ai], (AggKind)aggs[ai]->agg);
+                jaccs[ai].distinct = aggs[ai]->agg_distinct;
+            }
+
+            /* Prepare scan for join table */
+            Scan jsc1;
+            scan_init(&jsc1, db, join_tabs[1].table);
+            Scan psc1;
+            Row pr1;
+            scan_init(&psc1, db, t);
+
+            while (scan_next(&psc1, &pr1)) {
+                int where_ok;
+                if (row_matches(s->where, &pr1, t, now, &where_ok, err) < 0) {
+                    row_clear(&pr1); res_free(&res); return -1;
+                }
+                if (!where_ok) { row_clear(&pr1); continue; }
+
+                /* LEFT JOIN: always get at least one row per left row */
+                int any_match = 0;
+                Row jr1;
+                /* Reset join scan */
+                scan_init(&jsc1, db, join_tabs[1].table);
+
+                while (scan_next(&jsc1, &jr1)) {
+                    int on_ok;
+                    const Table *jtabs[2] = { t, join_tabs[1].table };
+                    const Row *jrows[2] = { &pr1, &jr1 };
+                    if (row_matches_join(s->joins[0].on, jtabs, jrows,
+                                         alias_ptrs, 2, now, &on_ok, err) < 0) {
+                        row_clear(&jr1); row_clear(&pr1); res_free(&res); return -1;
+                    }
+                    if (!on_ok) { row_clear(&jr1); continue; }
+                    any_match = 1;
+
+                    /* Feed join result into aggregates */
+                    const Row *eval_rows[2] = { &pr1, &jr1 };
+                    exec_set_join_ctx(jtabs, eval_rows, alias_ptrs, 2);
+                    for (int ai = 0; ai < naggs; ai++) {
+                        if (aggs[ai]->agg_star) {
+                            if (agg_update(&jaccs[ai], NULL, err) < 0) {
+                                exec_set_join_ctx(NULL, NULL, NULL, 0);
+                                row_clear(&jr1); row_clear(&pr1); res_free(&res);
+                                return -1;
+                            }
+                        } else {
+                            Value av;
+                            if (eval_expr(aggs[ai]->args[0], &pr1, t, now, &av, err) < 0) {
+                                exec_set_join_ctx(NULL, NULL, NULL, 0);
+                                row_clear(&jr1); row_clear(&pr1); res_free(&res);
+                                return -1;
+                            }
+                            if (agg_update(&jaccs[ai], &av, err) < 0) {
+                                val_clear(&av);
+                                exec_set_join_ctx(NULL, NULL, NULL, 0);
+                                row_clear(&jr1); row_clear(&pr1); res_free(&res);
+                                return -1;
+                            }
+                            val_clear(&av);
+                        }
+                    }
+                    exec_set_join_ctx(NULL, NULL, NULL, 0);
+                    row_clear(&jr1);
+                }
+
+                /* LEFT JOIN: unmatched left rows still contribute to aggregate */
+                if (s->joins[0].type == JOIN_LEFT && !any_match) {
+                    Row null_r;
+                    memset(&null_r, 0, sizeof null_r);
+                    null_r.ncols = join_tabs[1].table->ncols;
+                    const Table *jtabs[2] = { t, join_tabs[1].table };
+                    const Row *eval_rows[2] = { &pr1, &null_r };
+                    exec_set_join_ctx(jtabs, eval_rows, alias_ptrs, 2);
+                    for (int ai = 0; ai < naggs; ai++) {
+                        if (aggs[ai]->agg_star) {
+                            agg_update(&jaccs[ai], NULL, err);
+                        } else {
+                            Value av;
+                            if (eval_expr(aggs[ai]->args[0], &pr1, t, now, &av, err) < 0) break;
+                            agg_update(&jaccs[ai], &av, err);
+                            val_clear(&av);
+                        }
+                    }
+                    exec_set_join_ctx(NULL, NULL, NULL, 0);
+                }
+                row_clear(&pr1);
+            }
+
+            /* Emit aggregate result */
+            Value agvals[MAX_AGGS];
+            for (int ai = 0; ai < naggs; ai++)
+                agvals[ai] = agg_result(&jaccs[ai]);
+            exec_set_agg_context(agvals, naggs);
+
+            /* Empty join result still produces one row for aggregates */
+            if (res_grow(&res) < 0) {
+                snprintf(err, MAX_ERR, "out of memory");
+                res_free(&res); return -1;
+            }
+            for (int c = 0; c < ncols; c++) {
+                if (eval_expr(exprs[c], &pr1, t, now,
+                              &res.cells[res.nrows * ncols + c], err) < 0) {
+                    res_free(&res); return -1;
+                }
+            }
+            for (int k = 0; k < s->norder; k++) {
+                Value *dst = &res.keys[res.nrows * s->norder + k];
+                if (order_from_col[k] >= 0)
+                    *dst = val_copy(&res.cells[res.nrows * ncols + order_from_col[k]]);
+                else {
+                    Row empty;
+                    memset(&empty, 0, sizeof empty);
+                    eval_expr(s->order[k].e, &empty, t, now, dst, err);
+                }
+            }
+            res.refs[res.nrows] = (RowRef){0, 0};
+            res.rids[res.nrows] = 0;
+            res.nrows++;
+
+            exec_set_agg_context(NULL, 0);
+            for (int ai = 0; ai < naggs; ai++) { val_clear(&agvals[ai]); agg_cleanup(&jaccs[ai]); }
+            goto emit;
+        }
+
+        /* Prepare scans for each join table (positions 1..njoin_tabs-1) */
+        #define MAX_JT 8
+        Scan jsc[MAX_JT];
+        for (int i = 1; i < njoin_tabs; i++)
+            scan_init(&jsc[i], db, join_tabs[i].table);
+
+        /* Scan primary table */
+        Scan psc;
+        Row pr;
+        scan_init(&psc, db, t);
+
+        while (scan_next(&psc, &pr)) {
+            int where_ok;
+            if (row_matches(s->where, &pr, t, now, &where_ok, err) < 0) {
+                row_clear(&pr); res_free(&res); goto join_cleanup;
+            }
+            if (!where_ok) { row_clear(&pr); continue; }
+
+            join_tabs[0].row = pr;
+            join_tabs[0].matched = 0;
+
+            /* For each join table, do nested-loop */
+            /* We use a simple approach: 1 join at a time for now */
+            if (njoin_tabs > 2) {
+                snprintf(err, MAX_ERR, "multiple JOINs are not yet supported");
+                row_clear(&pr); res_free(&res); goto join_cleanup;
+            }
+
+            /* Scan the first joined table */
+            Row jr;
+            Scan *js = &jsc[1];
+            int any_match = 0;
+
+            while (scan_next(js, &jr)) {
+                join_tabs[1].row = jr;
+
+                /* Evaluate ON clause */
+                Join *j = &s->joins[0];
+                int on_ok;
+                const Row *jrows[2] = { &pr, &jr };
+                const Table *jtabs[2] = { t, join_tabs[1].table };
+                if (row_matches_join(j->on, jtabs, jrows, alias_ptrs, 2,
+                                     now, &on_ok, err) < 0) {
+                    row_clear(&jr); row_clear(&pr); res_free(&res); goto join_cleanup;
+                }
+                if (!on_ok) { row_clear(&jr); continue; }
+
+                any_match = 1;
+                join_tabs[1].matched = 1;
+
+                /* Set up join context for expression evaluation */
+                const Row *eval_rows[2] = { &pr, &jr };
+                exec_set_join_ctx(jtabs, eval_rows, alias_ptrs, 2);
+
+                if (res_grow(&res) < 0) {
+                    row_clear(&jr); row_clear(&pr); res_free(&res);
+                    snprintf(err, MAX_ERR, "out of memory");
+                    goto join_cleanup;
+                }
+                int failed = 0;
+                for (int c = 0; c < ncols && !failed; c++) {
+                    Value *dst = &res.cells[res.nrows * ncols + c];
+                    if (exprs[c]) {
+                        if (eval_expr(exprs[c], &pr, t, now, dst, err) < 0) failed = 1;
+                    } else {
+                        int ti = colsrc[c].tab;
+                        int ci = colsrc[c].col;
+                        const Row *sr = (ti == 0) ? &pr : &jr;
+                        *dst = (ci >= 0 && ci < sr->ncols) ? val_copy(&sr->v[ci]) : val_null();
+                    }
+                }
+                for (int k = 0; k < s->norder && !failed; k++) {
+                    Value *dst = &res.keys[res.nrows * s->norder + k];
+                    if (order_from_col[k] >= 0)
+                        *dst = val_copy(&res.cells[res.nrows * ncols + order_from_col[k]]);
+                    else if (eval_expr(s->order[k].e, &pr, t, now, dst, err) < 0)
+                        failed = 1;
+                }
+                res.refs[res.nrows] = pr.ref;
+                res.rids[res.nrows] = pr.rid;
+                res.nrows++;
+                row_clear(&jr);
+                if (failed) { row_clear(&pr); res_free(&res); goto join_cleanup; }
+                exec_set_join_ctx(NULL, NULL, NULL, 0);
+            }
+
+            /* LEFT JOIN: emit left row with NULLs for right side */
+            if (s->joins[0].type == JOIN_LEFT && !any_match) {
+                if (res_grow(&res) < 0) {
+                    row_clear(&pr); res_free(&res);
+                    snprintf(err, MAX_ERR, "out of memory");
+                    goto join_cleanup;
+                }
+                Row null_r;
+                memset(&null_r, 0, sizeof null_r);
+                null_r.ncols = join_tabs[1].table->ncols;
+                for (int c = 0; c < ncols; c++) {
+                    Value *dst = &res.cells[res.nrows * ncols + c];
+                    if (exprs[c]) {
+                        if (eval_expr(exprs[c], &pr, t, now, dst, err) < 0) {
+                            res_free(&res); goto join_cleanup;
+                        }
+                    } else {
+                        int ti = colsrc[c].tab;
+                        int ci = colsrc[c].col;
+                        *dst = (ti == 0 && ci >= 0 && ci < pr.ncols) ? val_copy(&pr.v[ci])
+                             : (ti > 0) ? val_null()
+                             : val_null();
+                    }
+                }
+                for (int k = 0; k < s->norder; k++) {
+                    Value *dst = &res.keys[res.nrows * s->norder + k];
+                    if (order_from_col[k] >= 0)
+                        *dst = val_copy(&res.cells[res.nrows * ncols + order_from_col[k]]);
+                    else if (eval_expr(s->order[k].e, &pr, t, now, dst, err) < 0) {
+                        res_free(&res); goto join_cleanup;
+                    }
+                }
+                res.refs[res.nrows] = pr.ref;
+                res.rids[res.nrows] = pr.rid;
+                res.nrows++;
+            }
+
+            row_clear(&pr);
+            exec_set_join_ctx(NULL, NULL, NULL, 0);
+        }
+
+join_cleanup:
+        if (err[0]) return -1;
+        goto emit;
+    } else if (!grouped) {
         if (point_lookup) {
             int idx = table_find_index(t, point_col);
             RowRef ref;
@@ -664,8 +1066,10 @@ int exec_select_into(DB *db, Stmt *s, Capture *capture, char *err)
                 snprintf(groups[gidx].key, sizeof groups[gidx].key, "%s", key);
                 groups[gidx].rep = r;             /* the group owns this row now */
                 became_rep = 1;
-                for (int ai = 0; ai < naggs; ai++)
+                for (int ai = 0; ai < naggs; ai++) {
                     agg_init(&groups[gidx].accs[ai], (AggKind)aggs[ai]->agg);
+                    groups[gidx].accs[ai].distinct = aggs[ai]->agg_distinct;
+                }
             }
 
             Group *grp = &groups[gidx];
@@ -703,8 +1107,10 @@ int exec_select_into(DB *db, Stmt *s, Capture *capture, char *err)
                 groups = ng;
                 gcap = ngroups = 1;
                 memset(&groups[0].rep, 0, sizeof(Row));
-                for (int ai = 0; ai < naggs; ai++)
+                for (int ai = 0; ai < naggs; ai++) {
                     agg_init(&groups[0].accs[ai], (AggKind)aggs[ai]->agg);
+                    groups[0].accs[ai].distinct = aggs[ai]->agg_distinct;
+                }
             }
         }
 
@@ -768,7 +1174,10 @@ int exec_select_into(DB *db, Stmt *s, Capture *capture, char *err)
 
         for (int gi = 0; gi < ngroups; gi++) {
             row_clear(&groups[gi].rep);
-            for (int ai = 0; ai < naggs; ai++) val_clear(&groups[gi].accs[ai].best);
+            for (int ai = 0; ai < naggs; ai++) {
+                val_clear(&groups[gi].accs[ai].best);
+                agg_cleanup(&groups[gi].accs[ai]);
+            }
         }
         free(groups);
 

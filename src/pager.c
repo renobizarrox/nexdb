@@ -24,13 +24,17 @@
 #include <errno.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/file.h>
 
 #define MAGIC       "nexdb\x01\x00"
 #define MAGIC_LEN   8
 /* v2 added per-column length limits, integer widths and key flags.
  * v3 added DEFAULT and IDENTITY metadata, and the packed UUID value type.
- * v4 added multi-index support (Index array replacing single btree_root). */
-#define FMT_VERSION 4u
+ * v4 added multi-index support (Index array replacing single btree_root).
+ * v5 added free-list for reusing deleted pages. */
+#define FMT_VERSION   6u
+#define OVERFLOW_MARKER  0xFFFFu  /* ncols value signalling an overflow row */
+#define OVERFLOW_STUB    (TUP_HDR_SIZE + 4u)  /* header + chain_head_pno = 30 */
 
 /* heap page header: next(4) nslots(2) free_start(2) free_end(2) pad(2) */
 #define HP_NEXT       0
@@ -75,6 +79,9 @@ int pager_read(DB *db, uint32_t pno, void *buf)
 
 int pager_write(DB *db, uint32_t pno, const void *buf)
 {
+    if (db->txn_active) {
+        if (pager_undo_capture(db, pno) < 0) return -1;
+    }
     ssize_t n = pwrite(db->fd, buf, PAGE_SIZE, (off_t)pno * PAGE_SIZE);
     if (n != PAGE_SIZE) {
         snprintf(db->err, MAX_ERR, "write page %u: %s", pno, strerror(errno));
@@ -84,15 +91,36 @@ int pager_write(DB *db, uint32_t pno, const void *buf)
     return 0;
 }
 
-/* Append a new zero-filled page at the end of the file and return its number. */
+/* Pop a page from the free list, or extend the file if the list is empty. */
 uint32_t pager_alloc(DB *db)
 {
+    if (db->free_list) {
+        uint32_t pno = db->free_list;
+        uint8_t pg[PAGE_SIZE];
+        if (pager_read(db, pno, pg) < 0) return 0;
+        db->free_list = rd32(pg, 0);  /* next free page */
+        uint8_t zero[PAGE_SIZE];
+        memset(zero, 0, sizeof zero);
+        if (pager_write(db, pno, zero) < 0) return 0;
+        return pno;
+    }
     uint32_t pno = db->page_count;
     uint8_t zero[PAGE_SIZE];
     memset(zero, 0, sizeof zero);
     if (pager_write(db, pno, zero) < 0) return 0;
     db->page_count = pno + 1;
     return pno;
+}
+
+/* Push a page onto the free list so pager_alloc can reuse it. */
+void pager_free(DB *db, uint32_t pno)
+{
+    if (pno == 0) return;  /* never free the header page */
+    uint8_t pg[PAGE_SIZE];
+    memset(pg, 0, sizeof pg);
+    wr32(pg, 0, db->free_list);
+    if (pager_write(db, pno, pg) < 0) return;
+    db->free_list = pno;
 }
 
 /* ----------------------------------------------------------- chain pages */
@@ -184,9 +212,10 @@ static int write_header(DB *db)
     memcpy(pg, MAGIC, MAGIC_LEN);
     wr32(pg, 8,  FMT_VERSION);
     wr32(pg, 12, db->page_count);
-    wr32(pg, 16, db->catalog_page);
-    wr32(pg, 20, db->links_page);
-    wr64(pg, 24, db->next_rid);
+    wr32(pg, 16, db->free_list);
+    wr32(pg, 20, db->catalog_page);
+    wr32(pg, 24, db->links_page);
+    wr64(pg, 28, db->next_rid);
     return pager_write(db, 0, pg);
 }
 
@@ -309,6 +338,18 @@ int db_open(DB *db, const char *path)
         return -1;
     }
 
+    /* Advisory exclusive lock: prevents two processes from corrupting the file */
+    if (flock(db->fd, LOCK_EX | LOCK_NB) < 0) {
+        close(db->fd);
+        if (errno == EWOULDBLOCK || errno == EAGAIN)
+            snprintf(db->err, MAX_ERR,
+                     "%s is already open in another nexdb process", path);
+        else
+            snprintf(db->err, MAX_ERR, "flock failed on %s: %s",
+                     path, strerror(errno));
+        return -1;
+    }
+
     struct stat st;
     if (fstat(db->fd, &st) < 0) {
         snprintf(db->err, MAX_ERR, "stat failed: %s", strerror(errno));
@@ -317,6 +358,7 @@ int db_open(DB *db, const char *path)
 
     if (st.st_size == 0) {
         db->page_count   = 1;
+        db->free_list    = 0;
         db->catalog_page = 0;
         db->links_page   = 0;
         db->next_rid     = 1;
@@ -339,9 +381,10 @@ int db_open(DB *db, const char *path)
             return -1;
         }
         db->page_count   = rd32(pg, 12);
-        db->catalog_page = rd32(pg, 16);
-        db->links_page   = rd32(pg, 20);
-        db->next_rid     = rd64(pg, 24);
+        db->free_list    = rd32(pg, 16);
+        db->catalog_page = rd32(pg, 20);
+        db->links_page   = rd32(pg, 24);
+        db->next_rid     = rd64(pg, 28);
         if (db->page_count == 0) db->page_count = 1;
         if (db->next_rid == 0) db->next_rid = 1;
 
@@ -432,6 +475,16 @@ int cat_drop(DB *db, const char *name)
 {
     for (int i = 0; i < db->cat.ntables; i++) {
         if (strcasecmp(db->cat.tables[i].name, name) == 0) {
+            /* free all heap pages */
+            Table *t = &db->cat.tables[i];
+            uint32_t pno = t->first_page;
+            while (pno) {
+                uint8_t pg[PAGE_SIZE];
+                if (pager_read(db, pno, pg) < 0) break;
+                uint32_t next = rd32(pg, HP_NEXT);
+                pager_free(db, pno);
+                pno = next;
+            }
             for (int j = i; j < db->cat.ntables - 1; j++)
                 db->cat.tables[j] = db->cat.tables[j + 1];
             db->cat.ntables--;
@@ -601,26 +654,52 @@ static int heap_page_put(uint8_t *pg, const uint8_t *tup, size_t tlen, uint16_t 
     return 0;
 }
 
+/* overflow-chain forward declarations */
+static void chain_free(DB *db, uint32_t head);
+static int  row_decode(DB *db, const uint8_t *buf, size_t len, Row *out);
+static void overflow_stub(const Row *r, uint32_t chain_head, uint8_t *stub);
+
 int heap_insert(DB *db, Table *t, Row *r)
 {
-    uint8_t tup[PAGE_SIZE];
+    uint8_t tup[MAX_ROW_SIZE];
+    int overflow = 0;
     if (r->rid == 0) r->rid = db->next_rid++;
     if (r->strength <= 0) r->strength = (float)MEM_INIT_STRENGTH;
     if (r->last_access == 0) r->last_access = mem_now();
 
     size_t tlen = tuple_encode(r, tup, sizeof tup);
-    if (tlen == 0 || tlen > PAGE_SIZE - HP_HDR_SIZE - SLOT_SIZE) {
-        snprintf(db->err, MAX_ERR, "row too large for a %d byte page", PAGE_SIZE);
+    if (tlen == 0) {
+        snprintf(db->err, MAX_ERR, "row too large (max %zu bytes)", sizeof tup);
         return -1;
+    }
+
+    size_t inline_max = PAGE_SIZE - HP_HDR_SIZE - SLOT_SIZE;
+    uint8_t stub[OVERFLOW_STUB];
+    uint32_t chain_head = 0;
+    size_t stub_len = tlen;
+
+    if (tlen > inline_max) {
+        overflow = 1;
+        chain_head = 0;
+        if (chain_write(db, &chain_head, tup, tlen) < 0) return -1;
+        overflow_stub(r, chain_head, stub);
+        stub_len = OVERFLOW_STUB;
     }
 
     uint8_t pg[PAGE_SIZE];
     uint32_t pno = t->first_page, prev = 0;
+    const uint8_t *put_data = overflow ? stub : tup;
     while (pno) {
-        if (pager_read(db, pno, pg) < 0) return -1;
+        if (pager_read(db, pno, pg) < 0) {
+            if (overflow) chain_free(db, chain_head);
+            return -1;
+        }
         uint16_t slot;
-        if (heap_page_put(pg, tup, tlen, &slot) == 0) {
-            if (pager_write(db, pno, pg) < 0) return -1;
+        if (heap_page_put(pg, put_data, stub_len, &slot) == 0) {
+            if (pager_write(db, pno, pg) < 0) {
+                if (overflow) chain_free(db, chain_head);
+                return -1;
+            }
             r->ref.page = pno;
             r->ref.slot = slot;
             t->nrows++;
@@ -631,22 +710,36 @@ int heap_insert(DB *db, Table *t, Row *r)
     }
 
     uint32_t np = pager_alloc(db);
-    if (np == 0) { snprintf(db->err, MAX_ERR, "cannot allocate page"); return -1; }
+    if (np == 0) {
+        if (overflow) chain_free(db, chain_head);
+        snprintf(db->err, MAX_ERR, "cannot allocate page");
+        return -1;
+    }
     heap_page_init(pg);
     uint16_t slot;
-    if (heap_page_put(pg, tup, tlen, &slot) < 0) {
+    if (heap_page_put(pg, put_data, stub_len, &slot) < 0) {
+        if (overflow) chain_free(db, chain_head);
         snprintf(db->err, MAX_ERR, "row does not fit in an empty page");
         return -1;
     }
-    if (pager_write(db, np, pg) < 0) return -1;
+    if (pager_write(db, np, pg) < 0) {
+        if (overflow) chain_free(db, chain_head);
+        return -1;
+    }
 
     if (prev == 0) {
         t->first_page = np;
     } else {
         uint8_t pp[PAGE_SIZE];
-        if (pager_read(db, prev, pp) < 0) return -1;
+        if (pager_read(db, prev, pp) < 0) {
+            if (overflow) chain_free(db, chain_head);
+            return -1;
+        }
         wr32(pp, HP_NEXT, np);
-        if (pager_write(db, prev, pp) < 0) return -1;
+        if (pager_write(db, prev, pp) < 0) {
+            if (overflow) chain_free(db, chain_head);
+            return -1;
+        }
     }
     t->last_page = np;
     r->ref.page = np;
@@ -655,16 +748,89 @@ int heap_insert(DB *db, Table *t, Row *r)
     return db_flush_catalog(db);
 }
 
+/* Return 1 if every slot on the page is a tombstone (offset==0, length==0). */
+static int page_is_empty(const uint8_t *pg)
+{
+    uint16_t nslots = rd16(pg, HP_NSLOTS);
+    for (uint16_t i = 0; i < nslots; i++) {
+        uint16_t off = rd16(pg, HP_HDR_SIZE + i * SLOT_SIZE + 0);
+        uint16_t len = rd16(pg, HP_HDR_SIZE + i * SLOT_SIZE + 2);
+        if (off != 0 || len != 0) return 0;
+    }
+    return 1;
+}
+
+/* Free every heap page linked from first_page onward and reset the chain.
+ * Also frees any overflow chains on rows that are still live. */
+void heap_free_pages(DB *db, Table *t)
+{
+    uint32_t pno = t->first_page;
+    while (pno) {
+        uint8_t pg[PAGE_SIZE];
+        if (pager_read(db, pno, pg) < 0) break;
+        uint16_t nslots = rd16(pg, HP_NSLOTS);
+        for (uint16_t i = 0; i < nslots; i++) {
+            uint16_t off = rd16(pg, HP_HDR_SIZE + i * SLOT_SIZE + 0);
+            uint16_t len = rd16(pg, HP_HDR_SIZE + i * SLOT_SIZE + 2);
+            if (off >= TUP_HDR_SIZE + 4 && len >= TUP_HDR_SIZE + 4) {
+                if (rd16(pg + off, TUP_NCOLS) == OVERFLOW_MARKER)
+                    chain_free(db, rd32(pg + off, TUP_HDR_SIZE));
+            }
+        }
+        uint32_t next = rd32(pg, HP_NEXT);
+        pager_free(db, pno);
+        pno = next;
+    }
+    t->first_page = 0;
+    t->last_page  = 0;
+    t->nrows      = 0;
+}
+
 int heap_delete(DB *db, Table *t, RowRef ref)
 {
     uint8_t pg[PAGE_SIZE];
     if (pager_read(db, ref.page, pg) < 0) return -1;
     uint16_t nslots = rd16(pg, HP_NSLOTS);
     if (ref.slot >= nslots) { snprintf(db->err, MAX_ERR, "bad row reference"); return -1; }
+    uint16_t off = rd16(pg, HP_HDR_SIZE + ref.slot * SLOT_SIZE + 0);
+    uint16_t len = rd16(pg, HP_HDR_SIZE + ref.slot * SLOT_SIZE + 2);
+    if (off >= TUP_HDR_SIZE + 4 && len >= TUP_HDR_SIZE + 4) {
+        if (rd16(pg + off, TUP_NCOLS) == OVERFLOW_MARKER) {
+            uint32_t head = rd32(pg + off, TUP_HDR_SIZE);
+            chain_free(db, head);
+        }
+    }
     wr16(pg, HP_HDR_SIZE + ref.slot * SLOT_SIZE + 0, 0);
     wr16(pg, HP_HDR_SIZE + ref.slot * SLOT_SIZE + 2, 0);
     if (pager_write(db, ref.page, pg) < 0) return -1;
     if (t->nrows > 0) t->nrows--;
+
+    /* If the page is now completely empty, unlink it from the heap chain
+     * and return it to the free list for reuse. */
+    if (page_is_empty(pg)) {
+        uint32_t prev = 0;
+        uint32_t cur  = t->first_page;
+        while (cur && cur != ref.page) {
+            uint8_t cp[PAGE_SIZE];
+            if (pager_read(db, cur, cp) < 0) return 0;
+            prev = cur;
+            cur  = rd32(cp, HP_NEXT);
+        }
+        if (cur == ref.page) {
+            uint32_t next = rd32(pg, HP_NEXT);
+            if (prev == 0) {
+                t->first_page = next;
+            } else {
+                uint8_t pp[PAGE_SIZE];
+                if (pager_read(db, prev, pp) < 0) return 0;
+                wr32(pp, HP_NEXT, next);
+                if (pager_write(db, prev, pp) < 0) return 0;
+            }
+            if (t->last_page == ref.page) t->last_page = prev;
+            pager_free(db, ref.page);
+            db_flush_catalog(db);
+        }
+    }
     return 0;
 }
 
@@ -711,7 +877,7 @@ int scan_next(Scan *s, Row *out)
             if (len == 0 || off == 0) continue;      /* dead slot */
             if (off < HP_HDR_SIZE || (size_t)off + len > PAGE_SIZE)
                 continue;                            /* impossible slot: skip */
-            if (tuple_decode(s->buf + off, len, out) < 0) continue;
+            if (row_decode(s->db, s->buf + off, len, out) < 0) continue;
             out->ref.page = s->page;
             out->ref.slot = (uint16_t)slot;
             return 1;
@@ -748,7 +914,7 @@ int heap_read_row(DB *db, RowRef ref, Row *out)
     uint16_t len = rd16(pg, HP_HDR_SIZE + ref.slot * SLOT_SIZE + 2);
     if (off == 0 || len < TUP_HDR_SIZE) return -1;
     if (off < HP_HDR_SIZE || (size_t)off + len > PAGE_SIZE) return -1;
-    if (tuple_decode(pg + off, len, out) < 0) return -1;
+    if (row_decode(db, pg + off, len, out) < 0) return -1;
     out->ref = ref;
     return 0;
 }
@@ -769,4 +935,95 @@ int heap_update_meta(DB *db, RowRef ref, uint32_t access, int64_t last, float st
     wr64(pg, off + TUP_LAST, (uint64_t)last);
     memcpy(pg + off + TUP_STRENGTH, &strength, 4);
     return pager_write(db, ref.page, pg);
+}
+
+/* ---------------------------------------------------------------------------
+ * Overflow page chain helpers
+ *
+ * When a serialised row is too large for one heap page we store a 30-byte
+ * stub inline (header + ncols = OVERFLOW_MARKER + chain head pno) and write
+ * the full encoded tuple to a chain of overflow pages. */
+
+/* Free every page in an overflow chain. */
+static void chain_free(DB *db, uint32_t head)
+{
+    while (head) {
+        uint8_t pg[PAGE_SIZE];
+        if (pager_read(db, head, pg) < 0) break;
+        uint32_t next = rd32(pg, 0);
+        pager_free(db, head);
+        head = next;
+    }
+}
+
+/* Decode a row that may be inline (normal) or in an overflow chain.
+ * buf/len point to the in-page tuple data.  Returns 0 on success. */
+static int row_decode(DB *db, const uint8_t *buf, size_t len, Row *out)
+{
+    if (len < TUP_HDR_SIZE + 4) goto inline_decode;
+    if (rd16(buf, TUP_NCOLS) == OVERFLOW_MARKER) {
+        uint32_t head = rd32(buf, TUP_HDR_SIZE);
+        uint8_t *chain = NULL;
+        size_t clen = 0;
+        if (chain_read(db, head, &chain, &clen) < 0) return -1;
+        int rc = tuple_decode(chain, clen, out);
+        free(chain);
+        return rc;
+    }
+inline_decode:
+    return tuple_decode(buf, len, out);
+}
+
+/* Encode just the overflow stub for a row (header with OVERFLOW_MARKER
+ * and the chain head page number).  Stub is always OVERFLOW_STUB bytes. */
+static void overflow_stub(const Row *r, uint32_t chain_head, uint8_t *stub)
+{
+    memset(stub, 0, OVERFLOW_STUB);
+    wr64(stub, TUP_RID, r->rid);
+    wr32(stub, TUP_ACCESS, r->access_count);
+    wr64(stub, TUP_LAST, (uint64_t)r->last_access);
+    memcpy(stub + TUP_STRENGTH, &r->strength, 4);
+    wr16(stub, TUP_NCOLS, OVERFLOW_MARKER);
+    wr32(stub, TUP_HDR_SIZE, chain_head);
+}
+
+/* ---------------------------------------------------------------------------
+ * Transaction undo log
+ *
+ * Before a page is written inside an explicit transaction, its old content
+ * is saved so it can be restored on ROLLBACK.  A given page is captured only
+ * once per transaction (the first write to it). */
+
+int pager_undo_capture(DB *db, uint32_t pno)
+{
+    if (!db->txn_active) return 0;
+    for (int i = 0; i < db->undo_depth; i++)
+        if (db->undo[i].pno == pno) return 0;  /* already captured */
+    if (db->undo_depth >= UNDO_MAX) {
+        snprintf(db->err, MAX_ERR, "transaction too large: max %d modified pages", UNDO_MAX);
+        return -1;
+    }
+    UndoEntry *e = &db->undo[db->undo_depth++];
+    e->pno = pno;
+    return pager_read(db, pno, e->old);
+}
+
+void pager_undo_rollback(DB *db)
+{
+    if (!db->txn_active) return;
+    /* Restore in reverse order so nested overwrites unroll correctly. */
+    for (int i = db->undo_depth - 1; i >= 0; i--) {
+        uint32_t pno = db->undo[i].pno;
+        pwrite(db->fd, db->undo[i].old, PAGE_SIZE, (off_t)pno * PAGE_SIZE);
+    }
+    db->undo_depth = 0;
+    db->txn_active = 0;
+}
+
+void pager_undo_commit(DB *db)
+{
+    if (!db->txn_active) return;
+    fsync(db->fd);
+    db->undo_depth = 0;
+    db->txn_active = 0;
 }

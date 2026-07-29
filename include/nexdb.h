@@ -20,15 +20,24 @@
 #define NEXDB_VERSION    "0.2"
 
 #define PAGE_SIZE        4096
-#define MAX_NAME         64
+#define MAX_NAME         128
 #define MAX_COLS         32
-#define MAX_TABLES       64
-#define MAX_INDEXES      16
+#define MAX_TABLES       128
+#define MAX_INDEXES      32
 #define MAX_ERR          256
-#define MAX_SELECT_ITEMS 64
-#define MAX_SET_ITEMS    32
-#define MAX_IN_ITEMS     64
-#define MAX_RECALL_TERMS 64   /* distinct search words RECALL considers */
+#define MAX_SELECT_ITEMS 128
+#define MAX_SET_ITEMS    64
+#define MAX_IN_ITEMS     128
+#define MAX_RECALL_TERMS 128   /* distinct search words RECALL considers */
+#define MAX_INSERT_ROWS  128   /* rows per INSERT statement */
+#define UNDO_MAX         256  /* max pages in a single transaction */
+
+/* An entry in the in-memory undo log: the page number and its content before
+ * the write that is part of an explicit transaction. */
+typedef struct {
+    uint32_t pno;
+    uint8_t  old[PAGE_SIZE];
+} UndoEntry;
 
 /* ------------------------------------------------------- memory tuning
  * These constants define how the "brain" behaves. They are the knobs worth
@@ -170,11 +179,15 @@ typedef struct {
     int       fd;
     char      path[512];
     uint32_t  page_count;
+    uint32_t  free_list;    /* head of singly-linked free page list */
     uint32_t  catalog_page;
     uint32_t  links_page;
     uint64_t  next_rid;
     Catalog   cat;
     LinkStore links;
+    int       txn_active;   /* 1 between BEGIN and COMMIT/ROLLBACK */
+    UndoEntry undo[UNDO_MAX];
+    int       undo_depth;
     char      err[MAX_ERR];
 } DB;
 
@@ -201,6 +214,10 @@ void     db_close(DB *db);
 int      pager_read(DB *db, uint32_t pno, void *buf);
 int      pager_write(DB *db, uint32_t pno, const void *buf);
 uint32_t pager_alloc(DB *db);
+void     pager_free(DB *db, uint32_t pno);
+int      pager_undo_capture(DB *db, uint32_t pno);
+void     pager_undo_rollback(DB *db);
+void     pager_undo_commit(DB *db);
 int      db_flush_catalog(DB *db);
 int      db_sync(DB *db);
 int      db_write_links_blob(DB *db, const uint8_t *blob, size_t len);
@@ -219,6 +236,7 @@ int    table_col_index(const Table *t, const char *name);
 int heap_insert(DB *db, Table *t, Row *r);
 int heap_delete(DB *db, Table *t, RowRef ref);
 int heap_replace(DB *db, Table *t, RowRef ref, Row *r);
+void heap_free_pages(DB *db, Table *t);
 int heap_read_row(DB *db, RowRef ref, Row *out);
 
 typedef struct {
@@ -245,6 +263,7 @@ int     links_load(DB *db);
 void    links_free(DB *db);
 double  mem_link_weight(DB *db, uint64_t a, uint64_t b);
 int     mem_link_count(DB *db);
+void    mem_link_set(DB *db, uint64_t a, uint64_t b, float w);
 int  mem_top_links(DB *db, Link *out, int max);
 void mem_forget_row(DB *db, uint64_t rid);
 
@@ -274,7 +293,8 @@ typedef enum {
  * fit inside one page. Overflowing this is reported as an error rather than
  * silently truncated - quietly losing the tail of someone's data is worse
  * than refusing it. */
-#define MAX_TOKEN 4096
+#define MAX_TOKEN     4096   /* max length of a single token (string literal, identifier, etc.) */
+#define MAX_ROW_SIZE (64 * 1024)  /* max serialised row; may span multiple pages via overflow chain */
 
 typedef struct {
     TokKind kind;
@@ -334,21 +354,29 @@ typedef enum {
     EX_CAST,      /* CAST(x AS type)             */
     EX_CASE,      /* CASE [x] WHEN..THEN..ELSE   */
     EX_BETWEEN,
-    EX_AGG        /* COUNT/SUM/AVG/MIN/MAX       */
+    EX_AGG,       /* COUNT/SUM/AVG/MIN/MAX       */
+    EX_SUBQUERY   /* (SELECT ...) subquery       */
 } ExprKind;
 
-#define MAX_FUNC_ARGS 8
+#define MAX_FUNC_ARGS  16
+
+/* Subquery types */
+#define SUBQ_SCALAR 0
+#define SUBQ_EXISTS 1
+
+struct Stmt;
 
 typedef struct Expr Expr;
 struct Expr {
     ExprKind kind;
     Value    lit;
     char     col[MAX_NAME];
+    char     col_table[MAX_NAME];   /* table qualifier, empty if unqualified */
     BinOp    op;
     Expr    *l, *r;
     Expr    *items[MAX_IN_ITEMS];   /* IN list, or CASE WHEN/THEN pairs */
     int      nitems;
-    int      negated;   /* NOT IN / NOT LIKE / NOT BETWEEN */
+    int      negated;   /* NOT IN / NOT LIKE / NOT BETWEEN / NOT EXISTS */
     char     esc;       /* LIKE ... ESCAPE 'c', 0 = none    */
 
     /* EX_FUNC / EX_AGG / EX_BETWEEN */
@@ -357,12 +385,17 @@ struct Expr {
     int      nargs;
     uint8_t  agg;        /* AggKind                      */
     uint8_t  agg_star;   /* COUNT(*)                     */
+    uint8_t  agg_distinct; /* COUNT(DISTINCT x)          */
     int      agg_slot;   /* index into the group's states */
 
     /* EX_CAST */
     uint8_t  cast_type;
     uint8_t  cast_sub;
     uint32_t cast_len;
+
+    /* EX_SUBQUERY / EX_IN (subquery) */
+    struct Stmt *sub;
+    uint8_t      subq_type;   /* SUBQ_SCALAR or SUBQ_EXISTS */
 };
 
 void expr_free(Expr *e);
@@ -370,6 +403,8 @@ void expr_free(Expr *e);
 /* A select-list entry is either '*' or an arbitrary expression. */
 typedef struct {
     int   is_star;
+    int   col_star;       /* t.* — star qualified by a table name */
+    char  col_table[MAX_NAME];  /* table name for col_star */
     Expr *e;
     char  alias[MAX_NAME];
     char  label[MAX_NAME];   /* heading to print */
@@ -380,8 +415,22 @@ typedef struct {
     int   desc;
 } OrderKey;
 
-#define MAX_ORDER_KEYS 8
-#define MAX_GROUP_KEYS 8
+typedef enum {
+    JOIN_INNER,
+    JOIN_LEFT
+} JoinType;
+
+typedef struct {
+    JoinType type;
+    char     table[MAX_NAME];
+    char     alias[MAX_NAME];
+    Expr    *on;
+} Join;
+
+#define MAX_ORDER_KEYS  16
+#define MAX_GROUP_KEYS  16
+#define MAX_JOINS       16
+#define MAX_AGGS        32   /* aggregate functions (COUNT, SUM, etc) per query */
 
 typedef struct {
     char  col[MAX_NAME];
@@ -394,6 +443,8 @@ typedef enum {
     ST_DROP,
     ST_ALTER_ADD,
     ST_ALTER_DROP,
+    ST_ALTER_RENAME,
+    ST_ALTER_TYPE,
     ST_TRUNCATE,
     ST_INSERT,
     ST_SELECT,
@@ -406,7 +457,12 @@ typedef enum {
     ST_SHOW_MEMORY,
     ST_SHOW_LINKS,
     ST_PRINT,
-    ST_CHECKPOINT
+    ST_CHECKPOINT,
+    ST_BEGIN,
+    ST_COMMIT,
+    ST_ROLLBACK,
+    ST_EXPLAIN,
+    ST_VACUUM
 } StKind;
 
 typedef struct Stmt {
@@ -421,9 +477,9 @@ typedef struct Stmt {
     /* INSERT */
     char   ins_cols[MAX_COLS][MAX_NAME];
     int    n_ins_cols;
-    Expr  *rows[64][MAX_COLS];
+    Expr  *rows[MAX_INSERT_ROWS][MAX_COLS];
     int    nrows;
-    int    row_width[64];
+    int    row_width[MAX_INSERT_ROWS];
 
     /* SELECT / RECALL / SHOW */
     SelItem  items[MAX_SELECT_ITEMS];
@@ -431,6 +487,7 @@ typedef struct Stmt {
     Expr    *where;
     int      distinct;
     int      has_from;
+    char     alias[MAX_NAME];     /* table alias for the primary table */
     Expr    *group[MAX_GROUP_KEYS];
     int      ngroup;
     Expr    *having;
@@ -438,6 +495,8 @@ typedef struct Stmt {
     int      norder;
     struct Stmt *sub;         /* INSERT INTO ... SELECT */
     int      top;             /* -1 = unlimited */
+    Join     joins[MAX_JOINS];
+    int      njoins;
     /* sized to match the lexer's literal limit, so a RECALL phrase can never
      * be silently clipped on its way in */
     char    recall_text[MAX_TOKEN];
@@ -457,11 +516,17 @@ int parse_stmt(Lexer *lx, Stmt *out, char *err);   /* 1 = stmt, 0 = end, -1 = er
 
 /* exec.c */
 int exec_stmt(DB *db, Stmt *s, char *err);
+int row_matches(const Expr *where, const Row *row, const Table *t,
+                int64_t now, int *match, char *err);
 void exec_set_reinforce(int on);
 int  exec_reinforce_enabled(void);
+int  row_matches_join(const Expr *where, const Table **tables,
+                      const Row **rows, const char **aliases,
+                      int ntables, int64_t now, int *match, char *err);
+extern DB *g_db;
 
 /* result formatting, shared between exec.c and select.c */
-#define MAX_OUT_COLS 40
+#define MAX_OUT_COLS 64
 
 typedef struct {
     int    ncols;
@@ -475,10 +540,10 @@ int  grid_row(Grid *g, char **vals);
 void grid_print(Grid *g);
 void grid_free(Grid *g);
 
-int  row_matches(const Expr *where, const Row *row, const Table *t,
-                 int64_t now, int *match, char *err);
 int  pseudo_col_index(const char *name);
 void exec_set_agg_context(const Value *vals, int n);
+void exec_set_join_ctx(const Table **tables, const Row **rows,
+                       const char **aliases, int n);
 
 /* select.c
  *

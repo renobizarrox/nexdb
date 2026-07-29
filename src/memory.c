@@ -215,6 +215,17 @@ int mem_link_count(DB *db)
     return (int)db->links.n;
 }
 
+/* Set a single link's weight directly (used by VACUUM to copy links). */
+void mem_link_set(DB *db, uint64_t a, uint64_t b, float w)
+{
+    if (a == 0 || b == 0 || a == b) return;
+    if (a > b) { uint64_t t = a; a = b; b = t; }
+    LinkStore *ls = &db->links;
+    if (!ls->e && links_init(ls, 1024) < 0) return;
+    Link *l = link_slot(ls, a, b, 1);
+    if (l) { l->w = w; ls->dirty = 1; }
+}
+
 static int link_cmp_desc(const void *x, const void *y)
 {
     const Link *a = x, *b = y;
