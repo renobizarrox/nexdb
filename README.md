@@ -204,7 +204,7 @@ BIN=/tmp/nexdb-asan sh tests/run_tests.sh
 
 ## What it does not do yet
 
-`LIMITATIONS.md` is the full audit — every gap, verified by probing the binary,
+This was verified by probing the binary,
 with the silent-wrongness bugs listed first. The short version, in the order
 they'd hurt:
 
