@@ -28,8 +28,9 @@
 #define MAGIC       "nexdb\x01\x00"
 #define MAGIC_LEN   8
 /* v2 added per-column length limits, integer widths and key flags.
- * v3 added DEFAULT and IDENTITY metadata, and the packed UUID value type. */
-#define FMT_VERSION 3u
+ * v3 added DEFAULT and IDENTITY metadata, and the packed UUID value type.
+ * v4 added multi-index support (Index array replacing single btree_root). */
+#define FMT_VERSION 4u
 
 /* heap page header: next(4) nslots(2) free_start(2) free_end(2) pad(2) */
 #define HP_NEXT       0
@@ -221,6 +222,13 @@ static size_t catalog_serialize(const Catalog *c, uint8_t **out)
         wr32(b, o, t->first_page); o += 4;
         wr32(b, o, t->last_page);  o += 4;
         wr64(b, o, (uint64_t)t->nrows); o += 8;
+        wr32(b, o, (uint32_t)t->nindexes); o += 4;
+        for (int k = 0; k < t->nindexes; k++) {
+            wr32(b, o, t->indexes[k].root); o += 4;
+            b[o++] = (uint8_t)t->indexes[k].col;
+            b[o++] = t->indexes[k].valid;
+            b[o++] = 0; b[o++] = 0;
+        }
     }
     *out = b;
     return o;
@@ -261,10 +269,18 @@ static void catalog_deserialize(Catalog *c, const uint8_t *b, size_t len)
             cl->id_next     = (int64_t)rd64(b, o); o += 8;
             cl->id_step     = (int64_t)rd64(b, o); o += 8;
         }
-        if (o + 16 > len) return;
+        if (o + 20 > len) return;
         t->first_page = rd32(b, o); o += 4;
         t->last_page  = rd32(b, o); o += 4;
         t->nrows      = (int64_t)rd64(b, o); o += 8;
+        t->nindexes   = (int32_t)rd32(b, o); o += 4;
+        if (t->nindexes < 0 || t->nindexes > MAX_INDEXES) t->nindexes = 0;
+        for (int k = 0; k < t->nindexes; k++) {
+            if (o + 8 > len) { t->nindexes = k; break; }
+            t->indexes[k].root  = rd32(b, o); o += 4;
+            t->indexes[k].col   = (int8_t)b[o++];
+            t->indexes[k].valid = b[o++]; o += 2;
+        }
         c->ntables = i + 1;
     }
 }
@@ -406,6 +422,7 @@ Table *cat_create(DB *db, const char *name, const Column *cols, int ncols)
     t->first_page = 0;
     t->last_page = 0;
     t->nrows = 0;
+
     db->cat.ntables++;
     if (db_flush_catalog(db) < 0) return NULL;
     return t;
@@ -717,6 +734,22 @@ int heap_read_meta(DB *db, RowRef ref, uint32_t *access, int64_t *last, float *s
     *access   = rd32(pg, off + TUP_ACCESS);
     *last     = (int64_t)rd64(pg, off + TUP_LAST);
     memcpy(strength, pg + off + TUP_STRENGTH, 4);
+    return 0;
+}
+
+/* Read a full row from a heap page by its row reference. */
+int heap_read_row(DB *db, RowRef ref, Row *out)
+{
+    uint8_t pg[PAGE_SIZE];
+    if (pager_read(db, ref.page, pg) < 0) return -1;
+    uint16_t nslots = rd16(pg, HP_NSLOTS);
+    if (ref.slot >= nslots) return -1;
+    uint16_t off = rd16(pg, HP_HDR_SIZE + ref.slot * SLOT_SIZE + 0);
+    uint16_t len = rd16(pg, HP_HDR_SIZE + ref.slot * SLOT_SIZE + 2);
+    if (off == 0 || len < TUP_HDR_SIZE) return -1;
+    if (off < HP_HDR_SIZE || (size_t)off + len > PAGE_SIZE) return -1;
+    if (tuple_decode(pg + off, len, out) < 0) return -1;
+    out->ref = ref;
     return 0;
 }
 

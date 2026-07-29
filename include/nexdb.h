@@ -23,6 +23,7 @@
 #define MAX_NAME         64
 #define MAX_COLS         32
 #define MAX_TABLES       64
+#define MAX_INDEXES      16
 #define MAX_ERR          256
 #define MAX_SELECT_ITEMS 64
 #define MAX_SET_ITEMS    32
@@ -127,12 +128,21 @@ int         valid_datetime(const char *s);
 int         text_to_number(const char *s, double *out, int *is_int, int64_t *ival);
 
 typedef struct {
+    uint32_t root;
+    int8_t   col;
+    uint8_t  valid;
+    uint8_t  _pad[2];
+} Index;
+
+typedef struct {
     char     name[MAX_NAME];
     int32_t  ncols;
     Column   cols[MAX_COLS];
     uint32_t first_page;
     uint32_t last_page;
     int64_t  nrows;
+    int32_t  nindexes;
+    Index    indexes[MAX_INDEXES];
 } Table;
 
 typedef struct {
@@ -209,6 +219,7 @@ int    table_col_index(const Table *t, const char *name);
 int heap_insert(DB *db, Table *t, Row *r);
 int heap_delete(DB *db, Table *t, RowRef ref);
 int heap_replace(DB *db, Table *t, RowRef ref, Row *r);
+int heap_read_row(DB *db, RowRef ref, Row *out);
 
 typedef struct {
     DB      *db;
@@ -234,8 +245,20 @@ int     links_load(DB *db);
 void    links_free(DB *db);
 double  mem_link_weight(DB *db, uint64_t a, uint64_t b);
 int     mem_link_count(DB *db);
-int     mem_top_links(DB *db, Link *out, int max);
-void    mem_forget_row(DB *db, uint64_t rid);
+int  mem_top_links(DB *db, Link *out, int max);
+void mem_forget_row(DB *db, uint64_t rid);
+
+/* btree.c */
+int  btree_create(Index *idx);
+int  btree_find(DB *db, uint32_t root, const Value *key, RowRef *ref, char *err);
+int  btree_insert(DB *db, uint32_t *root, const Value *key, RowRef ref, char *err);
+int  btree_delete(DB *db, uint32_t *root, const Value *key, char *err);
+int  btree_destroy(DB *db, uint32_t root);
+int  btree_has_key(DB *db, uint32_t root, const Value *key, char *err);
+
+/* index helpers in exec.c */
+int  table_ensure_index(DB *db, Table *t, int col);
+int  table_find_index(const Table *t, int col);
 
 /* ----------------------------------------------------------------- lexer */
 

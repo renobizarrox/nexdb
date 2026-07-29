@@ -128,7 +128,7 @@ FORGET FROM notes WHERE id = 8;     -- zero the strength, keep the row
 | DDL           | `CREATE TABLE`, `DROP TABLE [IF EXISTS]`                                                                                         |
 | Types         | `TINYINT`/`SMALLINT`/`INT`/`BIGINT`, `FLOAT`/`REAL`/`DECIMAL`, `NVARCHAR(n)`/`NVARCHAR(MAX)`/`VARCHAR`/`TEXT`, `BIT`, `DATETIME` |
 | Constraints   | `NOT NULL`, `PRIMARY KEY`, `UNIQUE` — all enforced                                                                               |
-| Queries       | `SELECT`, `TOP n`, column aliases with `AS`, `COUNT(*)`, `WHERE`, `ORDER BY ... ASC/DESC`                                        |
+| Queries       | `SELECT`, `TOP n`, column aliases with `AS`, `COUNT(*)`, `SUM`, `AVG`, `MIN`, `MAX`, `GROUP BY`, `WHERE`, `ORDER BY ... ASC/DESC` |
 | Predicates    | `= <> != < <= > >=`, `AND`, `OR`, `NOT`, `LIKE` with `%`/`_` and `ESCAPE`, `IN (...)`, `IS [NOT] NULL`                           |
 | Arithmetic    | `+ - * /`, and `+` concatenates when either side is text                                                                         |
 | Writes        | `INSERT ... VALUES (...), (...)`, `UPDATE ... SET`, `DELETE`                                                                     |
@@ -177,9 +177,12 @@ your own interference. It is also the right flag for dashboards and backups.
 include/nexdb.h   all types and interfaces
 src/pager.c       4 KB pages, slotted heap pages, persisted catalog
 src/memory.c      strength, decay, and the Hebbian association table
+src/btree.c       B-tree index on primary keys
 src/lexer.c       tokenizer
 src/parser.c      recursive-descent parser producing an AST
+src/func.c        scalar functions and UUID support
 src/exec.c        executor, reinforcement, result formatting
+src/select.c      GROUP BY and aggregation
 src/main.c        shell and script runner
 tests/            137 integration tests, run with `make test`
 ```
@@ -208,12 +211,10 @@ This was verified by probing the binary,
 with the silent-wrongness bugs listed first. The short version, in the order
 they'd hurt:
 
-- **No indexes.** Every query is a full table scan. Fine for thousands of rows,
-not for millions. A B-tree on primary keys is the obvious next step.
 - **No crash safety.** There's no write-ahead log, so a power cut mid-write can
 corrupt the file. Only a clean exit calls `fsync`; `CHECKPOINT` writes pages
 but leaves them in the OS cache. Keep backups.
-- **No joins,** `GROUP BY`**, or aggregates beyond** `COUNT(*)`**.**
+- **No joins.** `GROUP BY` and aggregates (`SUM`, `AVG`, `MIN`, `MAX`) are supported; scalar functions like `LEN`, `UPPER`, `SUBSTRING`, `COALESCE`, `ABS`, `ROUND` and others work too.
 - **Single user.** No locking; do not point two processes at one file.
 - **Deleted pages are not reused.** Space is reclaimed within a page but a page
 emptied entirely stays allocated, so heavy delete cycles grow the file.
@@ -223,8 +224,6 @@ semantic recall would need embeddings, which is the biggest single upgrade
 available.
 - **No transactions**, so no `BEGIN`/`COMMIT`/`ROLLBACK`, and a script that fails
 halfway leaves the earlier statements applied.
-- **Uniqueness costs a full scan per write**, since there are no indexes yet, so
-bulk-loading into a table with a `PRIMARY KEY` is quadratic.
 - **Rows must fit in one 4 KB page**, capping a row at roughly 4,000 bytes.
 - Limits: 64 tables, 32 columns per table, 63-character names.
 

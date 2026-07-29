@@ -947,42 +947,101 @@ static int coerce_to_column(const Column *c, Value *v, char *err)
     return 0;
 }
 
+/* Find the index descriptor for a column, or -1 if none. */
+int table_find_index(const Table *t, int col)
+{
+    for (int i = 0; i < t->nindexes; i++)
+        if (t->indexes[i].valid && t->indexes[i].col == col)
+            return i;
+    return -1;
+}
+
+/* Ensure an index exists for the given column. Creates one if needed. */
+int table_ensure_index(DB *db, Table *t, int col)
+{
+    int idx = table_find_index(t, col);
+    if (idx >= 0) return idx;
+    if (t->nindexes >= MAX_INDEXES) {
+        snprintf(db->err, MAX_ERR, "too many indexes (max %d)", MAX_INDEXES);
+        return -1;
+    }
+    idx = t->nindexes++;
+    t->indexes[idx].col = col;
+    btree_create(&t->indexes[idx]);
+    return idx;
+}
+
+/* Insert a key+ref into every index that covers the given column. */
+static int index_insert_row(DB *db, Table *t, const Row *r, char *err)
+{
+    for (int i = 0; i < t->nindexes; i++) {
+        if (!t->indexes[i].valid) continue;
+        int col = t->indexes[i].col;
+        if (col < 0 || col >= r->ncols || r->v[col].tag == T_NULL) continue;
+        uint32_t old_root = t->indexes[i].root;
+        if (btree_insert(db, &t->indexes[i].root, &r->v[col], r->ref, err) < 0)
+            return -1;
+        if (t->indexes[i].root != old_root)
+            db_flush_catalog(db);
+    }
+    return 0;
+}
+
 /* Reject a row that would duplicate a PRIMARY KEY or UNIQUE value.
  *
- * This is a full scan per constrained column, which is honest for a prototype
- * with no indexes: correctness first, then make it fast. exclude_rid lets an
- * UPDATE skip the row it is rewriting. */
+ * Uses the B-tree index per-column for O(log n) lookups when an index exists,
+ * falling back to a full scan for any column without an index. */
 static int check_unique(DB *db, Table *t, const Row *cand, uint64_t exclude_rid,
                         char *err)
 {
-    int constrained = 0;
-    for (int c = 0; c < t->ncols; c++)
-        if (t->cols[c].unique) constrained = 1;
-    if (!constrained) return 0;
-
-    Scan sc;
-    Row r;
-    scan_init(&sc, db, t);
-    while (scan_next(&sc, &r)) {
-        if (r.rid == exclude_rid) { row_clear(&r); continue; }
-        for (int c = 0; c < t->ncols; c++) {
-            if (!t->cols[c].unique) continue;
-            if (c >= cand->ncols || c >= r.ncols) continue;
-            if (cand->v[c].tag == T_NULL || r.v[c].tag == T_NULL) continue;
-            int ok;
-            if (val_compare(&cand->v[c], &r.v[c], &ok) == 0 && ok == 1) {
-                char shown[128];
-                val_format(&cand->v[c], shown, sizeof shown);
-                snprintf(err, MAX_ERR,
-                         "%s '%s' already exists in %s.%s (row _rid %llu)",
-                         t->cols[c].is_pk ? "primary key" : "unique value",
-                         shown, t->name, t->cols[c].name,
-                         (unsigned long long)r.rid);
+    for (int c = 0; c < t->ncols; c++) {
+        if (!t->cols[c].unique) continue;
+        if (c >= cand->ncols || cand->v[c].tag == T_NULL) continue;
+        int idx = table_find_index(t, c);
+        RowRef existing;
+        if (idx >= 0) {
+            int found = btree_find(db, t->indexes[idx].root, &cand->v[c], &existing, err);
+            if (found == 0) {
+                uint64_t found_rid = 0;
+                if (exclude_rid) {
+                    Row found_row;
+                    if (heap_read_row(db, existing, &found_row) == 0)
+                        found_rid = found_row.rid;
+                    row_clear(&found_row);
+                }
+                if (!exclude_rid || found_rid != exclude_rid) {
+                    char shown[128];
+                    val_format(&cand->v[c], shown, sizeof shown);
+                    snprintf(err, MAX_ERR,
+                             "%s '%s' already exists in %s.%s",
+                             t->cols[c].is_pk ? "primary key" : "unique value",
+                             shown, t->name, t->cols[c].name);
+                    return -1;
+                }
+            }
+        } else {
+            /* No index: full scan for this column */
+            Scan sc;
+            Row r;
+            scan_init(&sc, db, t);
+            while (scan_next(&sc, &r)) {
+                if (r.rid == exclude_rid) { row_clear(&r); continue; }
+                if (c >= r.ncols || r.v[c].tag == T_NULL) { row_clear(&r); continue; }
+                int ok;
+                if (val_compare(&cand->v[c], &r.v[c], &ok) == 0 && ok == 1) {
+                    char shown[128];
+                    val_format(&cand->v[c], shown, sizeof shown);
+                    snprintf(err, MAX_ERR,
+                             "%s '%s' already exists in %s.%s (row _rid %llu)",
+                             t->cols[c].is_pk ? "primary key" : "unique value",
+                             shown, t->name, t->cols[c].name,
+                             (unsigned long long)r.rid);
+                    row_clear(&r);
+                    return -1;
+                }
                 row_clear(&r);
-                return -1;
             }
         }
-        row_clear(&r);
     }
     return 0;
 }
@@ -1130,6 +1189,12 @@ static int exec_insert(DB *db, Stmt *s, char *err)
             row_clear(&r);
             return -1;
         }
+
+        if (index_insert_row(db, t, &r, err) < 0) {
+            row_clear(&r);
+            return -1;
+        }
+
         row_clear(&r);
         inserted++;
     }
@@ -1230,6 +1295,11 @@ static int exec_insert_select(DB *db, Stmt *s, char *err)
             snprintf(err, MAX_ERR, "%s", db->err);
             row_clear(&r); capture_free(&cap); return -1;
         }
+
+        if (index_insert_row(db, t, &r, err) < 0) {
+            row_clear(&r); capture_free(&cap); return -1;
+        }
+
         row_clear(&r);
         inserted++;
     }
@@ -1269,6 +1339,14 @@ static int exec_truncate(DB *db, Stmt *s, char *err)
         n++;
         row_clear(&r);
     }
+    for (int i = 0; i < t->nindexes; i++) {
+        if (t->indexes[i].root) {
+            btree_destroy(db, t->indexes[i].root);
+            t->indexes[i].root = 0;
+            t->indexes[i].valid = 0;
+        }
+    }
+    t->nindexes = 0;
     for (int i = 0; i < n; i++) {
         heap_delete(db, t, refs[i]);
         mem_forget_row(db, rids[i]);
@@ -1347,6 +1425,28 @@ static int exec_alter(DB *db, Stmt *s, char *err)
         for (int c = dropidx; c < t->ncols - 1; c++) t->cols[c] = t->cols[c + 1];
         t->ncols--;
     }
+
+    /* add/drop index for the column */
+    if (adding && added.unique) {
+        int idx = table_ensure_index(db, t, t->ncols - 1);
+        if (idx < 0) { rs_free(&rs); return -1; }
+    } else if (!adding) {
+        /* destroy index on the dropped column if one exists */
+        for (int ki = 0; ki < t->nindexes; ki++) {
+            if (t->indexes[ki].col == dropidx) {
+                if (t->indexes[ki].root) btree_destroy(db, t->indexes[ki].root);
+                /* shift remaining indexes down */
+                for (int kk = ki; kk < t->nindexes - 1; kk++)
+                    t->indexes[kk] = t->indexes[kk + 1];
+                t->indexes[t->nindexes - 1].root = 0;
+                t->indexes[t->nindexes - 1].col = -1;
+                t->indexes[t->nindexes - 1].valid = 0;
+                t->nindexes--;
+                break;
+            }
+        }
+    }
+
     if (db_flush_catalog(db) < 0) {
         rs_free(&rs);
         snprintf(err, MAX_ERR, "%s", db->err);
@@ -1382,11 +1482,26 @@ static int exec_alter(DB *db, Stmt *s, char *err)
             while (o < t->ncols) out.v[o++] = val_null();
         }
 
-        if (heap_replace(db, t, row->ref, &out) < 0) {
+        RowRef old_ref = row->ref;
+        if (heap_replace(db, t, old_ref, &out) < 0) {
             snprintf(err, MAX_ERR, "%s", db->err);
             row_clear(&out);
             rs_free(&rs);
             return -1;
+        }
+
+        /* update all indexes: delete old ref, insert new ref */
+        for (int ki = 0; ki < t->nindexes; ki++) {
+            if (!t->indexes[ki].valid) continue;
+            int col = t->indexes[ki].col;
+            if (col < 0) continue;
+            if (col < row->ncols && row->v[col].tag != T_NULL)
+                btree_delete(db, &t->indexes[ki].root, &row->v[col], err);
+            if (col < out.ncols && out.v[col].tag != T_NULL) {
+                if (btree_insert(db, &t->indexes[ki].root, &out.v[col], out.ref, err) < 0) {
+                    row_clear(&out); rs_free(&rs); return -1;
+                }
+            }
         }
         row_clear(&out);
     }
@@ -1448,15 +1563,26 @@ static int exec_update(DB *db, Stmt *s, char *err)
     int changed = 0;
     for (int i = 0; i < rs.n; i++) {
         Row *row = &rs.rows[i];
+
+        /* save indexed column values before SET modifies them */
+        Value old_idx_vals[MAX_INDEXES];
+        for (int ki = 0; ki < t->nindexes; ki++) {
+            int col = t->indexes[ki].col;
+            old_idx_vals[ki] = (col >= 0 && col < row->ncols)
+                               ? val_copy(&row->v[col]) : val_null();
+        }
+
         for (int j = 0; j < s->nsets; j++) {
             int idx = table_col_index(t, s->sets[j].col);
             Value v;
             if (eval_expr(s->sets[j].val, row, t, now, &v, err) < 0) {
+                for (int ki = 0; ki < t->nindexes; ki++) val_clear(&old_idx_vals[ki]);
                 rs_free(&rs);
                 return -1;
             }
             if (coerce_to_column(&t->cols[idx], &v, err) < 0) {
                 val_clear(&v);
+                for (int ki = 0; ki < t->nindexes; ki++) val_clear(&old_idx_vals[ki]);
                 rs_free(&rs);
                 return -1;
             }
@@ -1464,6 +1590,7 @@ static int exec_update(DB *db, Stmt *s, char *err)
                 snprintf(err, MAX_ERR, "column '%s' does not accept NULL",
                          t->cols[idx].name);
                 val_clear(&v);
+                for (int ki = 0; ki < t->nindexes; ki++) val_clear(&old_idx_vals[ki]);
                 rs_free(&rs);
                 return -1;
             }
@@ -1472,19 +1599,32 @@ static int exec_update(DB *db, Stmt *s, char *err)
         }
 
         if (check_unique(db, t, row, row->rid, err) < 0) {
+            for (int ki = 0; ki < t->nindexes; ki++) val_clear(&old_idx_vals[ki]);
             rs_free(&rs);
             return -1;
         }
-        /* writing counts as a strong access, so carry the metadata forward
-         * and let mem_touch apply the boost afterwards */
         double cur = mem_strength_at(row->strength, row->last_access, now);
         row->strength = (float)cur;
         row->last_access = now;
         if (heap_replace(db, t, row->ref, row) < 0) {
             snprintf(err, MAX_ERR, "%s", db->err);
+            for (int ki = 0; ki < t->nindexes; ki++) val_clear(&old_idx_vals[ki]);
             rs_free(&rs);
             return -1;
         }
+
+        /* update all indexes: delete old entries, insert new ones */
+        for (int ki = 0; ki < t->nindexes; ki++) {
+            if (!t->indexes[ki].valid) continue;
+            int col = t->indexes[ki].col;
+            if (col < 0) continue;
+            if (old_idx_vals[ki].tag != T_NULL)
+                btree_delete(db, &t->indexes[ki].root, &old_idx_vals[ki], err);
+            if (col < row->ncols && row->v[col].tag != T_NULL)
+                btree_insert(db, &t->indexes[ki].root, &row->v[col], row->ref, err);
+            val_clear(&old_idx_vals[ki]);
+        }
+
         mem_touch(db, t, row->ref, MEM_BOOST);
         changed++;
     }
@@ -1500,47 +1640,41 @@ static int exec_delete(DB *db, Stmt *s, char *err)
     if (!t) { snprintf(err, MAX_ERR, "unknown table '%s'", s->table); return -1; }
     int64_t now = mem_now();
 
-    RowRef *refs = NULL;
-    uint64_t *rids = NULL;
-    int n = 0, cap = 0;
-
+    RowSet rs;
+    rs_init(&rs);
     Scan sc;
     Row r;
     scan_init(&sc, db, t);
     while (scan_next(&sc, &r)) {
         int m;
         if (row_matches(s->where, &r, t, now, &m, err) < 0) {
-            row_clear(&r); free(refs); free(rids); return -1;
+            row_clear(&r); rs_free(&rs); return -1;
         }
         if (m) {
-            if (n == cap) {
-                cap = cap ? cap * 2 : 64;
-                RowRef *nr = realloc(refs, sizeof(RowRef) * cap);
-                uint64_t *ni = realloc(rids, sizeof(uint64_t) * cap);
-                if (!nr || !ni) {
-                    free(nr ? nr : refs); free(ni ? ni : rids);
-                    row_clear(&r);
-                    snprintf(err, MAX_ERR, "out of memory");
-                    return -1;
-                }
-                refs = nr; rids = ni;
+            if (rs_push(&rs, &r, 0) < 0) {
+                row_clear(&r); rs_free(&rs);
+                snprintf(err, MAX_ERR, "out of memory");
+                return -1;
             }
-            refs[n] = r.ref;
-            rids[n] = r.rid;
-            n++;
         }
-        row_clear(&r);
     }
 
     int deleted = 0;
-    for (int i = 0; i < n; i++) {
-        if (heap_delete(db, t, refs[i]) == 0) {
-            mem_forget_row(db, rids[i]);
+    for (int i = 0; i < rs.n; i++) {
+        Row *row = &rs.rows[i];
+        if (heap_delete(db, t, row->ref) == 0) {
+            mem_forget_row(db, row->rid);
+            /* delete from every index */
+            for (int ki = 0; ki < t->nindexes; ki++) {
+                if (!t->indexes[ki].valid) continue;
+                int col = t->indexes[ki].col;
+                if (col < 0 || col >= row->ncols || row->v[col].tag == T_NULL) continue;
+                btree_delete(db, &t->indexes[ki].root, &row->v[col], err);
+            }
             deleted++;
         }
     }
-    free(refs);
-    free(rids);
+    rs_free(&rs);
 
     printf("(%d row%s deleted)\n", deleted, deleted == 1 ? "" : "s");
     return db_flush_catalog(db);
@@ -1771,19 +1905,39 @@ int exec_stmt(DB *db, Stmt *s, char *err)
     case ST_NOOP:
         return 0;
 
-    case ST_CREATE:
+    case ST_CREATE: {
         if (!cat_create(db, s->table, s->cols, s->ncols)) {
+            snprintf(err, MAX_ERR, "%s", db->err);
+            return -1;
+        }
+        Table *ct = cat_find(db, s->table);
+        for (int ci = 0; ci < s->ncols && ct; ci++) {
+            if (s->cols[ci].unique) {
+                int idx = table_ensure_index(db, ct, ci);
+                if (idx < 0) return -1;
+            }
+        }
+        if (db_flush_catalog(db) < 0) {
             snprintf(err, MAX_ERR, "%s", db->err);
             return -1;
         }
         printf("table '%s' created with %d column%s\n", s->table, s->ncols,
                s->ncols == 1 ? "" : "s");
         return 0;
+    }
 
     case ST_DROP: {
         Table *t = cat_find(db, s->table);
         if (!t && s->if_exists) return 0;
         if (!t) { snprintf(err, MAX_ERR, "unknown table '%s'", s->table); return -1; }
+        for (int ki = 0; ki < t->nindexes; ki++) {
+            if (t->indexes[ki].root) {
+                btree_destroy(db, t->indexes[ki].root);
+                t->indexes[ki].root = 0;
+                t->indexes[ki].valid = 0;
+            }
+        }
+        t->nindexes = 0;
         /* forget the associations belonging to the rows we are about to lose */
         Scan sc;
         Row r;

@@ -498,8 +498,75 @@ int exec_select_into(DB *db, Stmt *s, Capture *capture, char *err)
         goto emit;
     }
 
+    /* ---- try point-lookup via index for "WHERE indexed_col = literal" */
+    int point_lookup = 0;
+    Value point_key;
+    memset(&point_key, 0, sizeof point_key);
+    int point_col = -1;
+    if (!grouped && s->has_from && s->where && s->where->kind == EX_BIN &&
+        s->where->op == OP_EQ) {
+        Expr *l = s->where->l, *r = s->where->r;
+        if (l && r && l->kind == EX_COL && r->kind == EX_LIT) {
+            point_col = table_col_index(t, l->col);
+            if (point_col >= 0) {
+                int idx = table_find_index(t, point_col);
+                if (idx >= 0 && t->indexes[idx].valid) {
+                    point_key = val_copy(&r->lit);
+                    point_lookup = 1;
+                }
+            }
+        } else if (l && r && l->kind == EX_LIT && r->kind == EX_COL) {
+            point_col = table_col_index(t, r->col);
+            if (point_col >= 0) {
+                int idx = table_find_index(t, point_col);
+                if (idx >= 0 && t->indexes[idx].valid) {
+                    point_key = val_copy(&l->lit);
+                    point_lookup = 1;
+                }
+            }
+        }
+    }
+
     /* ---- scan, filter, and either project directly or fold into groups */
     if (!grouped) {
+        if (point_lookup) {
+            int idx = table_find_index(t, point_col);
+            RowRef ref;
+            if (btree_find(db, t->indexes[idx].root, &point_key, &ref, err) == 0) {
+                Row r;
+                if (heap_read_row(db, ref, &r) == 0) {
+                    if (res_grow(&res) < 0) {
+                        row_clear(&r); val_clear(&point_key); res_free(&res);
+                        snprintf(err, MAX_ERR, "out of memory");
+                        return -1;
+                    }
+                    int failed = 0;
+                    for (int c = 0; c < ncols && !failed; c++) {
+                        Value *dst = &res.cells[res.nrows * ncols + c];
+                        if (exprs[c]) {
+                            if (eval_expr(exprs[c], &r, t, now, dst, err) < 0) failed = 1;
+                        } else {
+                            int cm = colmap[c];
+                            *dst = (cm >= 0 && cm < r.ncols) ? val_copy(&r.v[cm]) : val_null();
+                        }
+                    }
+                    for (int k = 0; k < s->norder && !failed; k++) {
+                        Value *dst = &res.keys[res.nrows * s->norder + k];
+                        if (order_from_col[k] >= 0)
+                            *dst = val_copy(&res.cells[res.nrows * ncols + order_from_col[k]]);
+                        else if (eval_expr(s->order[k].e, &r, t, now, dst, err) < 0)
+                            failed = 1;
+                    }
+                    res.refs[res.nrows] = r.ref;
+                    res.rids[res.nrows] = r.rid;
+                    res.nrows++;
+                    row_clear(&r);
+                    if (failed) { val_clear(&point_key); res_free(&res); return -1; }
+                }
+            }
+            val_clear(&point_key);
+            goto point_done;
+        }
         Scan sc;
         Row r;
         scan_init(&sc, db, t);
@@ -709,6 +776,7 @@ int exec_select_into(DB *db, Stmt *s, Capture *capture, char *err)
         goto emit_grouped;
     }
 
+point_done:
 emit:
 emit_grouped:
     /* ---- DISTINCT: drop rows whose formatted cells repeat */
