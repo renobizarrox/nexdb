@@ -37,6 +37,13 @@
 #include <sys/select.h>
 #include <sys/wait.h>
 
+#ifdef ENABLE_TLS
+# include <openssl/ssl.h>
+# include <openssl/err.h>
+# include <openssl/crypto.h>
+static SSL_CTX *g_ssl_ctx = NULL;
+#endif
+
 /* ------------------------------------------------------------------ limits */
 #define MAX_SESSIONS   64
 #define MAX_LINE       (256 * 1024)  /* max incoming JSON line */
@@ -49,6 +56,9 @@ typedef struct {
     int64_t last_active;
     int    txn_active;
     int    txn_undo_depth;
+    int    txn_depth;
+    int    txn_sp_count;
+    int    txn_sp[MAX_SAVEPOINTS];
     char   db_err[MAX_ERR];
 } Session;
 
@@ -175,7 +185,11 @@ static void execute_sql(const char *sql, const char *session_id,
 
     if (sess && sess->txn_active) {
         g_db->txn_active = 1;
+        g_db->txn_depth = sess->txn_depth;
         g_db->undo_depth = sess->txn_undo_depth;
+        g_db->txn_sp_count = sess->txn_sp_count;
+        memcpy(g_db->txn_sp, sess->txn_sp,
+               sizeof(int) * (size_t)sess->txn_sp_count);
     }
 
     Lexer lx;
@@ -250,7 +264,11 @@ static void execute_sql(const char *sql, const char *session_id,
     if (sess) {
         sess->last_active = (int64_t)time(NULL);
         sess->txn_active = g_db->txn_active;
+        sess->txn_depth = g_db->txn_depth;
         sess->txn_undo_depth = g_db->undo_depth;
+        sess->txn_sp_count = g_db->txn_sp_count;
+        memcpy(sess->txn_sp, g_db->txn_sp,
+               sizeof(int) * (size_t)g_db->txn_sp_count);
     }
 
     /* Build JSON response */
@@ -308,20 +326,64 @@ static void execute_sql(const char *sql, const char *session_id,
     capture_free(&cap);
     free(captured);
 
-    if (!sess) {
+    if (!sess || !sess->txn_active) {
         g_db->txn_active = 0;
+        g_db->txn_depth = 0;
         g_db->undo_depth = 0;
-    }
-    if (sess && !sess->txn_active) {
-        g_db->txn_active = 0;
-        g_db->undo_depth = 0;
+        g_db->txn_sp_count = 0;
     }
 }
 
 /* ----------------------------------------------------------- per-client handler */
+
+#ifdef ENABLE_TLS
+/* Wrappers for TLS-aware read/write.  When ssl is non-NULL they use OpenSSL;
+ * otherwise they fall back to plain read/write. */
+static ssize_t conn_read(SSL *ssl, int fd, void *buf, size_t count)
+{
+    return ssl ? SSL_read(ssl, buf, (int)count) : read(fd, buf, count);
+}
+static ssize_t conn_write(SSL *ssl, int fd, const void *buf, size_t count)
+{
+    return ssl ? SSL_write(ssl, buf, (int)count) : write(fd, buf, count);
+}
+#else
+/* Plain wrappers when TLS is not compiled in – the compiler will optimise
+ * the ssl parameter away. */
+static ssize_t conn_read(void *ssl, int fd, void *buf, size_t count)
+{
+    (void)ssl; return read(fd, buf, count);
+}
+static ssize_t conn_write(void *ssl, int fd, const void *buf, size_t count)
+{
+    (void)ssl; return write(fd, buf, count);
+}
+#endif
+
 static void *client_handler(void *arg)
 {
     int fd = (int)(intptr_t)arg;
+
+#ifdef ENABLE_TLS
+    SSL *ssl = NULL;
+    if (g_ssl_ctx) {
+        ssl = SSL_new(g_ssl_ctx);
+        if (ssl) {
+            SSL_set_fd(ssl, fd);
+            int hr = SSL_accept(ssl);
+            if (hr <= 0) {
+                SSL_free(ssl);
+                ssl = NULL;
+            }
+        }
+        if (!ssl) {
+            close(fd);
+            return NULL;
+        }
+    }
+#else
+    void *ssl = NULL;
+#endif
 
     pthread_mutex_lock(&conn_lock);
     g_conn_count++;
@@ -335,6 +397,9 @@ static void *client_handler(void *arg)
     if (!line || !resp) {
         if (line) free(line);
         if (resp) free(resp);
+#ifdef ENABLE_TLS
+        if (ssl) { SSL_shutdown(ssl); SSL_free(ssl); }
+#endif
         close(fd);
         return NULL;
     }
@@ -354,10 +419,10 @@ static void *client_handler(void *arg)
     snprintf(resp, RESP_BUF,
              "{\"ok\":true,\"session\":\"%s\",\"text\":\"connected\"}\n",
              session_id);
-    write(fd, resp, strlen(resp));
+    conn_write(ssl, fd, resp, strlen(resp));
 
     while (g_running) {
-        ssize_t n = read(fd, line + llen, MAX_LINE - llen - 1);
+        ssize_t n = conn_read(ssl, fd, line + llen, MAX_LINE - llen - 1);
         if (n <= 0) break;
         llen += (size_t)n;
         line[llen] = 0;
@@ -380,7 +445,7 @@ static void *client_handler(void *arg)
             if (g_token[0] && strcmp(tok, g_token) != 0) {
                 snprintf(resp, RESP_BUF,
                          "{\"ok\":false,\"error\":\"unauthorized\"}\n");
-                write(fd, resp, strlen(resp));
+                conn_write(ssl, fd, resp, strlen(resp));
             } else if (sql[0]) {
                 pthread_mutex_lock(&exec_lock);
                 execute_sql(sql, active_sid, resp, RESP_BUF);
@@ -391,7 +456,7 @@ static void *client_handler(void *arg)
                     resp[rlen] = '\n';
                     resp[rlen + 1] = 0;
                 }
-                write(fd, resp, strlen(resp));
+                conn_write(ssl, fd, resp, strlen(resp));
             }
 
             memmove(line, line + consumed, llen - consumed);
@@ -400,6 +465,9 @@ static void *client_handler(void *arg)
         }
     }
 
+#ifdef ENABLE_TLS
+    if (ssl) { SSL_shutdown(ssl); SSL_free(ssl); }
+#endif
     close(fd);
 
     pthread_mutex_lock(&sess_lock);
@@ -430,13 +498,50 @@ static void sighandle(int sig)
 
 /* ------------------------------------------------------------ main server loop */
 int server_run(DB *db, int port, const char *unix_path,
-               const char *token, int session_ttl)
+               const char *token, int session_ttl,
+               const char *tls_cert, const char *tls_key)
 {
     g_db = db;
     if (token) {
         snprintf(g_token, sizeof g_token, "%s", token);
     }
     g_session_ttl = session_ttl;
+
+#ifdef ENABLE_TLS
+    if (tls_cert && tls_key) {
+        SSL_library_init();
+        SSL_load_error_strings();
+        OPENSSL_add_all_algorithms_noconf();
+        g_ssl_ctx = SSL_CTX_new(TLS_server_method());
+        if (!g_ssl_ctx) {
+            fprintf(stderr, "error: SSL_CTX_new failed\n");
+            return -1;
+        }
+        SSL_CTX_set_mode(g_ssl_ctx, SSL_MODE_AUTO_RETRY);
+        if (SSL_CTX_use_certificate_file(g_ssl_ctx, tls_cert, SSL_FILETYPE_PEM) <= 0) {
+            fprintf(stderr, "error: cannot load TLS cert '%s'\n", tls_cert);
+            SSL_CTX_free(g_ssl_ctx); g_ssl_ctx = NULL;
+            return -1;
+        }
+        if (SSL_CTX_use_PrivateKey_file(g_ssl_ctx, tls_key, SSL_FILETYPE_PEM) <= 0) {
+            fprintf(stderr, "error: cannot load TLS key '%s'\n", tls_key);
+            SSL_CTX_free(g_ssl_ctx); g_ssl_ctx = NULL;
+            return -1;
+        }
+        if (!SSL_CTX_check_private_key(g_ssl_ctx)) {
+            fprintf(stderr, "error: TLS cert and key do not match\n");
+            SSL_CTX_free(g_ssl_ctx); g_ssl_ctx = NULL;
+            return -1;
+        }
+    }
+#else
+    (void)tls_cert;
+    (void)tls_key;
+    if (tls_cert || tls_key) {
+        fprintf(stderr, "error: TLS support not compiled in (install OpenSSL headers and rebuild)\n");
+        return -1;
+    }
+#endif
 
     /* Ignore SIGPIPE so write() to a closed socket returns -1 instead of
      * killing the process. */
@@ -563,6 +668,12 @@ int server_run(DB *db, int port, const char *unix_path,
         close(unix_fd);
         unlink(sock_path);
     }
+#ifdef ENABLE_TLS
+    if (g_ssl_ctx) {
+        SSL_CTX_free(g_ssl_ctx);
+        g_ssl_ctx = NULL;
+    }
+#endif
     return 0;
 }
 

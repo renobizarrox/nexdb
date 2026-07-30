@@ -269,8 +269,9 @@ See `limitations.md` for the full list. The short version:
 - **No range scans via indexes.** `WHERE pk = literal` uses the B-tree, but
   range queries still do a full table scan. B-tree pages freed by `DROP TABLE`
   are not recycled.
-- **No network encryption.** The TCP server is cleartext; it binds to loopback
-  by default. Use `--unix`, an SSH tunnel, or a TLS proxy.
+- **TLS is now built-in** (since July 2026). Pass `--tls-cert cert.pem --tls-key key.pem`
+  to `serve` to enable OpenSSL encryption on TCP connections. The default is still
+  cleartext for local development. Build with `NEXDB_TLS=1 make` to link OpenSSL.
 - **Serialised execution.** Many clients can connect, but only one SQL statement
   runs at a time — the database handle is locked by a single mutex.
 - **No nested transactions.** `UNDO_MAX` is a single level.

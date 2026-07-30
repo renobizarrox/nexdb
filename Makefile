@@ -11,6 +11,25 @@ ifeq ($(IS_CLANG),0)
   CFLAGS += -Wno-format-truncation
 endif
 
+# Optional TLS support — enables --tls-cert / --tls-key in serve mode.
+# Tries pkg-config first, then Homebrew, then gives up (builds without TLS).
+TLS_CFLAGS :=
+TLS_LDFLAGS :=
+ifdef NEXDB_TLS
+  ifneq ($(NEXDB_TLS),0)
+    TLS_CFLAGS := $(shell pkg-config --cflags openssl 2>/dev/null)
+    TLS_LDFLAGS := $(shell pkg-config --libs openssl 2>/dev/null)
+    ifeq ($(TLS_CFLAGS),)
+      TLS_CFLAGS := -I/opt/homebrew/opt/openssl@3/include
+      TLS_LDFLAGS := -L/opt/homebrew/opt/openssl@3/lib -lssl -lcrypto
+    endif
+    TLS_CFLAGS += -DENABLE_TLS
+    $(info TLS support enabled)
+  endif
+endif
+CFLAGS += $(TLS_CFLAGS)
+LDFLAGS += $(TLS_LDFLAGS)
+
 SRC := src/value.c src/pager.c src/memory.c src/btree.c src/lexer.c \
        src/parser.c src/func.c src/select.c src/exec.c src/main.c src/wal.c src/server.c
 OBJ := $(SRC:src/%.c=build/%.o)
@@ -46,7 +65,7 @@ run: $(BIN)
 asan:
 	@mkdir -p build
 	$(CC) -std=c11 -g -O1 -fno-inline -fsanitize=address,undefined -Iinclude \
-	      $(SRC) -o build/nexdb-asan $(LDFLAGS)
+	      $(TLS_CFLAGS) $(SRC) -o build/nexdb-asan $(LDFLAGS)
 	@BIN=./build/nexdb-asan sh tests/run_tests.sh
 
 clean:

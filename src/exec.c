@@ -2466,32 +2466,44 @@ int exec_stmt(DB *db, Stmt *s, char *err)
         return 0;
 
     case ST_BEGIN:
-        if (db->txn_active) {
-            snprintf(err, MAX_ERR, "already in a transaction");
-            return -1;
+        if (db->txn_depth > 0) {
+            /* Nested BEGIN: push a savepoint at the current undo depth */
+            if (db->txn_sp_count >= MAX_SAVEPOINTS) {
+                snprintf(err, MAX_ERR, "too many nested transactions (max %d)",
+                         MAX_SAVEPOINTS);
+                return -1;
+            }
+            db->txn_sp[db->txn_sp_count++] = db->undo_depth;
+            db->txn_depth++;
+            return 0;
         }
         db->txn_active = 1;
+        db->txn_depth = 1;
         db->undo_depth = 0;
+        db->txn_sp_count = 0;
         return 0;
 
     case ST_COMMIT:
-        if (!db->txn_active) {
+        if (db->txn_depth == 0) {
             snprintf(err, MAX_ERR, "no active transaction");
             return -1;
         }
-        if (links_flush(db) < 0) {
-            snprintf(err, MAX_ERR, "%s", db->err);
-            return -1;
-        }
-        if (db_flush_catalog(db) < 0) {
-            snprintf(err, MAX_ERR, "%s", db->err);
-            return -1;
+        if (db->txn_depth == 1) {
+            /* Outer commit: flush and finalise */
+            if (links_flush(db) < 0) {
+                snprintf(err, MAX_ERR, "%s", db->err);
+                return -1;
+            }
+            if (db_flush_catalog(db) < 0) {
+                snprintf(err, MAX_ERR, "%s", db->err);
+                return -1;
+            }
         }
         pager_undo_commit(db);
         return 0;
 
     case ST_ROLLBACK:
-        if (!db->txn_active) {
+        if (db->txn_depth == 0) {
             snprintf(err, MAX_ERR, "no active transaction");
             return -1;
         }

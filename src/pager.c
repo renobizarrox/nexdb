@@ -1011,7 +1011,7 @@ static void overflow_stub(const Row *r, uint32_t chain_head, uint8_t *stub)
 
 int pager_undo_capture(DB *db, uint32_t pno)
 {
-    if (!db->txn_active) return 0;
+    if (db->txn_depth == 0) return 0;
     for (int i = 0; i < db->undo_depth; i++)
         if (db->undo[i].pno == pno) return 0;  /* already captured */
     if (db->undo_depth >= UNDO_MAX) {
@@ -1025,24 +1025,36 @@ int pager_undo_capture(DB *db, uint32_t pno)
 
 void pager_undo_rollback(DB *db)
 {
-    if (!db->txn_active) return;
-    /* Restore in reverse order so nested overwrites unroll correctly. */
-    for (int i = db->undo_depth - 1; i >= 0; i--) {
-        uint32_t pno = db->undo[i].pno;
-        /* Log the undo write to the WAL so that a crash during rollback
-         * still leaves a consistent state after recovery. */
-        wal_append(db, pno, db->undo[i].old);
-        pwrite(db->fd, db->undo[i].old, PAGE_SIZE, (off_t)pno * PAGE_SIZE);
+    if (db->txn_depth == 0) return;
+    int target = 0;
+    if (db->txn_sp_count > 0) {
+        /* Nested rollback: restore to the most recent savepoint */
+        target = db->txn_sp[--db->txn_sp_count];
     }
-    db->undo_depth = 0;
-    db->txn_active = 0;
+    /* Restore pages in reverse order. */
+    for (int i = db->undo_depth - 1; i >= target; i--) {
+        wal_append(db, db->undo[i].pno, db->undo[i].old);
+        pwrite(db->fd, db->undo[i].old, PAGE_SIZE,
+               (off_t)db->undo[i].pno * PAGE_SIZE);
+    }
+    db->undo_depth = target;
+    db->txn_depth = db->txn_sp_count + 1;
+    db->txn_active = db->txn_depth > 0;
 }
 
 void pager_undo_commit(DB *db)
 {
-    if (!db->txn_active) return;
+    if (db->txn_depth == 0) return;
+    if (db->txn_sp_count > 0) {
+        /* Nested commit: just pop the savepoint (changes stay) */
+        db->txn_sp_count--;
+        db->txn_depth = db->txn_sp_count + 1;
+        return;
+    }
+    /* Outermost commit: fsync, checkpoint, clear */
     fsync(db->fd);
     wal_checkpoint(db);
     db->undo_depth = 0;
+    db->txn_depth = 0;
     db->txn_active = 0;
 }

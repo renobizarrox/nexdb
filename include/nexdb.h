@@ -31,6 +31,7 @@
 #define MAX_RECALL_TERMS 128   /* distinct search words RECALL considers */
 #define MAX_INSERT_ROWS  128   /* rows per INSERT statement */
 #define UNDO_MAX         256  /* max pages in a single transaction */
+#define MAX_SAVEPOINTS   16   /* max nested transaction depth */
 
 /* An entry in the in-memory undo log: the page number and its content before
  * the write that is part of an explicit transaction. */
@@ -186,6 +187,9 @@ typedef struct {
     Catalog   cat;
     LinkStore links;
     int       txn_active;   /* 1 between BEGIN and COMMIT/ROLLBACK */
+    int       txn_depth;    /* nesting depth (0 = no txn, 1+ = nested) */
+    int       txn_sp[MAX_SAVEPOINTS];  /* undo_depth at each savepoint */
+    int       txn_sp_count;
     UndoEntry undo[UNDO_MAX];
     int       undo_depth;
     int       wal_fd;       /* WAL file descriptor, -1 if not open */

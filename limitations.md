@@ -15,38 +15,46 @@ distinguishes equality predicates from range predicates; route range predicates
 to an index scan. For secondary indexes, teach the query planner to detect
 indexed columns in `WHERE` and pick the index.
 
-## 2. No nested transactions
+## 2. No nested transactions — FIXED
 
-`UNDO_MAX = 256` pages supports a single level of undo. `BEGIN` inside an
-active transaction is ignored.
+~~`UNDO_MAX = 256` pages supports a single level of undo. `BEGIN` inside an
+active transaction is ignored.~~
 
-**To fix:** Replace the flat undo array with a stack of savepoints. Each
+~~**To fix:** Replace the flat undo array with a stack of savepoints. Each
 `BEGIN` pushes a savepoint (recording the current undo depth). `ROLLBACK`
 pops back to the most recent savepoint. `COMMIT` pops and discards. This
 requires changing the undo infrastructure in `src/pager.c` from an array to
-a stack-like structure.
+a stack-like structure.~~
 
-## 3. B-tree pages are not recycled
+Fixed: `BEGIN` inside an active transaction pushes a savepoint (recording the
+current undo depth in `txn_sp[]`). `ROLLBACK` in a nested context restores
+pages since the most recent savepoint. `COMMIT` in a nested context is a no-op
+(the changes stay). The maximum nesting depth is `MAX_SAVEPOINTS = 16`.
 
-When a table is dropped or truncated, its heap pages are returned to the
-free list. B-tree pages are not — they leak until the file is vacuumed.
+## 3. B-tree pages are not recycled — FIXED
 
-**To fix:** In `btree_destroy()` (or at the call site in `cat_drop()` and
+~~When a table is dropped or truncated, its heap pages are returned to the
+free list. B-tree pages are not — they leak until the file is vacuumed.~~
+
+~~**To fix:** In `btree_destroy()` (or at the call site in `cat_drop()` and
 `exec_truncate()`), walk every B-tree node page and call `pager_free()` on
 it. The B-tree code already has `INDEX_META_PAGE` / `INDEX_LEAF_PAGE` page
 tags; walk internal nodes recursively. `VACUUM` already rebuilds the entire
-file, so this is mainly relevant for frequent DDL-heavy workloads.
+file, so this is mainly relevant for frequent DDL-heavy workloads.~~
 
-## 4. No network encryption
+Fixed: `btree_destroy()` now calls `pager_free()` on every node page after
+recursively freeing its children. This applies to `DROP TABLE`, `TRUNCATE`,
+and `ALTER TABLE DROP COLUMN` — all three call `btree_destroy()` before
+freeing heap pages.
 
-The TCP server sends everything in cleartext. It binds to loopback by default;
-for remote access you must tunnel through SSH (`ssh -L 7890:localhost:7890 host`)
-or run behind a TLS proxy (e.g. `nginx`, `stunnel`). The Unix socket (`--unix`)
-is a sensible alternative for same-machine access.
+## 4. ~~No network encryption~~ (fixed July 2026)
 
-**To fix:** Add TLS support. The smallest change would be to accept an optional
-`--tls-cert` and `--tls-key` flag, then wrap the socket with OpenSSL or
-LibreSSL before the read/write loop in `client_handler`. This adds a dependency.
+The TCP server now supports optional TLS encryption via OpenSSL. Pass
+`--tls-cert cert.pem --tls-key key.pem` to `nexdb serve` to enable it.
+
+Build with `NEXDB_TLS=1 make` to link OpenSSL (auto-detected via `pkg-config`
+or the Homebrew path `/opt/homebrew/opt/openssl@3`). Without the environment
+variable the build remains TLS-free — no dependency.
 
 ## 5. No session persistence
 
@@ -106,6 +114,7 @@ concurrency. This is a major architectural change.
 | Maximum connections (server) | `MAX_CONN` | 64 |
 | Maximum sessions (server) | `MAX_SESSIONS` | 64 |
 | Undo pages per transaction | `UNDO_MAX` | 256 |
+| Nested transaction depth | `MAX_SAVEPOINTS` | 16 |
 | Maximum row size | `MAX_ROW_SIZE` | 64 KB |
 
 Most are single-constant bumps in `include/nexdb.h`. Some have structural

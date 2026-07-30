@@ -628,6 +628,7 @@ int btree_destroy(DB *db, uint32_t root)
             btree_destroy(db, cp);
         }
     }
+    pager_free(db, root);
     return 0;
 }
 

@@ -230,6 +230,8 @@ static int main_server(int argc, char **argv)
     int session_ttl = 300;
     int daemon = 0;
     const char *pidfile = NULL;
+    const char *tls_cert = NULL;
+    const char *tls_key = NULL;
 
     /* Skip argv[0] ("serve") */
     for (int i = 1; i < argc; i++) {
@@ -245,6 +247,10 @@ static int main_server(int argc, char **argv)
             daemon = 1;
         else if (strcmp(argv[i], "--pidfile") == 0 && i + 1 < argc)
             pidfile = argv[++i];
+        else if (strcmp(argv[i], "--tls-cert") == 0 && i + 1 < argc)
+            tls_cert = argv[++i];
+        else if (strcmp(argv[i], "--tls-key") == 0 && i + 1 < argc)
+            tls_key = argv[++i];
         else if (argv[i][0] == '-') {
             fprintf(stderr, "unknown option '%s'\n", argv[i]);
             return 2;
@@ -260,7 +266,8 @@ static int main_server(int argc, char **argv)
         fprintf(stderr,
                 "usage: nexdb serve <database-file> [--port N] [--unix PATH]\n"
                 "                    [--token STR] [--session-ttl SECS]\n"
-                "                    [--daemon] [--pidfile FILE]\n");
+                "                    [--daemon] [--pidfile FILE]\n"
+                "                    [--tls-cert FILE --tls-key FILE]\n");
         return 2;
     }
 
@@ -303,7 +310,8 @@ static int main_server(int argc, char **argv)
         return 1;
     }
 
-    int rc = server_run(db, port, unix_path, token, session_ttl);
+    int rc = server_run(db, port, unix_path, token, session_ttl,
+                        tls_cert, tls_key);
 
     /* Remove PID file on clean shutdown */
     if (pidfile) unlink(pidfile);
@@ -351,6 +359,7 @@ int main(int argc, char **argv)
                    "remote / server:\n"
                    "  nexdb serve <db> [--port N] [--unix PATH] [--token STR]\n"
                    "                 [--session-ttl SECS] [--daemon] [--pidfile FILE]\n"
+                   "                 [--tls-cert FILE --tls-key FILE]\n"
                    "  nexdb --connect host:port\n"
                    "\n"
                    "environment:\n"
