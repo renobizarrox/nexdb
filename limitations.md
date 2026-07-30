@@ -16,17 +16,19 @@ columns, and range scans are not yet indexed.~~
 ~~With no indexes, `check_unique()` did a full table scan per constrained column per row.~~
 ~~The B-tree on the PK makes PRIMARY KEY checks O(log n).~~
 
-## 1. No crash safety
+## 1. No crash safety — FIXED
 
-There is no write-ahead log. A power cut mid-write can corrupt the file. Only `CHECKPOINT` and clean exit call `fsync`.
+~~There is no write-ahead log. A power cut mid-write can corrupt the file. Only `CHECKPOINT` and clean exit call `fsync`.~~
 
-**To fix:** Add a write-ahead log in `src/pager.c`. Requires:
-- A `wal.c` / `wal.h` module that records every page mutation before it is applied
-- On startup, replay the WAL to restore a consistent state
-- Page checksums to detect torn writes (4 KB pages are usually safe, but not guaranteed)
-- Atomic page write via a double-write buffer or a shadow-paging scheme
-- Flush the WAL to disk (`fsync`) before applying in-place writes
-- On clean shutdown, checkpoint the WAL and remove it
+~~**To fix:** Add a write-ahead log in `src/pager.c`. Requires:~~
+~~- A `wal.c` / `wal.h` module that records every page mutation before it is applied~~
+~~- On startup, replay the WAL to restore a consistent state~~
+~~- Page checksums to detect torn writes (4 KB pages are usually safe, but not guaranteed)~~
+~~- Atomic page write via a double-write buffer or a shadow-paging scheme~~
+~~- Flush the WAL to disk (`fsync`) before applying in-place writes~~
+~~- On clean shutdown, checkpoint the WAL and remove it~~
+
+Fixed in `src/wal.c` and `src/pager.c`: every `pager_write()` appends a record to `<db>.wal` and fsyncs it before writing the main database file. On startup, `db_open()` replays any pending WAL entries to restore a consistent state. `CHECKPOINT`, `COMMIT`, and `db_close()` all checkpoint (fsync main + truncate WAL). Each WAL entry carries a simple XOR checksum so that incomplete entries from a crash during append are detected and discarded. Transaction rollback also logs undo pages through the WAL, ensuring the replay log is always a complete ordered record of every write.
 
 ## 2. No joins — FIXED
 
@@ -172,10 +174,10 @@ These are not in the README's "not yet" list but are missing:
 
 ~~FIXED: `Expr.agg_distinct` flag, `AggAcc.distinct`/`seen`/`nseen`/`cseen` fields for tracking seen values.~~
 
-### No subqueries
-`SELECT * FROM (SELECT ...)` and `WHERE x IN (SELECT ...)` are not supported. The parser would need to handle subselects as expressions, and the executor would need to execute sub-plans.
+~~### No subqueries~~
+~~`SELECT * FROM (SELECT ...)` and `WHERE x IN (SELECT ...)` are not supported. The parser would need to handle subselects as expressions, and the executor would need to execute sub-plans.~~
 
-FIXED: Scalar subqueries `(SELECT x FROM t)`, `IN (SELECT ...)`, `NOT IN (SELECT ...)`, `EXISTS (SELECT ...)`, and `NOT EXISTS (SELECT ...)` are all implemented and evaluated at runtime. FROM-clause subqueries (derived tables) and correlated subqueries (inner query referencing outer columns) remain unimplemented.
+~~FIXED: Scalar subqueries `(SELECT x FROM t)`, `IN (SELECT ...)`, `NOT IN (SELECT ...)`, `EXISTS (SELECT ...)`, `NOT EXISTS (SELECT ...)`, `ANY`/`ALL`, correlated subqueries, and FROM-clause subqueries (derived tables) are all implemented and evaluated at runtime.~~
 
 ~~### No `HAVING` without `GROUP BY`~~
 ~~`HAVING` is parsed but there may still be uncovered edge cases (the pre-existing test failures suggest at least one).~~

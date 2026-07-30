@@ -13,6 +13,7 @@
  */
 #define _GNU_SOURCE
 #include "nexdb.h"
+#include "wal.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -134,6 +135,13 @@ static const Row   **g_join_rows   = NULL;
 static const char  **g_join_aliases = NULL;
 static int          g_join_ntables = 0;
 
+/* Correlation context: outer table/row/name for correlated subqueries.
+ * Set before executing a subquery so the inner query can resolve qualified
+ * references to the outer table (e.g. SELECT 1 FROM u WHERE u.x = t.n). */
+static const Table *g_corr_table = NULL;
+static const Row   *g_corr_row   = NULL;
+static char         g_corr_name[MAX_NAME];
+
 void exec_set_join_ctx(const Table **tables, const Row **rows, const char **aliases, int n)
 {
     g_join_tables  = tables;
@@ -249,31 +257,47 @@ int eval_expr(const Expr *e, const Row *row, const Table *t, int64_t now,
     case EX_COL: {
         /* qualified column reference: table.col */
         if (e->col_table[0]) {
-            if (!g_join_tables || !g_join_rows) {
-                snprintf(err, MAX_ERR,
-                         "qualified column '%s.%s' used outside a join",
-                         e->col_table, e->col);
-                return -1;
+            if (g_join_tables && g_join_rows) {
+                for (int ti = 0; ti < g_join_ntables; ti++) {
+                    const Table *ct = g_join_tables[ti];
+                    if (strcasecmp(e->col_table, ct->name) == 0 ||
+                        (g_join_aliases && g_join_aliases[ti] &&
+                         strcasecmp(e->col_table, g_join_aliases[ti]) == 0)) {
+                        int idx = table_col_index(ct, e->col);
+                        if (idx < 0) {
+                            snprintf(err, MAX_ERR, "no column '%s' in table '%s'",
+                                     e->col, ct->name);
+                            return -1;
+                        }
+                        if (idx < g_join_rows[ti]->ncols) {
+                            *out = val_copy(&g_join_rows[ti]->v[idx]);
+                        }
+                        return 0;
+                    }
+                }
             }
-            for (int ti = 0; ti < g_join_ntables; ti++) {
-                const Table *ct = g_join_tables[ti];
-                if (strcasecmp(e->col_table, ct->name) == 0 ||
-                    (g_join_aliases && g_join_aliases[ti] &&
-                     strcasecmp(e->col_table, g_join_aliases[ti]) == 0)) {
-                    int idx = table_col_index(ct, e->col);
-                    if (idx < 0) {
-                        snprintf(err, MAX_ERR, "no column '%s' in table '%s'",
-                                 e->col, ct->name);
-                        return -1;
-                    }
-                    if (idx < g_join_rows[ti]->ncols) {
-                        *out = val_copy(&g_join_rows[ti]->v[idx]);
-                    }
+            /* try the current table (allows qualified refs in single-table queries) */
+            if (t && strcasecmp(e->col_table, t->name) == 0) {
+                int idx = table_col_index(t, e->col);
+                if (idx >= 0) {
+                    if (idx < row->ncols) *out = val_copy(&row->v[idx]);
                     return 0;
                 }
             }
-            snprintf(err, MAX_ERR, "unknown table '%s' in column reference",
-                     e->col_table);
+            /* try the correlation table (outer query in a correlated subquery) */
+            if (g_corr_table && strcasecmp(e->col_table, g_corr_name) == 0) {
+                int idx = table_col_index(g_corr_table, e->col);
+                if (idx >= 0) {
+                    if (g_corr_row && idx < g_corr_row->ncols)
+                        *out = val_copy(&g_corr_row->v[idx]);
+                    else
+                        *out = val_null();
+                    return 0;
+                }
+            }
+            snprintf(err, MAX_ERR,
+                     "no column '%s' in table '%s' (or outer query)",
+                     e->col, e->col_table);
             return -1;
         }
         int pc = pseudo_col(e->col);
@@ -343,6 +367,10 @@ int eval_expr(const Expr *e, const Row *row, const Table *t, int64_t now,
             const char **save_ja = g_join_aliases;
             int save_jn = g_join_ntables;
             double save_score = g_score_hint;
+            const Table *save_ct = g_corr_table;
+            const Row *save_cr = g_corr_row;
+            char save_cn[MAX_NAME];
+            memcpy(save_cn, g_corr_name, MAX_NAME);
             g_agg_values = NULL;
             g_agg_count = 0;
             g_join_tables = NULL;
@@ -350,6 +378,10 @@ int eval_expr(const Expr *e, const Row *row, const Table *t, int64_t now,
             g_join_aliases = NULL;
             g_join_ntables = 0;
             g_score_hint = 0.0;
+            g_corr_table = t;
+            g_corr_row = row;
+            if (t) snprintf(g_corr_name, MAX_NAME, "%s", t->name);
+            else g_corr_name[0] = 0;
 
             Capture cap = {0};
             int rc = exec_select_into(g_db, e->sub, &cap, err);
@@ -361,6 +393,9 @@ int eval_expr(const Expr *e, const Row *row, const Table *t, int64_t now,
             g_join_aliases = save_ja;
             g_join_ntables = save_jn;
             g_score_hint = save_score;
+            g_corr_table = save_ct;
+            g_corr_row = save_cr;
+            memcpy(g_corr_name, save_cn, MAX_NAME);
             g_reinforce = save_reinforce;
 
             if (rc < 0) { val_clear(&lv); return -1; }
@@ -403,6 +438,10 @@ int eval_expr(const Expr *e, const Row *row, const Table *t, int64_t now,
         const char **save_ja = g_join_aliases;
         int save_jn = g_join_ntables;
         double save_score = g_score_hint;
+        const Table *save_ct = g_corr_table;
+        const Row *save_cr = g_corr_row;
+        char save_cn[MAX_NAME];
+        memcpy(save_cn, g_corr_name, MAX_NAME);
         g_agg_values = NULL;
         g_agg_count = 0;
         g_join_tables = NULL;
@@ -410,6 +449,10 @@ int eval_expr(const Expr *e, const Row *row, const Table *t, int64_t now,
         g_join_aliases = NULL;
         g_join_ntables = 0;
         g_score_hint = 0.0;
+        g_corr_table = t;
+        g_corr_row = row;
+        if (t) snprintf(g_corr_name, MAX_NAME, "%s", t->name);
+        else g_corr_name[0] = 0;
 
         Capture cap = {0};
         int rc = exec_select_into(g_db, e->sub, &cap, err);
@@ -421,6 +464,9 @@ int eval_expr(const Expr *e, const Row *row, const Table *t, int64_t now,
         g_join_aliases = save_ja;
         g_join_ntables = save_jn;
         g_score_hint = save_score;
+        g_corr_table = save_ct;
+        g_corr_row = save_cr;
+        memcpy(g_corr_name, save_cn, MAX_NAME);
         g_reinforce = save_reinforce;
 
         if (rc < 0) return -1;
@@ -437,6 +483,80 @@ int eval_expr(const Expr *e, const Row *row, const Table *t, int64_t now,
         else
             *out = val_copy(&cap.cells[0]);
         capture_free(&cap);
+        return 0;
+    }
+
+    case EX_ANY:
+    case EX_ALL: {
+        if (!e->sub || !g_db) {
+            snprintf(err, MAX_ERR, "empty subquery");
+            return -1;
+        }
+        Value lv;
+        if (eval_expr(e->l, row, t, now, &lv, err) < 0) return -1;
+        int save_reinforce = g_reinforce;
+        g_reinforce = 0;
+        const Value *save_agg = g_agg_values;
+        int save_agg_count = g_agg_count;
+        const Table **save_jt = g_join_tables;
+        const Row **save_jr = g_join_rows;
+        const char **save_ja = g_join_aliases;
+        int save_jn = g_join_ntables;
+        double save_score = g_score_hint;
+        const Table *save_ct = g_corr_table;
+        const Row *save_cr = g_corr_row;
+        char save_cn[MAX_NAME];
+        memcpy(save_cn, g_corr_name, MAX_NAME);
+        g_agg_values = NULL;
+        g_agg_count = 0;
+        g_join_tables = NULL;
+        g_join_rows = NULL;
+        g_join_aliases = NULL;
+        g_join_ntables = 0;
+        g_score_hint = 0.0;
+        g_corr_table = t;
+        g_corr_row = row;
+        if (t) snprintf(g_corr_name, MAX_NAME, "%s", t->name);
+        else g_corr_name[0] = 0;
+
+        Capture cap = {0};
+        int rc = exec_select_into(g_db, e->sub, &cap, err);
+
+        g_agg_values = save_agg;
+        g_agg_count = save_agg_count;
+        g_join_tables = save_jt;
+        g_join_rows = save_jr;
+        g_join_aliases = save_ja;
+        g_join_ntables = save_jn;
+        g_score_hint = save_score;
+        g_corr_table = save_ct;
+        g_corr_row = save_cr;
+        memcpy(g_corr_name, save_cn, MAX_NAME);
+        g_reinforce = save_reinforce;
+
+        if (rc < 0) { val_clear(&lv); return -1; }
+        /* ALL starts true (vacuous truth), ANY starts false */
+        int result = (e->kind == EX_ALL) ? 1 : 0;
+        for (int i = 0; i < cap.nrows; i++) {
+            int ok;
+            int c = val_compare(&lv, &cap.cells[i * cap.ncols], &ok);
+            if (ok != 1) continue;
+            int matches = 0;
+            switch (e->op) {
+            case OP_EQ: matches = (c == 0); break;
+            case OP_NE: matches = (c != 0); break;
+            case OP_LT: matches = (c <  0); break;
+            case OP_LE: matches = (c <= 0); break;
+            case OP_GT: matches = (c >  0); break;
+            case OP_GE: matches = (c >= 0); break;
+            default: break;
+            }
+            if (e->kind == EX_ANY && matches) { result = 1; break; }
+            if (e->kind == EX_ALL && !matches) { result = 0; break; }
+        }
+        *out = val_bit(result);
+        capture_free(&cap);
+        val_clear(&lv);
         return 0;
     }
 
@@ -2324,6 +2444,10 @@ int exec_stmt(DB *db, Stmt *s, char *err)
         /* fsync, not just pwrite: otherwise "checkpoint complete" promised
          * durability it had not delivered. */
         if (links_flush(db) < 0 || db_flush_catalog(db) < 0 || db_sync(db) < 0) {
+            snprintf(err, MAX_ERR, "%s", db->err);
+            return -1;
+        }
+        if (wal_checkpoint(db) < 0) {
             snprintf(err, MAX_ERR, "%s", db->err);
             return -1;
         }

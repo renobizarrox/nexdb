@@ -479,7 +479,7 @@ int exec_select_into(DB *db, Stmt *s, Capture *capture, char *err)
     int64_t now = mem_now();
     Table *t = NULL;
 
-    if (s->has_from) {
+    if (s->has_from && !s->derived) {
         t = cat_find(db, s->table);
         if (!t) { snprintf(err, MAX_ERR, "unknown table '%s'", s->table); return -1; }
     }
@@ -548,6 +548,92 @@ int exec_select_into(DB *db, Stmt *s, Capture *capture, char *err)
     int colmap[MAX_OUT_COLS];
     ColSrc colsrc[MAX_OUT_COLS];
     int ncols;
+    int order_from_col[MAX_ORDER_KEYS];
+    Res res;
+    memset(&res, 0, sizeof res);
+
+    /* ---- derived table: FROM (SELECT ...) AS t must be handled before
+     * output_columns, which needs a valid table pointer. */
+    if (s->derived) {
+        Capture inner;
+        memset(&inner, 0, sizeof inner);
+        if (exec_select_into(db, s->derived, &inner, err) < 0) return -1;
+
+        Table vtbl;
+        memset(&vtbl, 0, sizeof vtbl);
+        snprintf(vtbl.name, MAX_NAME, "%s",
+                 s->alias[0] ? s->alias : s->table);
+        vtbl.ncols = inner.ncols;
+        for (int i = 0; i < inner.ncols && i < MAX_COLS; i++)
+            snprintf(vtbl.cols[i].name, MAX_NAME, "%s", inner.colnames[i]);
+
+        ncols = output_columns(s, &vtbl, heads, exprs, MAX_OUT_COLS, err);
+        if (ncols < 0) { capture_free(&inner); return -1; }
+        star_map(s, &vtbl, colmap, ncols);
+
+        for (int k = 0; k < s->norder; k++) order_from_col[k] = -1;
+        for (int k = 0; k < s->norder; k++) {
+            OrderKey *oe = &s->order[k];
+            if (oe->e && oe->e->kind == EX_COL && !oe->e->col_table[0]) {
+                for (int c = 0; c < ncols; c++)
+                    if (strcasecmp(heads[c], oe->e->col) == 0)
+                        { order_from_col[k] = c; break; }
+            }
+        }
+
+        Res dres;
+        memset(&dres, 0, sizeof dres);
+        dres.ncols = ncols;
+        dres.nkeys = s->norder;
+
+        for (int ri = 0; ri < inner.nrows; ri++) {
+            Row r;
+            memset(&r, 0, sizeof r);
+            r.ncols = inner.ncols;
+            for (int c = 0; c < inner.ncols; c++)
+                r.v[c] = val_copy(&inner.cells[ri * inner.ncols + c]);
+
+            int m;
+            if (row_matches(s->where, &r, &vtbl, now, &m, err) < 0) {
+                row_clear(&r); res_free(&dres); capture_free(&inner); return -1;
+            }
+            if (!m) { row_clear(&r); continue; }
+
+            if (res_grow(&dres) < 0) {
+                row_clear(&r); res_free(&dres); capture_free(&inner);
+                snprintf(err, MAX_ERR, "out of memory"); return -1;
+            }
+
+            int failed = 0;
+            for (int c = 0; c < ncols && !failed; c++) {
+                Value *dst = &dres.cells[dres.nrows * ncols + c];
+                if (exprs[c]) {
+                    if (eval_expr(exprs[c], &r, &vtbl, now, dst, err) < 0) failed = 1;
+                } else {
+                    int idx = colmap[c];
+                    *dst = (idx >= 0 && idx < r.ncols) ? val_copy(&r.v[idx]) : val_null();
+                }
+            }
+            for (int k = 0; k < s->norder && !failed; k++) {
+                Value *dst = &dres.keys[dres.nrows * s->norder + k];
+                if (order_from_col[k] >= 0)
+                    *dst = val_copy(&dres.cells[dres.nrows * ncols + order_from_col[k]]);
+                else if (eval_expr(s->order[k].e, &r, &vtbl, now, dst, err) < 0)
+                    failed = 1;
+            }
+            if (failed) { row_clear(&r); res_free(&dres); capture_free(&inner); return -1; }
+
+            dres.refs[dres.nrows].page = 0;
+            dres.refs[dres.nrows].slot = 0;
+            dres.rids[dres.nrows] = 0;
+            dres.nrows++;
+            row_clear(&r);
+        }
+
+        capture_free(&inner);
+        res = dres;
+        goto emit;
+    }
 
     if (s->has_from && njoin_tabs > 1) {
         ncols = output_columns_join(s, join_tabs, njoin_tabs,
@@ -569,11 +655,16 @@ int exec_select_into(DB *db, Stmt *s, Capture *capture, char *err)
         }
     }
 
+    /* if capturing, save column headings so callers (e.g. derived tables) can
+     * inspect them */
+    if (capture)
+        for (int i = 0; i < ncols && i < MAX_OUT_COLS; i++)
+            snprintf(capture->colnames[i], MAX_NAME, "%s", heads[i]);
+
     /* ORDER BY may name an output alias rather than repeat the expression, as in
      * "SELECT SUM(x) AS total ... ORDER BY total DESC". Resolve those to the
      * output column instead of evaluating them against a row, which is both
      * what SQL means and the only way it can work for an aggregate alias. */
-    int order_from_col[MAX_ORDER_KEYS];
     for (int k = 0; k < s->norder; k++) {
         order_from_col[k] = -1;
         Expr *oe = s->order[k].e;
@@ -592,7 +683,6 @@ int exec_select_into(DB *db, Stmt *s, Capture *capture, char *err)
             if (order_from_col[k] < 0 && check_grouped(s->order[k].e, s, err) < 0)
                 return -1;
 
-    Res res;
     res_init(&res, ncols, s->norder);
 
     /* ---- SELECT with no FROM: one synthetic row, no scanning */
@@ -1288,7 +1378,7 @@ emit_grouped:
         int nr = 0;
         for (int i = 0; i < limit; i++) {
             int src = order[i];
-            mem_touch(db, t, res.refs[src], MEM_BOOST);
+            if (t) mem_touch(db, t, res.refs[src], MEM_BOOST);
             if (nr < MEM_COACT_MAX) rids[nr++] = res.rids[src];
         }
         if (nr >= 2) mem_associate(db, rids, nr, MEM_LINK_BOOST);

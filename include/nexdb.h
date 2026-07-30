@@ -188,6 +188,8 @@ typedef struct {
     int       txn_active;   /* 1 between BEGIN and COMMIT/ROLLBACK */
     UndoEntry undo[UNDO_MAX];
     int       undo_depth;
+    int       wal_fd;       /* WAL file descriptor, -1 if not open */
+    char      wal_path[520];
     char      err[MAX_ERR];
 } DB;
 
@@ -355,7 +357,9 @@ typedef enum {
     EX_CASE,      /* CASE [x] WHEN..THEN..ELSE   */
     EX_BETWEEN,
     EX_AGG,       /* COUNT/SUM/AVG/MIN/MAX       */
-    EX_SUBQUERY   /* (SELECT ...) subquery       */
+    EX_SUBQUERY,  /* (SELECT ...) subquery       */
+    EX_ANY,       /* = ANY / > ALL (subquery)    */
+    EX_ALL        /* = ALL / > ALL (subquery)    */
 } ExprKind;
 
 #define MAX_FUNC_ARGS  16
@@ -494,6 +498,7 @@ typedef struct Stmt {
     OrderKey order[MAX_ORDER_KEYS];
     int      norder;
     struct Stmt *sub;         /* INSERT INTO ... SELECT */
+    struct Stmt *derived;     /* FROM (SELECT ...) derived table */
     int      top;             /* -1 = unlimited */
     Join     joins[MAX_JOINS];
     int      njoins;
@@ -550,8 +555,9 @@ void exec_set_join_ctx(const Table **tables, const Row **rows,
  * A Capture makes a SELECT hand its rows to the caller instead of printing
  * them, which is what INSERT ... SELECT needs. */
 typedef struct {
-    Value *cells;      /* nrows * ncols */
+    Value *cells;          /* nrows * ncols */
     int    ncols, nrows, cap;
+    char   colnames[MAX_OUT_COLS][MAX_NAME]; /* column headings */
 } Capture;
 
 int  exec_select(DB *db, Stmt *s, char *err);

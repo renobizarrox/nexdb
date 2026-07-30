@@ -12,7 +12,7 @@ ifeq ($(IS_CLANG),0)
 endif
 
 SRC := src/value.c src/pager.c src/memory.c src/btree.c src/lexer.c \
-       src/parser.c src/func.c src/select.c src/exec.c src/main.c
+       src/parser.c src/func.c src/select.c src/exec.c src/main.c src/wal.c
 OBJ := $(SRC:src/%.c=build/%.o)
 BIN := build/nexdb
 

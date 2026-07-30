@@ -72,6 +72,11 @@ void stmt_free(Stmt *s)
         free(s->sub);
         s->sub = NULL;
     }
+    if (s->derived) {
+        stmt_free(s->derived);
+        free(s->derived);
+        s->derived = NULL;
+    }
 }
 
 /* ------------------------------------------------------------- utilities */
@@ -595,6 +600,28 @@ static Expr *parse_pred(Lexer *lx, char *err)
     else return l;
 
     if (adv(lx, err) < 0) { expr_free(l); return NULL; }
+    /* ANY / ALL (subquery) after comparison operator, e.g. x > ALL (SELECT ...) */
+    if (tok_is_kw(&lx->cur, "ANY") || tok_is_kw(&lx->cur, "ALL")) {
+        int is_any = tok_is_kw(&lx->cur, "ANY");
+        if (adv(lx, err) < 0) { expr_free(l); return NULL; }
+        if (eat_punct(lx, "(", err) < 0) { expr_free(l); return NULL; }
+        if (!tok_is_kw(&lx->cur, "SELECT")) {
+            expr_free(l);
+            snprintf(err, MAX_ERR, "ANY/ALL requires a subquery (SELECT ...)");
+            return NULL;
+        }
+        if (adv(lx, err) < 0) { expr_free(l); return NULL; }
+        struct Stmt *sub = calloc(1, sizeof(struct Stmt));
+        if (!sub) { expr_free(l); snprintf(err, MAX_ERR, "out of memory"); return NULL; }
+        if (parse_select(lx, sub, err) < 0) { free(sub); expr_free(l); return NULL; }
+        if (eat_punct(lx, ")", err) < 0) { stmt_free(sub); free(sub); expr_free(l); return NULL; }
+        Expr *e = ex_new(is_any ? EX_ANY : EX_ALL);
+        if (!e) { stmt_free(sub); free(sub); expr_free(l); snprintf(err, MAX_ERR, "out of memory"); return NULL; }
+        e->l = l;
+        e->op = op;
+        e->sub = sub;
+        return e;
+    }
     Expr *r = parse_add(lx, err);
     if (!r) { expr_free(l); return NULL; }
     Expr *e = mk_bin(op, l, r);
@@ -1046,6 +1073,32 @@ static int parse_select(Lexer *lx, Stmt *s, char *err)
     /* FROM is optional, so SELECT 1 and SELECT NEWID() work */
     if (tok_is_kw(&lx->cur, "FROM")) {
         if (adv(lx, err) < 0) return -1;
+        /* FROM (SELECT ...) AS alias — derived table */
+        if (tok_is_punct(&lx->cur, "(")) {
+            if (adv(lx, err) < 0) return -1;
+            if (!tok_is_kw(&lx->cur, "SELECT"))
+                FAIL("expected SELECT after '(' in FROM clause for derived table");
+            if (adv(lx, err) < 0) return -1;
+            s->derived = calloc(1, sizeof(struct Stmt));
+            if (!s->derived) FAIL("out of memory");
+            if (parse_select(lx, s->derived, err) < 0) return -1;
+            if (eat_punct(lx, ")", err) < 0) return -1;
+            if (tok_is_kw(&lx->cur, "AS")) {
+                if (adv(lx, err) < 0) return -1;
+            }
+            if (lx->cur.kind != TK_IDENT ||
+                tok_is_kw(&lx->cur, "WHERE") ||
+                tok_is_kw(&lx->cur, "GROUP") ||
+                tok_is_kw(&lx->cur, "ORDER") ||
+                tok_is_kw(&lx->cur, "HAVING") ||
+                tok_is_kw(&lx->cur, "GO")) {
+                FAIL("derived table requires an alias, e.g. FROM (SELECT ...) AS t");
+            }
+            if (take_ident(lx, s->table, MAX_NAME, err) < 0) return -1;
+            snprintf(s->alias, MAX_NAME, "%s", s->table);
+            s->has_from = 1;
+            goto after_derived_from;
+        }
         if (take_ident(lx, s->table, MAX_NAME, err) < 0) return -1;
         /* optional alias for the primary table */
         if (lx->cur.kind == TK_IDENT &&
@@ -1094,6 +1147,8 @@ static int parse_select(Lexer *lx, Stmt *s, char *err)
             s->njoins++;
         }
         s->has_from = 1;
+after_derived_from:
+        ;
     } else {
         for (int i = 0; i < s->nitems; i++)
             if (s->items[i].is_star)
@@ -1179,16 +1234,15 @@ static int parse_show(Lexer *lx, Stmt *s, char *err)
         s->kind = tok_is_kw(&lx->cur, "MEMORY") ? ST_SHOW_MEMORY : ST_SHOW_LINKS;
         if (adv(lx, err) < 0) return -1;
         if (parse_top(lx, s, err) < 0) return -1;
-        if (tok_is_kw(&lx->cur, "FROM")) {
-            if (adv(lx, err) < 0) return -1;
-            if (take_ident(lx, s->table, MAX_NAME, err) < 0) return -1;
-        } else if (s->kind == ST_SHOW_MEMORY) {
-            FAIL("SHOW MEMORY needs a table: SHOW MEMORY FROM <table>");
-        }
-        if (parse_top(lx, s, err) < 0) return -1;
-        return 0;
     }
-    FAIL("SHOW what? try SHOW TABLES, SHOW MEMORY FROM t, or SHOW LINKS");
+    if (tok_is_kw(&lx->cur, "FROM")) {
+        if (adv(lx, err) < 0) return -1;
+        if (take_ident(lx, s->table, MAX_NAME, err) < 0) return -1;
+    } else if (s->kind == ST_SHOW_MEMORY) {
+        FAIL("SHOW MEMORY needs a table: SHOW MEMORY FROM <table>");
+    }
+    if (parse_top(lx, s, err) < 0) return -1;
+    return 0;
 }
 
 /* --------------------------------------------------------- entry point */

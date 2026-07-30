@@ -15,6 +15,7 @@
  */
 #define _GNU_SOURCE
 #include "nexdb.h"
+#include "wal.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -82,6 +83,9 @@ int pager_write(DB *db, uint32_t pno, const void *buf)
     if (db->txn_active) {
         if (pager_undo_capture(db, pno) < 0) return -1;
     }
+    /* Write to the WAL first and fsync it.  If we crash before the main
+     * file write below, recovery will replay this entry. */
+    if (wal_append(db, pno, buf) < 0) return -1;
     ssize_t n = pwrite(db->fd, buf, PAGE_SIZE, (off_t)pno * PAGE_SIZE);
     if (n != PAGE_SIZE) {
         snprintf(db->err, MAX_ERR, "write page %u: %s", pno, strerror(errno));
@@ -330,6 +334,7 @@ int db_flush_catalog(DB *db)
 int db_open(DB *db, const char *path)
 {
     memset(db, 0, sizeof *db);
+    db->wal_fd = -1;
     snprintf(db->path, sizeof db->path, "%s", path);
 
     db->fd = open(path, O_RDWR | O_CREAT, 0644);
@@ -357,6 +362,11 @@ int db_open(DB *db, const char *path)
     }
 
     if (st.st_size == 0) {
+        /* New database: discard any stale WAL from a previous run. */
+        char wp[520];
+        snprintf(wp, sizeof wp, "%s.wal", path);
+        unlink(wp);
+
         db->page_count   = 1;
         db->free_list    = 0;
         db->catalog_page = 0;
@@ -365,6 +375,10 @@ int db_open(DB *db, const char *path)
         memset(&db->cat, 0, sizeof db->cat);
         if (db_flush_catalog(db) < 0) return -1;
     } else {
+        /* Recover any pending WAL entries before reading the header – this
+         * ensures the main file is fully consistent. */
+        if (wal_recover(db) < 0) return -1;
+
         uint8_t pg[PAGE_SIZE];
         if (pager_read(db, 0, pg) < 0) return -1;
         if (memcmp(pg, MAGIC, MAGIC_LEN) != 0) {
@@ -417,10 +431,11 @@ void db_close(DB *db)
     if (db->fd >= 0) {
         links_flush(db);
         db_flush_catalog(db);
-        fsync(db->fd);
+        wal_checkpoint(db);
         close(db->fd);
         db->fd = -1;
     }
+    wal_close(db);
     links_free(db);
 }
 
@@ -1014,6 +1029,9 @@ void pager_undo_rollback(DB *db)
     /* Restore in reverse order so nested overwrites unroll correctly. */
     for (int i = db->undo_depth - 1; i >= 0; i--) {
         uint32_t pno = db->undo[i].pno;
+        /* Log the undo write to the WAL so that a crash during rollback
+         * still leaves a consistent state after recovery. */
+        wal_append(db, pno, db->undo[i].old);
         pwrite(db->fd, db->undo[i].old, PAGE_SIZE, (off_t)pno * PAGE_SIZE);
     }
     db->undo_depth = 0;
@@ -1024,6 +1042,7 @@ void pager_undo_commit(DB *db)
 {
     if (!db->txn_active) return;
     fsync(db->fd);
+    wal_checkpoint(db);
     db->undo_depth = 0;
     db->txn_active = 0;
 }
