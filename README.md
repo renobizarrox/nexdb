@@ -275,8 +275,9 @@ See `limitations.md` for the full list. The short version:
 - **Serialised execution.** Many clients can connect, but only one SQL statement
   runs at a time — the database handle is locked by a single mutex.
 - **No nested transactions.** `UNDO_MAX` is a single level.
-- **No session persistence.** Server sessions are kept in memory only. A crash
-  loses in-flight transaction state (but the WAL protects committed data).
+- **Session persistence.** Sessions are saved to `<database>.sessions` on every
+  state change and restored on restart. In-flight transactions are not carried
+  across restarts (the WAL protects committed data).
 - **Single process.** `flock()` prevents two `nexdb` instances from opening
   the same file.
 - **Rows must fit in 64 KB** (`MAX_ROW_SIZE`), enforced by overflow page chains.

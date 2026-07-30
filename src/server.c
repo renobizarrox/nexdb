@@ -75,6 +75,10 @@ static volatile int g_running = 1;
 static volatile int g_conn_count = 0;
 static pthread_mutex_t conn_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/* Session persistence (populated in server_run). */
+static char g_session_path[1024] = "";
+static volatile int g_session_dirty = 0;
+
 /* ---------------------------------------------------------- UUID helpers */
 static void uuid_str(char out[37])
 {
@@ -111,11 +115,77 @@ static int session_alloc(void)
         if (sessions[i].id[0] && now - sessions[i].last_active > g_session_ttl) {
             sessions[i].id[0] = 0;
             sessions[i].txn_active = 0;
+            g_session_dirty = 1;
         }
     }
     for (int i = 0; i < MAX_SESSIONS; i++)
         if (!sessions[i].id[0]) return i;
     return -1;
+}
+
+/* ------------------------------------------------------ session persistence */
+#define SESSION_MAGIC  0x5345534e  /* "NSES" */
+
+static void sessions_save(void)
+{
+    if (!g_session_path[0]) return;
+    char tmp[1032];
+    snprintf(tmp, sizeof tmp, "%s.tmp", g_session_path);
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) return;
+
+    uint32_t magic = SESSION_MAGIC;
+    uint32_t ver = 1;
+
+    pthread_mutex_lock(&sess_lock);
+    uint32_t count = 0;
+    for (int i = 0; i < MAX_SESSIONS; i++)
+        if (sessions[i].id[0]) count++;
+    /* header: magic + version + count */
+    struct { uint32_t magic; uint32_t ver; uint32_t count; } hdr;
+    hdr.magic = magic; hdr.ver = ver; hdr.count = count;
+    write(fd, &hdr, sizeof hdr);
+    for (int i = 0; i < MAX_SESSIONS; i++)
+        if (sessions[i].id[0])
+            write(fd, &sessions[i], sizeof(Session));
+    pthread_mutex_unlock(&sess_lock);
+
+    close(fd);
+    rename(tmp, g_session_path);
+}
+
+static void sessions_load(void)
+{
+    if (!g_session_path[0]) return;
+    int fd = open(g_session_path, O_RDONLY);
+    if (fd < 0) return;
+
+    struct { uint32_t magic; uint32_t ver; uint32_t count; } hdr;
+    if (read(fd, &hdr, sizeof hdr) != sizeof hdr) { close(fd); return; }
+    if (hdr.magic != SESSION_MAGIC || hdr.ver != 1) { close(fd); return; }
+    if (hdr.count > MAX_SESSIONS) hdr.count = MAX_SESSIONS;
+
+    pthread_mutex_lock(&sess_lock);
+    int64_t now = (int64_t)time(NULL);
+    for (uint32_t i = 0; i < hdr.count; i++) {
+        Session s;
+        if (read(fd, &s, sizeof(Session)) != sizeof(Session)) break;
+        if (s.id[0] && now - s.last_active <= g_session_ttl) {
+            s.txn_active = 0;
+            s.txn_depth = 0;
+            s.txn_undo_depth = 0;
+            s.txn_sp_count = 0;
+            for (int j = 0; j < MAX_SESSIONS; j++) {
+                if (!sessions[j].id[0]) {
+                    memcpy(&sessions[j], &s, sizeof(Session));
+                    break;
+                }
+            }
+        }
+    }
+    pthread_mutex_unlock(&sess_lock);
+
+    close(fd);
 }
 
 /* ----------------------------------------------------------- JSON helpers
@@ -269,6 +339,7 @@ static void execute_sql(const char *sql, const char *session_id,
         sess->txn_sp_count = g_db->txn_sp_count;
         memcpy(sess->txn_sp, g_db->txn_sp,
                sizeof(int) * (size_t)g_db->txn_sp_count);
+        g_session_dirty = 1;
     }
 
     /* Build JSON response */
@@ -413,6 +484,7 @@ static void *client_handler(void *arg)
         memcpy(sessions[sidx].id, session_id, 37);
         sessions[sidx].last_active = (int64_t)time(NULL);
         sessions[sidx].txn_active = 0;
+        g_session_dirty = 1;
     }
     pthread_mutex_unlock(&sess_lock);
 
@@ -474,6 +546,7 @@ static void *client_handler(void *arg)
     for (int i = 0; i < MAX_SESSIONS; i++) {
         if (strcmp(sessions[i].id, session_id) == 0) {
             sessions[i].id[0] = 0;
+            g_session_dirty = 1;
             break;
         }
     }
@@ -606,6 +679,12 @@ int server_run(DB *db, int port, const char *unix_path,
     if (unix_fd >= 0) printf(", unix:%s", sock_path);
     printf("\n");
 
+    /* Session file sits next to the database */
+    snprintf(g_session_path, sizeof g_session_path, "%s.sessions", db->path);
+
+    /* Restore persisted sessions */
+    sessions_load();
+
     /* Accept loop */
     while (g_running) {
         fd_set rfds;
@@ -627,6 +706,13 @@ int server_run(DB *db, int port, const char *unix_path,
             fprintf(stderr, "select: %s\n", strerror(errno));
             break;
         }
+
+        /* Persist sessions to disk (~1/s throttle from select timeout) */
+        if (g_session_dirty) {
+            g_session_dirty = 0;
+            sessions_save();
+        }
+
         if (ret == 0) continue;
 
         int cfd = -1;
@@ -662,6 +748,9 @@ int server_run(DB *db, int port, const char *unix_path,
             pthread_detach(thr);
         }
     }
+
+    /* Final session flush */
+    sessions_save();
 
     close(listen_fd);
     if (unix_fd >= 0) {

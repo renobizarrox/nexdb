@@ -56,19 +56,15 @@ Build with `NEXDB_TLS=1 make` to link OpenSSL (auto-detected via `pkg-config`
 or the Homebrew path `/opt/homebrew/opt/openssl@3`). Without the environment
 variable the build remains TLS-free — no dependency.
 
-## 5. No session persistence
+## 5. ~~No session persistence~~ (fixed July 2026)
 
-Server sessions (transaction state, undo depth) live only in the in-memory
-`sessions[]` array. If the server process is killed, all in-flight
-transactions are lost. The WAL ensures committed data survives, but the
-application must re-authenticate and restart any interrupted `BEGIN`..`COMMIT`
-sequence.
-
-**To fix:** Serialise session state to the database file (or a separate
-`.sessions` file) on each `COMMIT` / `ROLLBACK`. On startup, reload active
-sessions that had an open transaction. This is subtle — the WAL replay
-must complete before session state can be restored, and sessions whose
-transaction was mid-flight at the time of crash must be auto-rolled-back.
+Sessions are now persisted to `<database>.sessions` — a binary file written
+alongside the database file. The server saves on every session state change
+(alloc, free, BEGIN, COMMIT, ROLLBACK, SAVEPOINT) and flushes again on
+clean shutdown. On restart, sessions that have not expired (per
+`--session-ttl`) are restored. Transaction state is NOT restored across
+restarts — in-flight transactions must be re‑started. The session ID and
+TTL tracking survive, so clients can reconnect with the same session token.
 
 ## 6. Execution is serialised
 
