@@ -3,18 +3,21 @@
  *   nexdb mydata.ndb              interactive
  *   nexdb mydata.ndb -f setup.sql run a script
  *   nexdb mydata.ndb -c "SELECT * FROM notes"
- *
- * In interactive mode statements are buffered until you end a line with ';'
- * or type GO on its own line, the way sqlcmd behaves.
+ *   nexdb serve mydata.ndb        start daemon (port 7890)
+ *   nexdb --connect localhost:7890  remote REPL
  */
 #define _GNU_SOURCE
 #include "nexdb.h"
+#include "server.h"
 
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 #include <stdio.h>
 #include <ctype.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
 
 static const char *BANNER =
 "nexdb 0.1 - a database that remembers what you use\n"
@@ -217,8 +220,115 @@ static void repl(DB *db)
     free(batch);
 }
 
+/* --------------------------------------------------------- serve subcommand */
+static int main_server(int argc, char **argv)
+{
+    const char *path = NULL;
+    int port = 7890;
+    const char *unix_path = NULL;
+    const char *token = NULL;
+    int session_ttl = 300;
+    int daemon = 0;
+    const char *pidfile = NULL;
+
+    /* Skip argv[0] ("serve") */
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--port") == 0 && i + 1 < argc)
+            port = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--unix") == 0 && i + 1 < argc)
+            unix_path = argv[++i];
+        else if (strcmp(argv[i], "--token") == 0 && i + 1 < argc)
+            token = argv[++i];
+        else if (strcmp(argv[i], "--session-ttl") == 0 && i + 1 < argc)
+            session_ttl = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--daemon") == 0)
+            daemon = 1;
+        else if (strcmp(argv[i], "--pidfile") == 0 && i + 1 < argc)
+            pidfile = argv[++i];
+        else if (argv[i][0] == '-') {
+            fprintf(stderr, "unknown option '%s'\n", argv[i]);
+            return 2;
+        } else if (!path)
+            path = argv[i];
+        else {
+            fprintf(stderr, "unexpected argument '%s'\n", argv[i]);
+            return 2;
+        }
+    }
+
+    if (!path) {
+        fprintf(stderr,
+                "usage: nexdb serve <database-file> [--port N] [--unix PATH]\n"
+                "                    [--token STR] [--session-ttl SECS]\n"
+                "                    [--daemon] [--pidfile FILE]\n");
+        return 2;
+    }
+
+    /* Daemonise before opening the DB (so the child owns the file) */
+    if (daemon) {
+        pid_t pid = fork();
+        if (pid < 0) { perror("fork"); return 1; }
+        if (pid > 0) {
+            /* Parent: write PID file if requested and exit */
+            if (pidfile) {
+                FILE *pf = fopen(pidfile, "w");
+                if (pf) {
+                    fprintf(pf, "%d\n", pid);
+                    fclose(pf);
+                } else {
+                    fprintf(stderr, "error: cannot write pidfile '%s': %s\n",
+                            pidfile, strerror(errno));
+                }
+            }
+            exit(0);
+        }
+        /* Child: become session leader */
+        if (setsid() < 0) { perror("setsid"); return 1; }
+        /* Redirect stdio to /dev/null */
+        int nullfd = open("/dev/null", O_RDWR);
+        if (nullfd >= 0) {
+            dup2(nullfd, 0); dup2(nullfd, 1); dup2(nullfd, 2);
+            close(nullfd);
+        }
+    }
+
+    DB *db = malloc(sizeof(DB));
+    if (!db) {
+        fprintf(stderr, "error: out of memory\n");
+        return 1;
+    }
+    if (db_open(db, path) < 0) {
+        fprintf(stderr, "error: %s\n", db->err);
+        free(db);
+        return 1;
+    }
+
+    int rc = server_run(db, port, unix_path, token, session_ttl);
+
+    /* Remove PID file on clean shutdown */
+    if (pidfile) unlink(pidfile);
+
+    db_close(db);
+    free(db);
+    return rc ? 1 : 0;
+}
+
 int main(int argc, char **argv)
 {
+    /* Serve subcommand */
+    if (argc >= 2 && strcmp(argv[1], "serve") == 0)
+        return main_server(argc - 1, argv + 1);
+
+    /* Remote connect mode --client host:port (or unix path) */
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--connect") == 0) {
+            if (i + 1 < argc)
+                return server_connect_repl(argv[i + 1]);
+            fprintf(stderr, "error: --connect requires an address (host:port or /path)\n");
+            return 2;
+        }
+    }
+
     const char *path = NULL;
     const char *script = NULL;
     const char *command = NULL;
@@ -237,6 +347,11 @@ int main(int argc, char **argv)
                    "                   what they read, so you can inspect the\n"
                    "                   memory without changing it\n"
                    "  -h               this text\n"
+                   "\n"
+                   "remote / server:\n"
+                   "  nexdb serve <db> [--port N] [--unix PATH] [--token STR]\n"
+                   "                 [--session-ttl SECS] [--daemon] [--pidfile FILE]\n"
+                   "  nexdb --connect host:port\n"
                    "\n"
                    "environment:\n"
                    "  NEXDB_TIME_OFFSET  seconds to add to the clock, for\n"

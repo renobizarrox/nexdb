@@ -10,8 +10,9 @@ often it gets used, and rows that keep showing up together become linked. Over
 time the database develops an opinion about what matters to you — not because
 you set a priority column, but as a side effect of how you used it.
 
-Written from scratch in C11 with no dependencies: about 3,900 lines covering the
-storage layer, the SQL parser, the executor and the memory model.
+Written from scratch in C11 with no dependencies: about 9,900 lines covering the
+storage layer, the SQL parser, the executor, the associative memory model,
+a write-ahead log, a JSON-over-TCP server, and B-tree indexes.
 
 ## Quick start
 
@@ -22,7 +23,7 @@ Ubuntu, `sudo apt install build-essential`.
 ```sh
 cd ~/Documents/nexdb
 make          # compiles build/nexdb, takes a couple of seconds
-make test     # 137 integration tests, expect "137 passed, 0 failed"
+make test     # 228 integration tests, expect "228 passed, 2 failed"
 make demo     # the five minute guided tour
 make run      # interactive shell on a database called brain.ndb
 ```
@@ -30,10 +31,10 @@ make run      # interactive shell on a database called brain.ndb
 Or drive the binary directly:
 
 ```sh
-./build/nexdb mydata.ndb                       # interactive
+./build/nexdb mydata.ndb                            # interactive shell
 ./build/nexdb mydata.ndb -c "SELECT * FROM notes"   # one-off query
-./build/nexdb mydata.ndb -f myscript.sql       # run a script
-./build/nexdb -h                               # all the flags
+./build/nexdb mydata.ndb -f myscript.sql            # run a script
+./build/nexdb -h                                    # all the flags
 ```
 
 The database is a single file that you name yourself, created on first use.
@@ -52,11 +53,60 @@ nexdb> INSERT INTO notes (id, topic, body) VALUES (1, 'coffee', 'grind finer for
 nexdb> SELECT * FROM notes WHERE topic = 'coffee';
 ```
 
+## Server mode
 
+nexdb also runs as a JSON-over-TCP daemon for local network access:
+
+```sh
+./build/nexdb serve mydata.ndb                                  # port 7890
+./build/nexdb serve mydata.ndb --port 9000                      # custom port
+./build/nexdb serve mydata.ndb --unix /tmp/nexdb.sock           # Unix socket
+./build/nexdb serve mydata.ndb --token s3cret                   # auth token
+./build/nexdb serve mydata.ndb --daemon --pidfile /tmp/nexdb.pid # background
+```
+
+The wire protocol is newline-delimited JSON:
+
+```
+→ {"sql":"SELECT 1 AS n","session":"<uuid>","token":"<token>"}
+← {"ok":true,"text":"n\n-\n1\n\n(1 row)\n","columns":["n"],"rows":[["1"]],
+   "session":"<uuid>"}
+```
+
+The `session` field is optional — the server generates one and returns it in the
+welcome message. Include it on subsequent requests to keep transaction state.
+The `token` field is only needed when `--token` is set.
+
+Connect from any language:
+
+```python
+import socket, json
+s = socket.socket()
+s.connect(('127.0.0.1', 7890))
+welcome = json.loads(s.recv(4096))
+sid = welcome['session']
+s.sendall((json.dumps({'sql':'SELECT 1','session':sid}) + '\n').encode())
+resp = json.loads(s.recv(65536))
+```
+
+Or use the built-in REPL:
+
+```sh
+./build/nexdb --connect localhost:7890
+```
+
+**Features:**
+- Up to 64 concurrent clients with per-connection handler threads
+- Mutex-serialised execution (only one statement runs at a time)
+- Structured `columns` / `rows` in the JSON response alongside `text`
+- Session-managed transaction state (`BEGIN`/`COMMIT`/`ROLLBACK`)
+- Optional auth token
+- Session TTL (default 300 s, configurable via `--session-ttl`)
+- Graceful shutdown on `SIGINT` / `SIGTERM`
+- Daemonisation with `--daemon` and PID file with `--pidfile`
+- Unix domain socket with `--unix`
 
 ## The two things that make it a memory
-
-
 
 ### 1. Rows get stronger with use and fade without it
 
@@ -65,14 +115,17 @@ boosts its strength; time erodes it on an exponential curve — the same shape
 psychologists use to model human forgetting.
 
 ```
-strength now = stored strength × 2 ^ (−elapsed ÷ half-life)
+strength now = stored strength × 2 ^(−elapsed ÷ half-life)
 on use:        stored strength = strength now + boost
 ```
 
-The half-life is one week (`MEM_HALFLIFE_SECS` in `include/nexdb.h`). A row you look at daily climbs steadily. A row nobody has touched in two months sits near zero — still there, still queryable, just no longer something the database volunteers. **Nothing is ever deleted by decay.** Forgetting here means
-"stops being suggested first", not "is gone".
+The half-life is one week (`MEM_HALFLIFE_SECS` in `include/nexdb.h`). A row you
+look at daily climbs steadily. A row nobody has touched in two months sits near
+zero — still there, still queryable, just no longer something the database
+volunteers. **Nothing is ever deleted by decay.** Forgetting here means "stops
+being suggested first", not "is gone".
 
-You can see the memory state directly, and sort by it:
+You can see the memory state directly:
 
 ```sql
 SHOW MEMORY FROM notes;
@@ -98,43 +151,44 @@ SHOW LINKS TOP 10;
 matches, adds credit for familiarity, then uses the association graph to
 re-rank: a row linked to a strong match is pushed up the results.
 
-Be clear on what that last part does **not** do yet. A row still has to contain
-one of your search words to be a candidate at all, so association affects the
-*order* of results, never their membership. Asking about something linked to a
-match will not surface that match's neighbours. See `LIMITATIONS.md` §4.
+Fuzzy matching via Levenshtein edit distance handles typos: "shampoo" matches
+shampoo, and "cafe" matches coffee. A row must still contain one of your search
+words to be a candidate — association affects the *order* of results, never
+their membership.
 
 ```sql
 RECALL 'how do I make the coffee taste right';
 RECALL 'shampoo' FROM notes TOP 5;
 ```
 
-If nothing matches, it says so rather than returning its best guess dressed up
-as an answer.
+If nothing matches, the engine says so rather than returning its best guess
+dressed up as an answer.
 
 ### Steering it by hand
 
 ```sql
 REMEMBER FROM notes WHERE id = 4;   -- pin something important you rarely open
-FORGET FROM notes WHERE id = 8;     -- zero the strength, keep the row
+FORGET FROM notes WHERE id = 8;     -- zero the strength, keep the row and its links
 ```
-
-
 
 ## SQL supported
 
-
-| Area          | Supported                                                                                                                        |
-| ------------- | -------------------------------------------------------------------------------------------------------------------------------- |
-| DDL           | `CREATE TABLE`, `DROP TABLE [IF EXISTS]`                                                                                         |
-| Types         | `TINYINT`/`SMALLINT`/`INT`/`BIGINT`, `FLOAT`/`REAL`/`DECIMAL`, `NVARCHAR(n)`/`NVARCHAR(MAX)`/`VARCHAR`/`TEXT`, `BIT`, `DATETIME` |
-| Constraints   | `NOT NULL`, `PRIMARY KEY`, `UNIQUE` — all enforced                                                                               |
-| Queries       | `SELECT`, `TOP n`, column aliases with `AS`, `COUNT(*)`, `SUM`, `AVG`, `MIN`, `MAX`, `GROUP BY`, `WHERE`, `ORDER BY ... ASC/DESC` |
-| Predicates    | `= <> != < <= > >=`, `AND`, `OR`, `NOT`, `LIKE` with `%`/`_` and `ESCAPE`, `IN (...)`, `IS [NOT] NULL`                           |
-| Arithmetic    | `+ - * /`, and `+` concatenates when either side is text                                                                         |
-| Writes        | `INSERT ... VALUES (...), (...)`, `UPDATE ... SET`, `DELETE`                                                                     |
-| T-SQL surface | `GO` batches, `--` and `/* */` comments, `[bracketed]` and `"quoted"` identifiers, `N'literals'`, `''` escapes, `PRINT`          |
-| Memory        | `RECALL`, `REMEMBER`, `FORGET`, `SHOW TABLES`, `SHOW MEMORY`, `SHOW LINKS`, `CHECKPOINT`                                         |
-
+| Area | Supported |
+| --- | --- |
+| DDL | `CREATE TABLE`, `DROP TABLE [IF EXISTS]`, `TRUNCATE TABLE`, `ALTER TABLE` (ADD/DROP/RENAME/ALTER COLUMN TYPE) |
+| Types | `TINYINT`/`SMALLINT`/`INT`/`BIGINT`, `FLOAT`/`REAL`/`DECIMAL`/`MONEY`, `NVARCHAR(n)`/`VARCHAR`/`TEXT`, `BIT`, `DATETIME`, `UNIQUEIDENTIFIER` |
+| Constraints | `NOT NULL`/`NULL`, `PRIMARY KEY`, `UNIQUE`, `DEFAULT` (literal, `GETDATE()`, `NEWID()`), `IDENTITY(seed,step)` — all enforced |
+| Queries | `SELECT [ALL\|DISTINCT] [TOP n]` with expressions, column aliases, `FROM` (table, subquery, joins), `WHERE`, `GROUP BY` + `HAVING`, `ORDER BY` |
+| Joins | `INNER JOIN`, `LEFT JOIN`, `table.*` expansion, qualified `table.col` references |
+| Predicates | `= <> != < <= > >=`, `AND`/`OR`/`NOT`, `LIKE` with `%`/`_` and `ESCAPE`, `IN (...)`, `IS [NOT] NULL`, `BETWEEN`/`NOT BETWEEN` |
+| Expressions | Arithmetic `+ - * / %`, `CASE` (simple and searched), `CAST`, scalar functions, subqueries (scalar, `IN`, `EXISTS`, `ANY`/`ALL`, correlated) |
+| Aggregates | `COUNT(*)`, `COUNT(DISTINCT x)`, `SUM`, `AVG`, `MIN`, `MAX` |
+| Scalar functions | `LEN`, `UPPER`, `LOWER`, `SUBSTRING`, `LEFT`, `RIGHT`, `REPLACE`, `CONCAT`, `REVERSE`, `TRIM`, `LTRIM`, `RTRIM`, `ABS`, `ROUND`, `FLOOR`, `CEILING`, `SIGN`, `SQRT`, `POWER`, `ISNULL`, `COALESCE`, `NULLIF`, `IIF`, `GETDATE`, `NEWID` |
+| Writes | `INSERT ... VALUES (...), (...)`, `INSERT ... SELECT`, `UPDATE ... SET`, `DELETE` |
+| T-SQL surface | `GO` batches, `--` and `/* */` comments, `[bracketed]` and `"quoted"` identifiers, `N'literals'`, `''` escapes, `PRINT` |
+| Memory | `RECALL`, `REMEMBER`, `FORGET`, `SHOW TABLES`, `SHOW MEMORY`, `SHOW LINKS` |
+| Utility | `BEGIN`/`COMMIT`/`ROLLBACK`, `CHECKPOINT`, `EXPLAIN`, `VACUUM` |
+| Indexing | B-tree indexes on `PRIMARY KEY` and `UNIQUE` columns; O(log n) point lookups |
 
 Everything is case-insensitive, including string comparison.
 
@@ -152,10 +206,8 @@ INSERT INTO t (id) VALUES (1);               -- id is a PRIMARY KEY that exists
 SELECT * FROM t WHERE id < 'banana';         -- no meaningful ordering
 ```
 
-That last one matters more than it looks. Comparing a number against quoted text
-used to render the number to a string and compare alphabetically, so on an `INT`
-column `WHERE n > '10'` matched 9 and rejected 100. Numeric text now compares
-numerically, and non-numeric text is an error.
+Numeric text compares numerically. Non-numeric text compared against a number
+is an error.
 
 ## Watching a month pass in a second
 
@@ -174,75 +226,74 @@ your own interference. It is also the right flag for dashboards and backups.
 ## How it works inside
 
 ```
-include/nexdb.h   all types and interfaces
-src/pager.c       4 KB pages, slotted heap pages, persisted catalog
-src/memory.c      strength, decay, and the Hebbian association table
-src/btree.c       B-tree index on primary keys
-src/lexer.c       tokenizer
-src/parser.c      recursive-descent parser producing an AST
-src/func.c        scalar functions and UUID support
-src/exec.c        executor, reinforcement, result formatting
-src/select.c      GROUP BY and aggregation
-src/main.c        shell and script runner
-tests/            137 integration tests, run with `make test`
+include/nexdb.h   all types and interfaces (586 lines)
+include/server.h  server public API
+include/wal.h     WAL page types
+
+src/pager.c       paged file, slotted heap pages, free list, catalog (1048 lines)
+src/memory.c      strength decay, Hebbian association table (341 lines)
+src/btree.c       B-tree index on PK and UNIQUE columns (638 lines)
+src/lexer.c       tokenizer (224 lines)
+src/parser.c      recursive-descent parser → AST (1450 lines)
+src/exec.c        executor, reinforcement, result formatting (2612 lines)
+src/select.c      GROUP BY, aggregation, capture for server (1415 lines)
+src/func.c        scalar functions, UUID support (474 lines)
+src/wal.c         write-ahead log for crash safety (234 lines)
+src/server.c      JSON-over-TCP server, sessions, auth (691 lines)
+src/main.c        shell, script runner, CLI (402 lines)
+src/value.c       value API, type conversion (322 lines)
+tests/            228 integration tests, run with `make test`
 ```
 
 The whole database is one file. Page 0 is the header; the catalog and the
 association table live in their own page chains; each table is a linked list of
-slotted pages. Rows are variable-length, with the memory metadata as fixed-size
-fields at the head of each row so reinforcement can be written in place without
-rewriting the row.
+slotted pages. Rows are variable-length, with memory metadata at the head of
+each row so reinforcement can be written in place.
+
+A write-ahead log (`<db>.wal`) records every page mutation before it is applied.
+On startup, `db_open()` replays any pending entries. `CHECKPOINT` fsyncs the
+main file and truncates the WAL. This ensures crash safety.
 
 Tests run the binary as a fresh process against a scratch database, so anything
 passing has already survived a restart. The suite also runs clean under
 AddressSanitizer and UndefinedBehaviorSanitizer:
 
 ```sh
-gcc -std=c11 -g -O1 -fsanitize=address,undefined -Wno-format-truncation \
-    -Iinclude src/*.c -o /tmp/nexdb-asan -lm
-BIN=/tmp/nexdb-asan sh tests/run_tests.sh
+make asan
 ```
-
-
 
 ## What it does not do yet
 
-This was verified by probing the binary,
-with the silent-wrongness bugs listed first. The short version, in the order
-they'd hurt:
+See `limitations.md` for the full list. The short version:
 
-- **No crash safety.** There's no write-ahead log, so a power cut mid-write can
-corrupt the file. Only a clean exit calls `fsync`; `CHECKPOINT` writes pages
-but leaves them in the OS cache. Keep backups.
-- **No joins.** `GROUP BY` and aggregates (`SUM`, `AVG`, `MIN`, `MAX`) are supported; scalar functions like `LEN`, `UPPER`, `SUBSTRING`, `COALESCE`, `ABS`, `ROUND` and others work too.
-- **Single user.** No locking; do not point two processes at one file.
-- **Deleted pages are not reused.** Space is reclaimed within a page but a page
-emptied entirely stays allocated, so heavy delete cycles grow the file.
-- `RECALL` **needs a literal word match to get started.** It is substring and
-familiarity based, not semantic — it will not connect "car" to "vehicle". Real
-semantic recall would need embeddings, which is the biggest single upgrade
-available.
-- **No transactions**, so no `BEGIN`/`COMMIT`/`ROLLBACK`, and a script that fails
-halfway leaves the earlier statements applied.
-- **Rows must fit in one 4 KB page**, capping a row at roughly 4,000 bytes.
-- Limits: 64 tables, 32 columns per table, 63-character names.
-
-
+- **No range scans via indexes.** `WHERE pk = literal` uses the B-tree, but
+  range queries still do a full table scan. B-tree pages freed by `DROP TABLE`
+  are not recycled.
+- **No network encryption.** The TCP server is cleartext; it binds to loopback
+  by default. Use `--unix`, an SSH tunnel, or a TLS proxy.
+- **Serialised execution.** Many clients can connect, but only one SQL statement
+  runs at a time — the database handle is locked by a single mutex.
+- **No nested transactions.** `UNDO_MAX` is a single level.
+- **No session persistence.** Server sessions are kept in memory only. A crash
+  loses in-flight transaction state (but the WAL protects committed data).
+- **Single process.** `flock()` prevents two `nexdb` instances from opening
+  the same file.
+- **Rows must fit in 64 KB** (`MAX_ROW_SIZE`), enforced by overflow page chains.
+- **Limits:** 128 tables, 32 columns per table, 127-char names, 16 JOINs per
+  query, 16 ORDER BY keys, 16 GROUP BY keys, 32 aggregate functions.
 
 ## Tuning the memory
 
-All in `include/nexdb.h`, and worth playing with:
+All in `include/nexdb.h`:
 
-
-| Constant            | Default | Effect                                           |
-| ------------------- | ------- | ------------------------------------------------ |
-| `MEM_HALFLIFE_SECS` | 7 days  | how fast unused rows fade                        |
-| `MEM_BOOST`         | 1.0     | how much a single access counts                  |
-| `MEM_INIT_STRENGTH` | 1.0     | how strong a brand new row starts                |
-| `MEM_MAX_STRENGTH`  | 1000    | saturation ceiling                               |
-| `MEM_LINK_BOOST`    | 0.30    | how fast associations form                       |
-| `MEM_COACT_MAX`     | 12      | how many rows a single query links together      |
-| `MEM_SPREAD_FACTOR` | 0.45    | how much activation `RECALL` passes along a link |
-
+| Constant | Default | Effect |
+| --- | --- | --- |
+| `MEM_HALFLIFE_SECS` | 7 days | how fast unused rows fade |
+| `MEM_BOOST` | 1.0 | how much a single access counts |
+| `MEM_INIT_STRENGTH` | 1.0 | how strong a brand new row starts |
+| `MEM_MAX_STRENGTH` | 1000 | saturation ceiling |
+| `MEM_LINK_BOOST` | 0.30 | how fast associations form |
+| `MEM_COACT_MAX` | 12 | how many rows a single query links together |
+| `MEM_SPREAD_FACTOR` | 0.45 | how much activation `RECALL` passes along a link |
 
 Change one, run `make && make test`, and see what the behaviour feels like.

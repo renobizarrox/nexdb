@@ -519,6 +519,10 @@ void stmt_free(Stmt *s);
 /* parser.c */
 int parse_stmt(Lexer *lx, Stmt *out, char *err);   /* 1 = stmt, 0 = end, -1 = error */
 
+/* When non-NULL, all statement output goes here instead of stdout.
+ * Used by the TCP server to capture query results as text. */
+extern FILE *g_output_file;
+
 /* exec.c */
 int exec_stmt(DB *db, Stmt *s, char *err);
 int row_matches(const Expr *where, const Row *row, const Table *t,
@@ -563,6 +567,7 @@ typedef struct {
 int  exec_select(DB *db, Stmt *s, char *err);
 int  exec_select_into(DB *db, Stmt *s, Capture *cap, char *err);
 void capture_free(Capture *c);
+extern Capture *g_select_capture;
 
 /* func.c */
 int func_exists(const char *name);

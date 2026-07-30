@@ -20,6 +20,14 @@
 #include <stdio.h>
 #include <math.h>
 
+/* Capture all printf through g_output_file so the TCP server can intercept text output. */
+#undef printf
+#define printf(...)   fprintf(g_output_file ? g_output_file : stdout, __VA_ARGS__)
+
+/* When non-NULL, exec_select_into copies SELECT results to this capture
+ * in addition to printing them (used by the TCP server for JSON output). */
+Capture *g_select_capture = NULL;
+
 /* ---------------------------------------------------------------- join help */
 
 typedef struct {
@@ -1346,7 +1354,7 @@ emit_grouped:
     }
 
     /* ---- print */
-    Grid g;
+    Grid g = {0};
     grid_init(&g, ncols);
     for (int c = 0; c < ncols; c++) snprintf(g.head[c], MAX_NAME, "%s", heads[c]);
 
@@ -1369,6 +1377,23 @@ emit_grouped:
     }
     if (g.nrows) grid_print(&g);
     printf("\n(%d row%s)\n", g.nrows, g.nrows == 1 ? "" : "s");
+
+    /* If a global capture was requested, copy the grid to it */
+    if (g_select_capture) {
+        g_select_capture->ncols = g.ncols;
+        for (int c = 0; c < g.ncols; c++)
+            snprintf(g_select_capture->colnames[c], MAX_NAME, "%s", g.head[c]);
+        for (int r = 0; r < g.nrows; r++) {
+            Value row[MAX_OUT_COLS];
+            for (int c = 0; c < g.ncols; c++)
+                row[c] = g.cells[r * g.ncols + c]
+                             ? val_text(g.cells[r * g.ncols + c])
+                             : val_null();
+            capture_push(g_select_capture, row, g.ncols);
+            for (int c = 0; c < g.ncols; c++) val_clear(&row[c]);
+        }
+    }
+
     grid_free(&g);
 
     /* ---- reinforce the rows actually shown (ungrouped queries only; the

@@ -1,6 +1,6 @@
 CC      ?= cc
-CFLAGS  ?= -std=c11 -O2 -Wall -Wextra -Wshadow -Iinclude
-LDFLAGS ?= -lm
+CFLAGS  ?= -std=c11 -O2 -fno-inline -Wall -Wextra -Wshadow -Iinclude
+LDFLAGS ?= -lm -lpthread
 
 # -Wno-format-truncation is a GCC-only flag. Deliberate snprintf truncation into
 # fixed-size name and error buffers is all over the parser, and GCC complains
@@ -12,7 +12,7 @@ ifeq ($(IS_CLANG),0)
 endif
 
 SRC := src/value.c src/pager.c src/memory.c src/btree.c src/lexer.c \
-       src/parser.c src/func.c src/select.c src/exec.c src/main.c src/wal.c
+       src/parser.c src/func.c src/select.c src/exec.c src/main.c src/wal.c src/server.c
 OBJ := $(SRC:src/%.c=build/%.o)
 BIN := build/nexdb
 
@@ -23,7 +23,7 @@ all: $(BIN)
 $(BIN): $(OBJ)
 	$(CC) $(OBJ) -o $@ $(LDFLAGS)
 
-build/%.o: src/%.c include/nexdb.h | build
+build/%.o: src/%.c include/nexdb.h include/server.h | build
 	$(CC) $(CFLAGS) -c $< -o $@
 
 build:
@@ -45,7 +45,7 @@ run: $(BIN)
 # same tests under AddressSanitizer and UndefinedBehaviorSanitizer
 asan:
 	@mkdir -p build
-	$(CC) -std=c11 -g -O1 -fsanitize=address,undefined -Iinclude \
+	$(CC) -std=c11 -g -O1 -fno-inline -fsanitize=address,undefined -Iinclude \
 	      $(SRC) -o build/nexdb-asan $(LDFLAGS)
 	@BIN=./build/nexdb-asan sh tests/run_tests.sh
 

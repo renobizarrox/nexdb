@@ -1,195 +1,139 @@
 # Limitations
 
-What is missing and what it would take to fix it.
+What is still missing and what it would take to fix it.
 
-~~## 1. No indexes — FIXED~~
+## 1. Index range scans
 
-~~Every query is a full table scan. Inserts, updates, uniqueness checks — all linear.~~
+`WHERE pk = literal` uses the B-tree for O(log n) point lookups. Range queries
+(`WHERE pk > 10`, `WHERE pk BETWEEN 1 AND 100`) still do a full table scan.
+Secondary indexes exist for UNIQUE constraint enforcement but are not used by
+`SELECT` at all.
 
-~~Fixed in `src/btree.c` and `src/exec.c`: each UNIQUE column gets its own B-tree index. Inserts,
-updates, deletes, and ALTER TABLE all maintain indexes. `SELECT WHERE indexed_col = literal` uses
-the index for O(log n) point lookups. Full scans still run for range queries and non-indexed
-columns, and range scans are not yet indexed.~~
+**To fix:** Extend `scan_init()` to accept an optional index + range (start key,
+end key, inclusive/exclusive flags). The executor (`exec.c`) already
+distinguishes equality predicates from range predicates; route range predicates
+to an index scan. For secondary indexes, teach the query planner to detect
+indexed columns in `WHERE` and pick the index.
 
-~~## 8. Uniqueness is quadratic — FIXED (by item 1)~~
+## 2. No nested transactions
 
-~~With no indexes, `check_unique()` did a full table scan per constrained column per row.~~
-~~The B-tree on the PK makes PRIMARY KEY checks O(log n).~~
+`UNDO_MAX = 256` pages supports a single level of undo. `BEGIN` inside an
+active transaction is ignored.
 
-## 1. No crash safety — FIXED
+**To fix:** Replace the flat undo array with a stack of savepoints. Each
+`BEGIN` pushes a savepoint (recording the current undo depth). `ROLLBACK`
+pops back to the most recent savepoint. `COMMIT` pops and discards. This
+requires changing the undo infrastructure in `src/pager.c` from an array to
+a stack-like structure.
 
-~~There is no write-ahead log. A power cut mid-write can corrupt the file. Only `CHECKPOINT` and clean exit call `fsync`.~~
+## 3. B-tree pages are not recycled
 
-~~**To fix:** Add a write-ahead log in `src/pager.c`. Requires:~~
-~~- A `wal.c` / `wal.h` module that records every page mutation before it is applied~~
-~~- On startup, replay the WAL to restore a consistent state~~
-~~- Page checksums to detect torn writes (4 KB pages are usually safe, but not guaranteed)~~
-~~- Atomic page write via a double-write buffer or a shadow-paging scheme~~
-~~- Flush the WAL to disk (`fsync`) before applying in-place writes~~
-~~- On clean shutdown, checkpoint the WAL and remove it~~
+When a table is dropped or truncated, its heap pages are returned to the
+free list. B-tree pages are not — they leak until the file is vacuumed.
 
-Fixed in `src/wal.c` and `src/pager.c`: every `pager_write()` appends a record to `<db>.wal` and fsyncs it before writing the main database file. On startup, `db_open()` replays any pending WAL entries to restore a consistent state. `CHECKPOINT`, `COMMIT`, and `db_close()` all checkpoint (fsync main + truncate WAL). Each WAL entry carries a simple XOR checksum so that incomplete entries from a crash during append are detected and discarded. Transaction rollback also logs undo pages through the WAL, ensuring the replay log is always a complete ordered record of every write.
+**To fix:** In `btree_destroy()` (or at the call site in `cat_drop()` and
+`exec_truncate()`), walk every B-tree node page and call `pager_free()` on
+it. The B-tree code already has `INDEX_META_PAGE` / `INDEX_LEAF_PAGE` page
+tags; walk internal nodes recursively. `VACUUM` already rebuilds the entire
+file, so this is mainly relevant for frequent DDL-heavy workloads.
 
-## 2. No joins — FIXED
+## 4. No network encryption
 
-~~The parser does not recognise `JOIN` syntax and the executor only handles single-table queries.~~
+The TCP server sends everything in cleartext. It binds to loopback by default;
+for remote access you must tunnel through SSH (`ssh -L 7890:localhost:7890 host`)
+or run behind a TLS proxy (e.g. `nginx`, `stunnel`). The Unix socket (`--unix`)
+is a sensible alternative for same-machine access.
 
-~~**To fix:** Add join support across the stack:~~
-- ~~**Lexer/parser** (`src/lexer.c`, `src/parser.c`): parse `JOIN`, `INNER JOIN`, `LEFT JOIN`, `ON` clause, and add join clauses to the `Stmt` struct~~
-- ~~**Expression resolver** (`src/exec.c`): handle qualified column references (`t.col`)~~
-- ~~**Executor** (`src/select.c`): implement nested-loop join (sufficient for prototype), then consider hash join~~
-- ~~**Output** (`src/exec.c`): handle columns from multiple tables in result formatting~~
+**To fix:** Add TLS support. The smallest change would be to accept an optional
+`--tls-cert` and `--tls-key` flag, then wrap the socket with OpenSSL or
+LibreSSL before the read/write loop in `client_handler`. This adds a dependency.
 
-~~Fixed in `src/parser.c`, `src/exec.c`, `src/select.c`: `JOIN`, `INNER JOIN`, `LEFT JOIN` with `ON` clauses are parsed, qualified column refs (`t.col`) resolve across the joined tables, and nested-loop join execution produces correct INNER/LEFT results. `table.*` expansion and aggregate queries with joins are also supported. Multiple joins and GROUP BY with joins remain TODO.~~
+## 5. No session persistence
 
-## 3. Single user only — FIXED
+Server sessions (transaction state, undo depth) live only in the in-memory
+`sessions[]` array. If the server process is killed, all in-flight
+transactions are lost. The WAL ensures committed data survives, but the
+application must re-authenticate and restart any interrupted `BEGIN`..`COMMIT`
+sequence.
 
-~~No file locking exists. Two processes pointed at the same file will corrupt it.~~
+**To fix:** Serialise session state to the database file (or a separate
+`.sessions` file) on each `COMMIT` / `ROLLBACK`. On startup, reload active
+sessions that had an open transaction. This is subtle — the WAL replay
+must complete before session state can be restored, and sessions whose
+transaction was mid-flight at the time of crash must be auto-rolled-back.
 
-~~**To fix:** In `db_open()` (`src/pager.c:285`):~~
-~~- Add an advisory `flock(fd, LOCK_EX | LOCK_NB)` on open~~
-~~- On conflict, print a clear error message and exit~~
-~~- For a server-mode future, replace with a lock manager~~
+## 6. Execution is serialised
 
-~~Fixed in `src/pager.c`: `db_open()` now acquires an advisory exclusive lock via `flock()`.
-A second process gets a clear error and exits. The lock is automatically released when
-the file descriptor is closed. Only one nexdb process at a time can open a given database
-file, which is sufficient for the single-user use case. A server-mode future would replace
-this with a proper lock manager.
+All client requests share a single `DB` handle behind `exec_lock`. Statements
+from different clients never execute concurrently. This is safe but limits
+throughput on multi-core machines.
 
-## 4. Deleted pages are not reused — FIXED
+**To fix:** Make `DB` re-entrant or use a reader-writer lock so that read-only
+queries (`SELECT`, `RECALL`, `SHOW`) can run in parallel while writes
+(`INSERT`, `UPDATE`, `DELETE`, DDL) exclude readers. This requires auditing
+every global and static variable in the executor for thread safety.
 
-~~`pager_alloc()` always extends the file. Dropped tables and emptied pages stay allocated forever.~~
+## 7. Single process
 
-~~**To fix:** Add a free-page list in `src/pager.c`:~~
-~~- A new page (or header field tracking the head of a free list) records freed pages~~
-~~- On `pager_alloc()`, check the free list first before extending the file~~
-~~- On `cat_drop()`, walk the table's page chain and return every page to the free list~~
-~~- On `heap_delete()`, if a page becomes completely empty, unlink it from the chain and return it to the free list~~
-~~- The free list itself should be persisted in the catalog or a dedicated page chain~~
+`db_open()` acquires an advisory exclusive lock via `flock()`. A second process
+gets a clear error. Only one `nexdb` process at a time can open a given
+database file. The server accepts up to 64 concurrent clients, but they all
+share the same process.
 
-~~Fixed in `src/pager.c`: a singly-linked free list (head pointer at offset 32 in page 0) recycles
-pages. `pager_alloc()` pops from the free list before extending the file. `pager_free()` pushes
-pages back. `cat_drop()` frees every heap page of the dropped table. `exec_truncate()` frees all
-heap pages in O(n) instead of tombstoning rows individually. `heap_delete()` frees a page when
-the last live row is removed. B-tree pages are not yet recycled (see `btree_destroy()`).
+**To fix:** Replace `flock()` with a listening daemon that proxies requests
+to worker processes, or use POSIX shared memory + semaphores for multi-process
+concurrency. This is a major architectural change.
 
-## 5. RECALL only does literal substring matching — FIXED
+## 8. Hard limits
 
-~~RECALL tokenises the query into alphanumeric terms and does case-insensitive substring matching against text columns. It cannot connect related concepts.~~
+| Limit | Constant | Value |
+| --- | --- | --- |
+| Tables per database | `MAX_TABLES` | 128 |
+| Columns per table | `MAX_COLS` | 32 |
+| Name length | `MAX_NAME` | 127 chars |
+| Indexes per table | `MAX_INDEXES` | 32 |
+| INSERT rows per statement | `MAX_INSERT_ROWS` | 128 |
+| GROUP BY keys | `MAX_GROUP_KEYS` | 16 |
+| ORDER BY keys | `MAX_ORDER_KEYS` | 16 |
+| Joins per query | `MAX_JOINS` | 16 |
+| Aggregate functions | `MAX_AGGS` | 32 |
+| SELECT list items | `MAX_SELECT_ITEMS` | 128 |
+| IN list / CASE arms | `MAX_IN_ITEMS` | 128 |
+| SET clauses (UPDATE) | `MAX_SET_ITEMS` | 64 |
+| Function arguments | `MAX_FUNC_ARGS` | 16 |
+| RECALL search terms | `MAX_RECALL_TERMS` | 128 |
+| Output columns (result) | `MAX_OUT_COLS` | 64 |
+| Maximum connections (server) | `MAX_CONN` | 64 |
+| Maximum sessions (server) | `MAX_SESSIONS` | 64 |
+| Undo pages per transaction | `UNDO_MAX` | 256 |
+| Maximum row size | `MAX_ROW_SIZE` | 64 KB |
 
-~~**To fix:** Replace the lexical scoring engine (`exec.c:646-671`). Options in order of effort:~~
-- ~~**Easy:** Add fuzzy matching (Levenshtein distance) for typos and small variations~~
-- ~~**Medium:** Add stemming (Porter stemmer) so "running" matches "run"~~
-- ~~**Hard:** Add a TF-IDF inverted index to rank by relevance rather than hit count~~
-- ~~**Very hard:** Add semantic embeddings (on-disk vector store + approximate nearest neighbour) for genuine concept-level recall~~
-
-~~Fixed in `src/exec.c`: `lexical_score()` now falls back to Levenshtein-distance fuzzy matching when no exact substring match is found. The threshold is 0 edits for ≤4-char words, 1 edit for 5–7 char words, and 2 edits for 8+ char words. A fuzzy match contributes 0.8 to the lexical score vs 1.0 for an exact match, so exact hits still rank higher.~~
-
-## 6. No transactions — FIXED
-
-~~No `BEGIN`/`COMMIT`/`ROLLBACK`. Writes are applied in-place immediately. A script that fails mid-way leaves partial writes applied.~~
-
-~~**To fix:** Add a transaction manager in a new `src/txn.c`:~~
-- ~~`BEGIN` creates a savepoint in the WAL~~
-- ~~Each write records old-page images in the WAL (undo log)~~
-- ~~`ROLLBACK` replays the undo log to restore before-images~~
-- ~~`COMMIT` fsyncs the WAL then marks the transaction durable~~
-- ~~At minimum, wrap each individual statement in an implicit single-statement transaction for crash atomicity~~
-
-~~Fixed in `src/pager.c` and `src/exec.c`: `BEGIN` marks the transaction active; each call to `pager_write()` captures the old page image into an in-memory `UndoEntry` array before writing; `ROLLBACK` restores images in reverse order; `COMMIT` fsyncs, serialises catalog/links, then clears the undo log. A statement failure inside an active transaction auto-rolls back. Nested transactions are not supported. Maximum 256 modified pages per transaction.~~
-
-## 7. Rows are capped at ~4 KB — FIXED
-
-~~A row must fit entirely within one 4,096-byte page (max ~4,080 bytes of payload after headers).~~
-
-~~**To fix:** Add row chaining or overflow pages in `src/pager.c`:~~
-- ~~**Overflow pages:** When a row exceeds `PAGE_SIZE`, store a stub in the main page pointing to one or more overflow (chained) pages holding the rest of the data~~
-- ~~**Row chaining:** Allow a row's column data to span multiple heap pages in the table's chain~~
-- ~~Also bump `MAX_TOKEN` in the lexer (`include/nexdb.h`) above 4096 since large text values need matching parser/lexer capacity~~
-
-~~Fixed in `src/pager.c`: When a serialised row exceeds the inline limit (`PAGE_SIZE - HP_HDR_SIZE - SLOT_SIZE ≈ 4080 bytes`), the row is written as an overflow chain. A 30-byte stub (tuple header + `ncols = 0xFFFF` marker + chain head page number) is stored in the heap page slot, and the full encoded tuple is stored across one or more chain pages (each 4088 bytes of payload). On read, `row_decode()` detects the `OVERFLOW_MARKER` and reads the chain via `chain_read()` before decoding. On delete, `chain_free()` walks and frees every overflow page. `heap_free_pages()` (used by `cat_drop`/`TRUNCATE`) also frees overflow chains. `heap_replace()` works via `heap_delete` + `heap_insert`, both overflow-aware. Max row size is 64 KB (`MAX_ROW_SIZE`). Version bumped to 6. The lexer's `MAX_TOKEN` (4095 chars) is unchanged — very large string literals still need programmatic insertion via `-c` or scripting, or multiple `INSERT`/`UPDATE` steps.~~
-
-## 8. Hard limits — FIXED
-
-~~| Limit | Constant | Value |~~
-~~|---|---|---|~~
-~~| Tables per database | `MAX_TABLES` | 64 |~~
-~~| Columns per table | `MAX_COLS` | 32 |~~
-~~| Name length | `MAX_NAME` | 63 chars (+ null) |~~
-~~| INSERT rows per statement | (hardcoded) | 64 |~~
-~~| GROUP BY keys | `MAX_GROUP_KEYS` | 8 |~~
-~~| ORDER BY keys | `MAX_ORDER_KEYS` | 8 |~~
-~~| Aggregate functions per query | `MAX_AGGS` | 16 |~~
-~~| SELECT list items | `MAX_SELECT_ITEMS` | 64 |~~
-~~| IN list / CASE arms | `MAX_IN_ITEMS` | 64 |~~
-~~| Function arguments | `MAX_FUNC_ARGS` | 8 |~~
-~~| RECALL search terms | `MAX_RECALL_TERMS` | 64 |~~
-
-~~**To fix:** All are single-constant bumps in `include/nexdb.h` — but some have structural implications:~~
-~~- `MAX_TABLES` / `MAX_COLS` / `MAX_NAME`: Bump the constant, but very wide tables may hit the row-size cap (item 7) faster~~
-~~- `MAX_INSERT_ROWS` (hardcoded 64): Bump the `rows` array in the `Stmt` union (`include/nexdb.h`)~~
-~~- `MAX_AGGS` / `MAX_GROUP_KEYS` / `MAX_ORDER_KEYS`: Simple constant bump~~
-~~- `MAX_FUNC_ARGS` (currently 8): Bump to 16 or remove the limit entirely~~
-
-~~All bumped in `include/nexdb.h`. `MAX_AGGS` moved from `select.c` to the header. The Stmt struct now uses the `MAX_INSERT_ROWS` constant instead of hardcoded `64`.~~
-
-New limits:
-
-| Limit | Constant | Old | New |
-|---|---|---|---|
-| Tables per database | `MAX_TABLES` | 64 | 128 |
-| Columns per table | `MAX_COLS` | 32 | 32 (unchanged) |
-| Name length | `MAX_NAME` | 63 | 127 |
-| Indexes per table | `MAX_INDEXES` | 16 | 32 |
-| INSERT rows per statement | `MAX_INSERT_ROWS` | 64 | 128 |
-| GROUP BY keys | `MAX_GROUP_KEYS` | 8 | 16 |
-| ORDER BY keys | `MAX_ORDER_KEYS` | 8 | 16 |
-| Joins per query | `MAX_JOINS` | 8 | 16 |
-| Aggregate functions | `MAX_AGGS` | 16 | 32 |
-| SELECT list items | `MAX_SELECT_ITEMS` | 64 | 128 |
-| IN list / CASE arms | `MAX_IN_ITEMS` | 64 | 128 |
-| SET clauses (UPDATE) | `MAX_SET_ITEMS` | 32 | 64 |
-| Function arguments | `MAX_FUNC_ARGS` | 8 | 16 |
-| RECALL search terms | `MAX_RECALL_TERMS` | 64 | 128 |
-| Output columns (result) | `MAX_OUT_COLS` | 40 | 64 |
+Most are single-constant bumps in `include/nexdb.h`. Some have structural
+implications:
+- `MAX_TABLES` / `MAX_COLS` / `MAX_NAME`: bump the constant, recompile.
+- `MAX_ROW_SIZE` is already 64 KB via overflow page chains; increasing it
+  further is straightforward.
+- `MAX_CONN` / `MAX_SESSIONS`: each connection uses ~260 KB for working
+  buffers plus a pthread (8 MB default stack). Bumping beyond a few hundred
+  requires reducing per-connection memory.
 
 ## 9. Other gaps
 
-These are not in the README's "not yet" list but are missing:
-
-~~### No secondary indexes (FIXED — see item 1 above)~~
-~~The B-tree only covers the PK column. UNIQUE constraints on other columns still do full scans.~~
-
-~~### No index usage in SELECT (range scans) (FIXED — see item 1 above)~~
-~~The index is used by `check_unique()` but SELECT queries do not use it yet. `WHERE pk = ?` still does a full scan.~~
-
-~~### No `ALTER TABLE`~~
-~~There is an `ALTER TABLE ... ADD COLUMN` in the parser (`parser.c`) and executor (`exec.c`), but no `DROP COLUMN`, `ALTER COLUMN TYPE`, or `RENAME COLUMN`.~~
-
-~~FIXED: ADD COLUMN, DROP COLUMN, RENAME COLUMN, and ALTER COLUMN TYPE are all implemented.~~
-
-~~### No `DISTINCT` in aggregates~~
-~~`COUNT(DISTINCT x)` is not parsed.~~
-
-~~FIXED: `Expr.agg_distinct` flag, `AggAcc.distinct`/`seen`/`nseen`/`cseen` fields for tracking seen values.~~
-
-~~### No subqueries~~
-~~`SELECT * FROM (SELECT ...)` and `WHERE x IN (SELECT ...)` are not supported. The parser would need to handle subselects as expressions, and the executor would need to execute sub-plans.~~
-
-~~FIXED: Scalar subqueries `(SELECT x FROM t)`, `IN (SELECT ...)`, `NOT IN (SELECT ...)`, `EXISTS (SELECT ...)`, `NOT EXISTS (SELECT ...)`, `ANY`/`ALL`, correlated subqueries, and FROM-clause subqueries (derived tables) are all implemented and evaluated at runtime.~~
-
-~~### No `HAVING` without `GROUP BY`~~
-~~`HAVING` is parsed but there may still be uncovered edge cases (the pre-existing test failures suggest at least one).~~
-
-~~FIXED: HAVING without GROUP BY now works (treats entire result as one group).~~
-
-~~### No `EXPLAIN`~~
-~~No query plan introspection.~~
-
-~~FIXED: EXPLAIN parses any statement and displays a query plan (table scan, joins, WHERE filter, GROUP/ORDER BY, TOP, aggregates).~~
-
-~~### No `VACUUM` / file compaction~~
-~~Even with a free list, the file never shrinks. A `VACUUM` command that rewrites live rows into a new file then swaps is the standard approach.~~
-
-~~FIXED: `exec_vacuum()` rewrites into a temp file, swaps atomically via `rename()`, reopens.
+- **JOIN with GROUP BY on multiple joins** may have uncovered edge cases — the
+  nested-loop executor handles one join at a time.
+- **`ALTER COLUMN TYPE`** can widen a type (e.g. `INT` → `BIGINT`) but cannot
+  narrow it (e.g. `BIGINT` → `INT`) if existing values overflow.
+- **`INSERT ... SELECT`** does not support `TOP`, `ORDER BY`, or aggregates
+  in the subquery (these are evaluated per-row during the insert scan, not
+  materialised first).
+- **No `LIMIT` / `OFFSET`** — T-SQL `TOP` is the only pagination mechanism.
+- **No `UNION` / `INTERSECT` / `EXCEPT`** — set operations are not parsed.
+- **No `FOREIGN KEY`** — referential integrity is not tracked.
+- **No `CHECK` constraints** — arbitrary predicates per column are not stored.
+- **No `VIEW`** — stored queries are not supported.
+- **No `TRIGGER`** — event-driven logic is not supported.
+- **No stored procedures** — procedural SQL is not parsed.
+- **Full-text search** is limited to the RECALL engine; no inverted index or
+  tokenizer with stop-word removal exists.
+- **`VACUUM`** requires free disk space equal to the current database size
+  (it writes a temp file, then atomically replaces the original).

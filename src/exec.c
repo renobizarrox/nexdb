@@ -26,6 +26,17 @@
 #include <math.h>
 #include <time.h>
 
+/* When non-NULL, statement output goes here instead of stdout */
+FILE *g_output_file = NULL;
+
+/* Capture all printf/putchar through g_output_file so the TCP server can
+ * capture query text output without relying on stdout replacement (which
+ * does not work on macOS due to libc internals using a separate __stdoutp). */
+#undef printf
+#define printf(...)   fprintf(g_output_file ? g_output_file : stdout, __VA_ARGS__)
+#undef putchar
+#define putchar(c)    fputc((c), g_output_file ? g_output_file : stdout)
+
 /* memory pseudo-columns, addressable in SELECT lists, WHERE and ORDER BY */
 #define PC_RID      (-2)
 #define PC_STRENGTH (-3)
