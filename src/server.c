@@ -188,9 +188,60 @@ static void sessions_load(void)
     close(fd);
 }
 
+/* ------------------------------------------------------------ background GC */
+
+#define GC_INTERVAL      30   /* seconds between GC cycles */
+#define VACUUM_INTERVAL 300   /* minimum seconds between auto-vacuums */
+#define VACUUM_FREE_PCT  20   /* auto-vacuum when this % of pages are free */
+
+static void *gc_loop(void *arg)
+{
+    (void)arg;
+    int64_t last_vacuum = 0;
+    int counter = 0;
+
+    while (g_running) {
+        sleep(1);
+        if (!g_running) break;
+        counter++;
+        if (counter < GC_INTERVAL) continue;
+        counter = 0;
+
+        /* 1. Reap stale sessions */
+        pthread_mutex_lock(&sess_lock);
+        int64_t now = (int64_t)time(NULL);
+        int reaped = 0;
+        for (int i = 0; i < MAX_SESSIONS; i++) {
+            if (sessions[i].id[0] && now - sessions[i].last_active > g_session_ttl) {
+                sessions[i].id[0] = 0;
+                sessions[i].txn_active = 0;
+                reaped = 1;
+            }
+        }
+        if (reaped) g_session_dirty = 1;
+        pthread_mutex_unlock(&sess_lock);
+
+        /* 2. Auto-vacuum (non-blocking lock so we don't stall SQL) */
+        if (pthread_mutex_trylock(&exec_lock) == 0) {
+            now = (int64_t)time(NULL);
+            if (now - last_vacuum > VACUUM_INTERVAL) {
+                uint32_t free = db_free_count(g_db);
+                uint32_t total = g_db->page_count;
+                if (total > 100 && free * 100 / total >= VACUUM_FREE_PCT) {
+                    char err[MAX_ERR] = "";
+                    db_vacuum(g_db, err);
+                    last_vacuum = (int64_t)time(NULL);
+                }
+            }
+            pthread_mutex_unlock(&exec_lock);
+        }
+    }
+    return NULL;
+}
+
 /* ----------------------------------------------------------- JSON helpers
  * All very ad-hoc and not intended to be robust against malicious input —
- * this is a personal-data daemon, not a public-facing web service. */
+ * this is a personal-data daemon, not a public-facing web server. */
 
 /* Find the value of a quoted string key in a JSON object and unescape it.
  * Returns buf on success, NULL if the key was not found.
@@ -685,6 +736,10 @@ int server_run(DB *db, int port, const char *unix_path,
     /* Restore persisted sessions */
     sessions_load();
 
+    /* Start background GC thread */
+    pthread_t gc_thread;
+    pthread_create(&gc_thread, NULL, gc_loop, NULL);
+
     /* Accept loop */
     while (g_running) {
         fd_set rfds;
@@ -748,6 +803,10 @@ int server_run(DB *db, int port, const char *unix_path,
             pthread_detach(thr);
         }
     }
+
+    /* Stop background GC thread */
+    g_running = 0;
+    pthread_join(gc_thread, NULL);
 
     /* Final session flush */
     sessions_save();

@@ -127,6 +127,21 @@ void pager_free(DB *db, uint32_t pno)
     db->free_list = pno;
 }
 
+/* Count the number of pages currently on the free list. */
+uint32_t db_free_count(DB *db)
+{
+    uint32_t n = 0;
+    uint32_t pno = db->free_list;
+    while (pno) {
+        n++;
+        uint8_t pg[PAGE_SIZE];
+        if (pager_read(db, pno, pg) < 0) break;
+        pno = (uint32_t)pg[0] << 24 | (uint32_t)pg[1] << 16 |
+              (uint32_t)pg[2] << 8 | pg[3];
+    }
+    return n;
+}
+
 /* ----------------------------------------------------------- chain pages */
 
 /* Write blob across a chain starting at *head (allocating pages as needed). */

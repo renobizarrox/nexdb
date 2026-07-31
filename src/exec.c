@@ -2374,6 +2374,12 @@ static int exec_vacuum(DB *db, char *err)
     return 0;
 }
 
+/* Public wrapper for auto-vacuum (used by the server GC thread). */
+int db_vacuum(DB *db, char *err)
+{
+    return exec_vacuum(db, err);
+}
+
 /* ----------------------------------------------------------- dispatcher */
 
 /* Top-level statement dispatcher: CREATE, SELECT, RECALL, CHECKPOINT, etc. */

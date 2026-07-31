@@ -232,6 +232,10 @@ int      heap_update_meta(DB *db, RowRef ref, uint32_t access, int64_t last,
                           float strength);
 int      heap_read_meta(DB *db, RowRef ref, uint32_t *access, int64_t *last,
                         float *strength);
+uint32_t db_free_count(DB *db);
+
+/* exec.c */
+int      db_vacuum(DB *db, char *err);
 
 Table *cat_find(DB *db, const char *name);
 Table *cat_create(DB *db, const char *name, const Column *cols, int ncols);
