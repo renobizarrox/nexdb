@@ -95,16 +95,39 @@ Or use the built-in REPL:
 ./build/nexdb --connect localhost:7890
 ```
 
+**Single-process rule (PostgreSQL-style):** only the server ever opens the
+data file. The CLI detects the file is already open (via the `flock()`
+ownership test in `db_open()`) and automatically routes `-c`, `-f` and the
+interactive prompt through the server's per-database unix socket `<db>.sock`,
+so a shell and a daemon can use the same database at the same time:
+
+```sh
+./build/nexdb serve mydata.ndb --daemon
+./build/nexdb mydata.ndb -c "INSERT INTO notes (id, topic, body) VALUES (2, 'espresso', '18g in, 36g out')"
+./build/nexdb mydata.ndb -f setup.sql
+./build/nexdb mydata.ndb --token s3cret -r -c "RECALL 'coffee'"
+```
+
+`--token` authenticates routed requests; `-r` is forwarded per request so
+observer mode works through the socket too. Shell commands (`.read`,
+`.tables`, ...) are only available in a local interactive session — the
+routed prompt is a plain SQL REPL.
+
 **Features:**
 - Up to 64 concurrent clients with per-connection handler threads
-- Mutex-serialised execution (only one statement runs at a time)
+- Reader-writer locking: read-only statements (`SELECT`, `RECALL`, `SHOW`,
+  `PRINT`, `EXPLAIN`) run in parallel; writes and whole transactions are
+  serialised (memory reinforcement is deferred and applied under a write
+  lock, so parallel reads never write pages)
 - Structured `columns` / `rows` in the JSON response alongside `text`
 - Session-managed transaction state (`BEGIN`/`COMMIT`/`ROLLBACK`)
 - Optional auth token
 - Session TTL (default 300 s, configurable via `--session-ttl`)
-- Graceful shutdown on `SIGINT` / `SIGTERM`
+- Graceful shutdown on `SIGINT` / `SIGTERM` / `SIGQUIT` (dedicated `sigwait`
+  thread + self-pipe, reliable even under load)
 - Daemonisation with `--daemon` and PID file with `--pidfile`
-- Unix domain socket with `--unix`
+- Unix domain socket with `--unix`, plus an automatic per-database socket at
+  `<db>.sock` that the CLI uses to route around the single-process limit
 
 ## The two things that make it a memory
 
@@ -177,8 +200,11 @@ FORGET FROM notes WHERE id = 8;     -- zero the strength, keep the row and its l
 | --- | --- |
 | DDL | `CREATE TABLE`, `DROP TABLE [IF EXISTS]`, `TRUNCATE TABLE`, `ALTER TABLE` (ADD/DROP/RENAME/ALTER COLUMN TYPE) |
 | Types | `TINYINT`/`SMALLINT`/`INT`/`BIGINT`, `FLOAT`/`REAL`/`DECIMAL`/`MONEY`, `NVARCHAR(n)`/`VARCHAR`/`TEXT`, `BIT`, `DATETIME`, `UNIQUEIDENTIFIER` |
-| Constraints | `NOT NULL`/`NULL`, `PRIMARY KEY`, `UNIQUE`, `DEFAULT` (literal, `GETDATE()`, `NEWID()`), `IDENTITY(seed,step)` — all enforced |
-| Queries | `SELECT [ALL\|DISTINCT] [TOP n]` with expressions, column aliases, `FROM` (table, subquery, joins), `WHERE`, `GROUP BY` + `HAVING`, `ORDER BY` |
+| Constraints | `NOT NULL`/`NULL`, `PRIMARY KEY`, `UNIQUE`, `DEFAULT` (literal, `GETDATE()`, `NEWID()`), `IDENTITY(seed,step)`, `CHECK (expr)`, `FOREIGN KEY` / `REFERENCES ... ON DELETE CASCADE` — all enforced |
+| Queries | `SELECT [ALL\|DISTINCT] [TOP n]` with expressions, column aliases, `FROM` (table, subquery, joins), `WHERE`, `GROUP BY` + `HAVING`, `ORDER BY`, `LIMIT n [OFFSET m]` |
+| Set ops | `UNION`, `UNION ALL`, `INTERSECT`, `EXCEPT`, with trailing `ORDER BY` / `LIMIT` / `OFFSET` on the combined result |
+| Views | `CREATE VIEW name AS SELECT ...`, `DROP VIEW [IF EXISTS]` — stored, expanded at query time, persistent |
+| Stored procedures | `CREATE PROCEDURE name AS <statement>`, `CALL name`, `DROP PROCEDURE [IF EXISTS]` — stored, persistent, may nest |
 | Joins | `INNER JOIN`, `LEFT JOIN`, `table.*` expansion, qualified `table.col` references |
 | Predicates | `= <> != < <= > >=`, `AND`/`OR`/`NOT`, `LIKE` with `%`/`_` and `ESCAPE`, `IN (...)`, `IS [NOT] NULL`, `BETWEEN`/`NOT BETWEEN` |
 | Expressions | Arithmetic `+ - * / %`, `CASE` (simple and searched), `CAST`, scalar functions, subqueries (scalar, `IN`, `EXISTS`, `ANY`/`ALL`, correlated) |
@@ -239,8 +265,8 @@ src/exec.c        executor, reinforcement, result formatting (2612 lines)
 src/select.c      GROUP BY, aggregation, capture for server (1415 lines)
 src/func.c        scalar functions, UUID support (474 lines)
 src/wal.c         write-ahead log for crash safety (234 lines)
-src/server.c      JSON-over-TCP server, sessions, auth (691 lines)
-src/main.c        shell, script runner, CLI (402 lines)
+src/server.c      JSON-over-TCP server, sessions, auth, proxy client (1250 lines)
+src/main.c        shell, script runner, CLI, auto-routing (470 lines)
 src/value.c       value API, type conversion (322 lines)
 tests/            228 integration tests, run with `make test`
 ```
@@ -272,14 +298,15 @@ See `limitations.md` for the full list. The short version:
 - **TLS is now built-in** (since July 2026). Pass `--tls-cert cert.pem --tls-key key.pem`
   to `serve` to enable OpenSSL encryption on TCP connections. The default is still
   cleartext for local development. Build with `NEXDB_TLS=1 make` to link OpenSSL.
-- **Serialised execution.** Many clients can connect, but only one SQL statement
-  runs at a time — the database handle is locked by a single mutex.
+- **Writes are serialised.** Read-only statements run in parallel under the
+  reader-writer lock, but writes and whole transactions take the write side
+  (SQLite-style), so write throughput is single-threaded per database.
 - **No nested transactions.** `UNDO_MAX` is a single level.
 - **Session persistence.** Sessions are saved to `<database>.sessions` on every
   state change and restored on restart. In-flight transactions are not carried
   across restarts (the WAL protects committed data).
-- **Single process.** `flock()` prevents two `nexdb` instances from opening
-  the same file.
+- **Single process.** `flock()` means only one process can open the file — the
+  CLI routes around it by proxying through the running server's `<db>.sock`.
 - **Rows must fit in 64 KB** (`MAX_ROW_SIZE`), enforced by overflow page chains.
 - **Limits:** 128 tables, 32 columns per table, 127-char names, 16 JOINs per
   query, 16 ORDER BY keys, 16 GROUP BY keys, 32 aggregate functions.

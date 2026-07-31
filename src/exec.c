@@ -27,7 +27,7 @@
 #include <time.h>
 
 /* When non-NULL, statement output goes here instead of stdout */
-FILE *g_output_file = NULL;
+__thread FILE *g_output_file = NULL;
 
 /* Capture all printf/putchar through g_output_file so the TCP server can
  * capture query text output without relying on stdout replacement (which
@@ -60,8 +60,12 @@ static int pseudo_col(const char *name)
 /* Aggregate results for the group currently being projected. EX_AGG reads its
  * value from here rather than from the row, because an aggregate is a property
  * of a whole group. NULL outside a grouped projection. */
-static const Value *g_agg_values = NULL;
-static int          g_agg_count  = 0;
+static __thread const Value *g_agg_values = NULL;
+static __thread int          g_agg_count  = 0;
+
+/* Stored-procedure CALL nesting depth (bodies may CALL other procedures). */
+#define MAX_PROC_DEPTH 32
+static __thread int g_proc_depth = 0;
 
 int pseudo_col_index(const char *name) { return pseudo_col(name); }
 
@@ -130,28 +134,28 @@ static double row_strength_value(const Row *row, int64_t now)
 }
 
 /* Extra per-row score slot used by RECALL; keyed positionally by the caller. */
-static double g_score_hint = 0.0;
+static __thread double g_score_hint = 0.0;
 
 /* Used by eval_expr to run subqueries. Set before statement execution. */
 DB *g_db = NULL;
 
 /* Reinforcement is turned off during subquery/insert-select execution. */
-static int g_reinforce = 1;
+static __thread int g_reinforce = 1;
 
 /* Join context: when set, eval_expr resolves qualified column references
  * (e.g. "t.col") against these tables/rows instead of the single Table/Row
  * passed directly. */
-static const Table **g_join_tables = NULL;
-static const Row   **g_join_rows   = NULL;
-static const char  **g_join_aliases = NULL;
-static int          g_join_ntables = 0;
+static __thread const Table **g_join_tables = NULL;
+static __thread const Row   **g_join_rows   = NULL;
+static __thread const char  **g_join_aliases = NULL;
+static __thread int          g_join_ntables = 0;
 
 /* Correlation context: outer table/row/name for correlated subqueries.
  * Set before executing a subquery so the inner query can resolve qualified
  * references to the outer table (e.g. SELECT 1 FROM u WHERE u.x = t.n). */
-static const Table *g_corr_table = NULL;
-static const Row   *g_corr_row   = NULL;
-static char         g_corr_name[MAX_NAME];
+static __thread const Table *g_corr_table = NULL;
+static __thread const Row   *g_corr_row   = NULL;
+static __thread char         g_corr_name[MAX_NAME];
 
 void exec_set_join_ctx(const Table **tables, const Row **rows, const char **aliases, int n)
 {
@@ -572,19 +576,37 @@ int eval_expr(const Expr *e, const Row *row, const Table *t, int64_t now,
     }
 
     case EX_BIN: {
-        /* short-circuit the logical operators */
+        /* the logical operators follow SQL three-valued logic: FALSE
+         * dominates AND, TRUE dominates OR, and NULL propagates.  (WHERE
+         * filters are unaffected — the final truthiness test collapses NULL
+         * to false, which is exactly SQL's row-filtering behaviour.) */
         if (e->op == OP_AND || e->op == OP_OR) {
             Value a;
             if (eval_expr(e->l, row, t, now, &a, err) < 0) return -1;
-            int at = val_truthy(&a);
-            val_clear(&a);
-            if (e->op == OP_AND && !at) { *out = val_bit(0); return 0; }
-            if (e->op == OP_OR  &&  at) { *out = val_bit(1); return 0; }
+            if (e->op == OP_AND && a.tag != T_NULL && !val_truthy(&a)) {
+                *out = val_bit(0); return 0;
+            }
+            if (e->op == OP_OR && a.tag != T_NULL && val_truthy(&a)) {
+                *out = val_bit(1); return 0;
+            }
             Value b;
             if (eval_expr(e->r, row, t, now, &b, err) < 0) return -1;
-            int bt = val_truthy(&b);
-            val_clear(&b);
-            *out = val_bit(bt);
+            if (e->op == OP_AND) {
+                if (b.tag != T_NULL && !val_truthy(&b)) {
+                    val_clear(&a);
+                    *out = val_bit(0);
+                    return 0;
+                }
+                *out = (a.tag == T_NULL) ? val_null() : val_bit(1);
+            } else {
+                if (b.tag != T_NULL && val_truthy(&b)) {
+                    val_clear(&a);
+                    *out = val_bit(1);
+                    return 0;
+                }
+                *out = (a.tag == T_NULL) ? val_null() : val_bit(0);
+            }
+            val_clear(&a);
             return 0;
         }
 
@@ -749,11 +771,11 @@ static void rs_free(RowSet *rs)
     memset(rs, 0, sizeof *rs);
 }
 
-/* qsort context (single-threaded, so a file-static is fine) */
-static const Table *g_sort_table;
-static int          g_sort_col;      /* >=0 real column, else PC_* */
-static int          g_sort_desc;
-static int64_t      g_sort_now;
+/* qsort context (thread-local: parallel server reads sort concurrently) */
+static __thread const Table *g_sort_table;
+static __thread int          g_sort_col;      /* >=0 real column, else PC_* */
+static __thread int          g_sort_desc;
+static __thread int64_t      g_sort_now;
 
 static int cmp_rows(const void *x, const void *y)
 {
@@ -1159,6 +1181,22 @@ static int exec_recall(DB *db, Stmt *s, char *err)
 
 /* --------------------------------------------- type and key enforcement */
 
+/* Render a column's declared type, e.g. "BIGINT", "NVARCHAR(20)", "DATETIME". */
+static const char *type_decl(const Column *c)
+{
+    static char buf[64];
+    if (c->type == T_INT) {
+        snprintf(buf, sizeof buf, "%s", int_sub_name(c->sub));
+    } else if (c->type == T_TEXT) {
+        if (c->is_datetime) snprintf(buf, sizeof buf, "DATETIME");
+        else if (c->maxlen) snprintf(buf, sizeof buf, "NVARCHAR(%u)", c->maxlen);
+        else snprintf(buf, sizeof buf, "NVARCHAR(MAX)");
+    } else {
+        snprintf(buf, sizeof buf, "%s", type_name(c->type));
+    }
+    return buf;
+}
+
 /* Fit a value into a column, or explain why it does not go.
  *
  * Every branch here used to be a silent coercion: a 21-character string into
@@ -1402,6 +1440,416 @@ static int check_unique(DB *db, Table *t, const Row *cand, uint64_t exclude_rid,
     return 0;
 }
 
+/* Evaluate the table's CHECK constraint against a candidate row.  Returns 0
+ * when the row is fine, -1 with `err` set when it violates the constraint.
+ * A NULL result counts as satisfied (SQL three-valued logic). */
+static int check_constraint(DB *db, Table *t, Row *row, char *err)
+{
+    if (!t->check[0]) return 0;
+    (void)db;
+    Expr *e = parse_expr_text(t->check, err);
+    if (!e) return -1;
+    Value v;
+    int rc = eval_expr(e, row, t, mem_now(), &v, err);
+    expr_free(e);
+    if (rc < 0) return -1;
+    int ok = (v.tag == T_NULL) || val_truthy(&v);
+    val_clear(&v);
+    if (!ok) {
+        char where[MAX_ERR];
+        where[0] = 0;
+        if (t->ncols > 0) {
+            Value first = val_copy(&row->v[0]);
+            char shown[64];
+            val_format(&first, shown, sizeof shown);
+            val_clear(&first);
+            snprintf(where, sizeof where, " (first column '%s' = %s)",
+                     t->cols[0].name, shown);
+        }
+        snprintf(err, MAX_ERR, "CHECK constraint failed on '%s'%s: %s",
+                 t->name, where, t->check);
+        return -1;
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------- foreign keys */
+
+/* Does the child's FK column match the parent's referenced column? */
+static int fk_cols_match(const Row *prow, int pcol, const Row *crow, int ccol)
+{
+    if (pcol < 0 || ccol < 0 || pcol >= prow->ncols || ccol >= crow->ncols)
+        return 0;
+    const Value *a = &prow->v[pcol];
+    const Value *b = &crow->v[ccol];
+    if (a->tag == T_NULL || b->tag == T_NULL) return 0;
+    int ok;
+    return val_compare(a, b, &ok) == 0 && ok == 1;
+}
+
+/* Is there a row in `parent` whose column `pcol` holds value `v`?
+ * Returns 1 yes, 0 no, -1 error. */
+static int fk_ref_exists(DB *db, Table *parent, int pcol, const Value *v,
+                         char *err)
+{
+    if (v->tag == T_NULL) return 1;   /* NULL is never checked */
+    int idx = table_find_index(parent, pcol);
+    if (idx >= 0) {
+        RowRef ref;
+        /* btree_find: 0 = key present, -1 = absent */
+        int found = btree_find(db, parent->indexes[idx].root, v, &ref, err);
+        return found == 0 ? 1 : 0;
+    }
+    /* no index on the referenced column: full scan */
+    Scan sc;
+    Row r;
+    scan_init(&sc, db, parent);
+    while (scan_next(&sc, &r)) {
+        if (pcol < r.ncols && r.v[pcol].tag != T_NULL) {
+            int ok;
+            int eq = val_compare(v, &r.v[pcol], &ok);
+            if (eq == 0 && ok == 1) {
+                row_clear(&r);
+                return 1;
+            }
+        }
+        row_clear(&r);
+    }
+    return 0;
+}
+
+/* Child-side enforcement: every FK value of candidate row `r` (column-level
+ * and table-level) must exist in the referenced table.  NULL values are not
+ * checked, matching SQL semantics. */
+static int check_fk_child(DB *db, Table *t, const Row *r, char *err)
+{
+    for (int c = 0; c < t->ncols; c++) {
+        if (!t->cols[c].refs_table[0]) continue;
+        if (c >= r->ncols || r->v[c].tag == T_NULL) continue;
+        Table *p = cat_find(db, t->cols[c].refs_table);
+        if (!p) {
+            snprintf(err, MAX_ERR, "foreign key target table '%s' is gone",
+                     t->cols[c].refs_table);
+            return -1;
+        }
+        int pcol = table_col_index(p, t->cols[c].refs_col);
+        int found = fk_ref_exists(db, p, pcol, &r->v[c], err);
+        if (found < 0) return -1;
+        if (!found) {
+            char shown[128];
+            val_format(&r->v[c], shown, sizeof shown);
+            snprintf(err, MAX_ERR,
+                     "foreign key violation: %s.%s = '%s' has no match in "
+                     "%s.%s", t->name, t->cols[c].name, shown, p->name,
+                     p->cols[pcol].name);
+            return -1;
+        }
+    }
+    for (int k = 0; k < t->nfks; k++) {
+        const FK *fk = &t->fks[k];
+        Table *p = cat_find(db, fk->table);
+        if (!p) {
+            snprintf(err, MAX_ERR, "foreign key target table '%s' is gone",
+                     fk->table);
+            return -1;
+        }
+        for (int i = 0; i < fk->ncols; i++) {
+            int lc = table_col_index(t, fk->cols[i]);
+            int pc = table_col_index(p, fk->refs[i]);
+            if (lc < 0 || pc < 0) continue;
+            if (lc >= r->ncols || r->v[lc].tag == T_NULL) continue;
+            int found = fk_ref_exists(db, p, pc, &r->v[lc], err);
+            if (found < 0) return -1;
+            if (!found) {
+                char shown[128];
+                val_format(&r->v[lc], shown, sizeof shown);
+                snprintf(err, MAX_ERR,
+                         "foreign key violation: %s.%s = '%s' has no match in "
+                         "%s.%s", t->name, fk->cols[i], shown, p->name,
+                         fk->refs[i]);
+                return -1;
+            }
+        }
+    }
+    return 0;
+}
+
+/* Validate a foreign key definition against the catalog at CREATE TABLE time:
+ * the referenced table and columns must exist, the referenced columns must be
+ * PRIMARY KEY or UNIQUE (they need an index), and the column counts must
+ * agree.  The "_pk" placeholder is resolved to the parent's primary key. */
+static int fk_validate(DB *db, Table *t, char *err)
+{
+    for (int c = 0; c < t->ncols; c++) {
+        Column *cl = &t->cols[c];
+        if (!cl->refs_table[0]) continue;
+        Table *p = cat_find(db, cl->refs_table);
+        if (!p) {
+            snprintf(err, MAX_ERR, "foreign key on %s.%s references unknown "
+                     "table '%s'", t->name, cl->name, cl->refs_table);
+            return -1;
+        }
+        if (strcasecmp(cl->refs_col, "_pk") == 0) {
+            int pcol = -1;
+            for (int i = 0; i < p->ncols; i++)
+                if (p->cols[i].is_pk) { pcol = i; break; }
+            if (pcol < 0) {
+                snprintf(err, MAX_ERR, "foreign key on %s.%s references "
+                         "'%s' which has no PRIMARY KEY", t->name, cl->name,
+                         p->name);
+                return -1;
+            }
+            snprintf(cl->refs_col, MAX_NAME, "%s", p->cols[pcol].name);
+        }
+        int pcol = table_col_index(p, cl->refs_col);
+        if (pcol < 0) {
+            snprintf(err, MAX_ERR, "foreign key on %s.%s references unknown "
+                     "column '%s.%s'", t->name, cl->name, p->name,
+                     cl->refs_col);
+            return -1;
+        }
+        if (table_find_index(p, pcol) < 0 && !p->cols[pcol].unique &&
+            !p->cols[pcol].is_pk) {
+            snprintf(err, MAX_ERR, "foreign key on %s.%s references '%s.%s' "
+                     "which is not UNIQUE or a PRIMARY KEY", t->name, cl->name,
+                     p->name, p->cols[pcol].name);
+            return -1;
+        }
+    }
+    for (int k = 0; k < t->nfks; k++) {
+        FK *fk = &t->fks[k];
+        Table *p = cat_find(db, fk->table);
+        if (!p) {
+            snprintf(err, MAX_ERR, "foreign key on %s references unknown "
+                     "table '%s'", t->name, fk->table);
+            return -1;
+        }
+        for (int i = 0; i < fk->ncols; i++) {
+            int lc = table_col_index(t, fk->cols[i]);
+            if (lc < 0) {
+                snprintf(err, MAX_ERR, "foreign key on %s references unknown "
+                         "column '%s'", t->name, fk->cols[i]);
+                return -1;
+            }
+            if (strcasecmp(fk->refs[i], "_pk") == 0) {
+                int pcol = -1;
+                for (int j = 0; j < p->ncols; j++)
+                    if (p->cols[j].is_pk) { pcol = j; break; }
+                if (pcol < 0) {
+                    snprintf(err, MAX_ERR, "foreign key on %s references "
+                             "'%s' which has no PRIMARY KEY", t->name, p->name);
+                    return -1;
+                }
+                snprintf(fk->refs[i], MAX_NAME, "%s", p->cols[pcol].name);
+            }
+            int pcol = table_col_index(p, fk->refs[i]);
+            if (pcol < 0) {
+                snprintf(err, MAX_ERR, "foreign key on %s references unknown "
+                         "column '%s.%s'", t->name, p->name, fk->refs[i]);
+                return -1;
+            }
+            if (table_find_index(p, pcol) < 0 && !p->cols[pcol].unique &&
+                !p->cols[pcol].is_pk) {
+                snprintf(err, MAX_ERR, "foreign key on %s references '%s.%s' "
+                         "which is not UNIQUE or a PRIMARY KEY", t->name,
+                         p->name, p->cols[pcol].name);
+                return -1;
+            }
+        }
+    }
+    return 0;
+}
+
+/* Is table `t` referenced as a foreign key target by any other table? */
+static int fk_is_referenced(const DB *db, const Table *t)
+{
+    for (int ti = 0; ti < db->cat.ntables; ti++) {
+        const Table *other = &db->cat.tables[ti];
+        if (other == t) continue;
+        for (int c = 0; c < other->ncols; c++)
+            if (other->cols[c].refs_table[0] &&
+                strcasecmp(other->cols[c].refs_table, t->name) == 0)
+                return 1;
+        for (int k = 0; k < other->nfks; k++)
+            if (strcasecmp(other->fks[k].table, t->name) == 0)
+                return 1;
+    }
+    return 0;
+}
+
+/* Remove one row and its index entries; returns 1 deleted, 0 already gone. */
+static int row_delete(DB *db, Table *t, Row *row, char *err)
+{
+    if (heap_delete(db, t, row->ref) != 0) return 0;
+    mem_forget_row(db, row->rid);
+    for (int ki = 0; ki < t->nindexes; ki++) {
+        if (!t->indexes[ki].valid) continue;
+        int col = t->indexes[ki].col;
+        if (col < 0 || col >= row->ncols || row->v[col].tag == T_NULL) continue;
+        btree_delete(db, &t->indexes[ki].root, &row->v[col], err);
+    }
+    return 1;
+}
+
+/* Parent-side enforcement for DELETE: NO ACTION refuses to remove a row that
+ * children reference; CASCADE removes the referencing rows first (and their
+ * children in turn).  With check_only, NO ACTION refusals are reported but no
+ * cascade deletions happen, so a multi-row DELETE can verify every row before
+ * mutating anything. */
+static int fk_parent_delete(DB *db, Table *t, const Row *del, char *err,
+                            int check_only)
+{
+    for (int ti = 0; ti < db->cat.ntables; ti++) {
+        Table *child = &db->cat.tables[ti];
+        for (int c = 0; c < child->ncols; c++) {
+            if (!child->cols[c].refs_table[0]) continue;
+            if (strcasecmp(child->cols[c].refs_table, t->name) != 0) continue;
+            int pcol = table_col_index(t, child->cols[c].refs_col);
+            if (pcol < 0) continue;
+            int cascade = (child->cols[c].on_delete == FK_CASCADE);
+            Scan sc;
+            Row r;
+            scan_init(&sc, db, child);
+            while (scan_next(&sc, &r)) {
+                if (!fk_cols_match(del, pcol, &r, c)) { row_clear(&r); continue; }
+                if (cascade && !check_only) {
+                    row_delete(db, child, &r, err);
+                } else if (!cascade) {
+                    char shown[128];
+                    val_format(&del->v[pcol], shown, sizeof shown);
+                    snprintf(err, MAX_ERR,
+                             "cannot delete %s.%s = '%s': row %llu of '%s' "
+                             "still references it",
+                             t->name, t->cols[pcol].name, shown,
+                             (unsigned long long)r.rid, child->name);
+                    row_clear(&r);
+                    return -1;
+                }
+                row_clear(&r);
+            }
+        }
+        for (int k = 0; k < child->nfks; k++) {
+            const FK *fk = &child->fks[k];
+            if (strcasecmp(fk->table, t->name) != 0) continue;
+            Scan sc;
+            Row r;
+            scan_init(&sc, db, child);
+            while (scan_next(&sc, &r)) {
+                int all = 1;
+                for (int i = 0; i < fk->ncols && all; i++) {
+                    int pcol = table_col_index(t, fk->refs[i]);
+                    int ccol = table_col_index(child, fk->cols[i]);
+                    if (pcol < 0 || ccol < 0 ||
+                        !fk_cols_match(del, pcol, &r, ccol))
+                        all = 0;
+                }
+                if (!all) { row_clear(&r); continue; }
+                if (fk->on_delete == FK_CASCADE && !check_only) {
+                    row_delete(db, child, &r, err);
+                } else if (fk->on_delete != FK_CASCADE) {
+                    int pcol = table_col_index(t, fk->refs[0]);
+                    char shown[128];
+                    val_format(&del->v[pcol >= 0 ? pcol : 0], shown,
+                               sizeof shown);
+                    snprintf(err, MAX_ERR,
+                             "cannot delete %s.%s = '%s': row %llu of '%s' "
+                             "still references it",
+                             t->name,
+                             pcol >= 0 ? t->cols[pcol].name : "?",
+                             shown,
+                             (unsigned long long)r.rid, child->name);
+                    row_clear(&r);
+                    return -1;
+                }
+                row_clear(&r);
+            }
+        }
+    }
+    return 0;
+}
+
+/* Parent-side enforcement for UPDATE: when a referenced key changes, children
+ * pointing at the old value would be orphaned, so the change is refused.
+ * (NO ACTION is the only ON UPDATE policy.) */
+static int fk_parent_update(DB *db, Table *t, const Value *oldcols,
+                            const Row *newrow, char *err)
+{
+    Row oldrow;
+    memset(&oldrow, 0, sizeof oldrow);
+    oldrow.ncols = t->ncols;
+    for (int c = 0; c < t->ncols; c++) oldrow.v[c] = oldcols[c];
+
+    for (int ti = 0; ti < db->cat.ntables; ti++) {
+        Table *child = &db->cat.tables[ti];
+        for (int c = 0; c < child->ncols; c++) {
+            if (!child->cols[c].refs_table[0]) continue;
+            if (strcasecmp(child->cols[c].refs_table, t->name) != 0) continue;
+            int pcol = table_col_index(t, child->cols[c].refs_col);
+            if (pcol < 0 || pcol >= t->ncols) continue;
+            if (fk_cols_match(&oldrow, pcol, newrow, pcol)) continue;
+            Scan sc;
+            Row r;
+            scan_init(&sc, db, child);
+            while (scan_next(&sc, &r)) {
+                if (fk_cols_match(&oldrow, pcol, &r, c)) {
+                    char shown[128];
+                    val_format(&oldcols[pcol], shown, sizeof shown);
+                    snprintf(err, MAX_ERR,
+                             "cannot change %s.%s from '%s': row %llu of "
+                             "'%s' still references it",
+                             t->name, t->cols[pcol].name, shown,
+                             (unsigned long long)r.rid, child->name);
+                    row_clear(&r);
+                    return -1;
+                }
+                row_clear(&r);
+            }
+        }
+        for (int k = 0; k < child->nfks; k++) {
+            const FK *fk = &child->fks[k];
+            if (strcasecmp(fk->table, t->name) != 0) continue;
+            int changed = 0;
+            for (int i = 0; i < fk->ncols && !changed; i++) {
+                int pcol = table_col_index(t, fk->refs[i]);
+                if (pcol >= 0 && pcol < t->ncols &&
+                    !fk_cols_match(&oldrow, pcol, newrow, pcol))
+                    changed = 1;
+            }
+            if (!changed) continue;
+            Scan sc;
+            Row r;
+            scan_init(&sc, db, child);
+            while (scan_next(&sc, &r)) {
+                int all = 1;
+                for (int i = 0; i < fk->ncols && all; i++) {
+                    int pcol = table_col_index(t, fk->refs[i]);
+                    int ccol = table_col_index(child, fk->cols[i]);
+                    if (pcol < 0 || ccol < 0 ||
+                        !fk_cols_match(&oldrow, pcol, &r, ccol))
+                        all = 0;
+                }
+                if (all) {
+                    int pcol0 = table_col_index(t, fk->refs[0]);
+                    char shown[128];
+                    val_format(&oldcols[pcol0 >= 0 ? pcol0 : 0], shown,
+                               sizeof shown);
+                    snprintf(err, MAX_ERR,
+                             "cannot change %s.%s from '%s': row %llu of "
+                             "'%s' still references it",
+                             t->name,
+                             pcol0 >= 0 ? t->cols[pcol0].name : "?",
+                             shown,
+                             (unsigned long long)r.rid, child->name);
+                    row_clear(&r);
+                    return -1;
+                }
+                row_clear(&r);
+            }
+        }
+    }
+    return 0;
+}
+
 /* Fill a column the statement did not mention: IDENTITY counter, DEFAULT
  * value, or NULL. Returns 1 if a value was produced. */
 static int apply_default(DB *db, Table *t, Column *c, Value *out, char *err)
@@ -1537,6 +1985,16 @@ static int exec_insert(DB *db, Stmt *s, char *err)
             return -1;
         }
 
+        if (check_constraint(db, t, &r, err) < 0) {
+            row_clear(&r);
+            return -1;
+        }
+
+        if (check_fk_child(db, t, &r, err) < 0) {
+            row_clear(&r);
+            return -1;
+        }
+
         r.strength = (float)MEM_INIT_STRENGTH;
         r.last_access = mem_now();
         r.access_count = 0;
@@ -1644,6 +2102,12 @@ static int exec_insert_select(DB *db, Stmt *s, char *err)
         if (check_unique(db, t, &r, 0, err) < 0) {
             row_clear(&r); capture_free(&cap); return -1;
         }
+        if (check_constraint(db, t, &r, err) < 0) {
+            row_clear(&r); capture_free(&cap); return -1;
+        }
+        if (check_fk_child(db, t, &r, err) < 0) {
+            row_clear(&r); capture_free(&cap); return -1;
+        }
 
         r.strength = (float)MEM_INIT_STRENGTH;
         r.last_access = mem_now();
@@ -1741,7 +2205,7 @@ static int exec_alter(DB *db, Stmt *s, char *err)
         return db_flush_catalog(db);
     }
 
-    /* ALTER COLUMN TYPE — metadata only, no data rewrite */
+    /* ALTER COLUMN TYPE */
     if (s->kind == ST_ALTER_TYPE) {
         int idx = table_col_index(t, s->cols[0].name);
         if (idx < 0) {
@@ -1750,16 +2214,83 @@ static int exec_alter(DB *db, Stmt *s, char *err)
             return -1;
         }
         Column *c = &t->cols[idx];
-        uint8_t old_type = c->type;
-        uint8_t old_sub  = c->sub;
-        uint32_t old_max = c->maxlen;
-        c->type   = s->cols[0].type;
-        c->sub    = s->cols[0].sub;
-        c->maxlen = s->cols[0].maxlen;
-        /* preserve is_datetime if target is TEXT */
-        if (c->type != T_TEXT) c->is_datetime = 0;
-        /* if an index exists on this column the type change may invalidate it */
-        (void)old_type; (void)old_sub; (void)old_max;
+
+        /* The target definition, with the same normalization the catalog
+         * change below applies (DATETIME only survives on TEXT columns). */
+        Column newc = s->cols[0];
+        if (newc.type != T_TEXT) newc.is_datetime = 0;
+
+        /* Validate every stored value against the new type before touching
+         * anything.  Narrowing conversions (BIGINT→INT, NVARCHAR(MAX)→
+         * NVARCHAR(20), TEXT→DATETIME, FLOAT→INT, ...) must fail loudly
+         * instead of silently corrupting the rows. */
+        Scan sc;
+        Row r;
+        scan_init(&sc, db, t);
+        while (scan_next(&sc, &r)) {
+            if (idx < r.ncols && r.v[idx].tag != T_NULL) {
+                Value v = val_copy(&r.v[idx]);
+                char verr[MAX_ERR];
+                if (coerce_to_column(&newc, &v, verr) < 0) {
+                    char orig[64];
+                    val_format(&r.v[idx], orig, sizeof orig);
+                    snprintf(err, MAX_ERR,
+                             "cannot change '%s' to %s: row %lld has value %s "
+                             "(%s)", c->name, type_decl(&newc),
+                             (long long)r.rid, orig, verr);
+                    val_clear(&v);
+                    row_clear(&r);
+                    return -1;
+                }
+                val_clear(&v);
+            }
+            row_clear(&r);
+        }
+
+        /* The type is changing: an index keyed on this column holds values
+         * encoded with the old type, so it must be rebuilt. */
+        int rebuild_index = -1;
+        for (int ki = 0; ki < t->nindexes; ki++) {
+            if (t->indexes[ki].valid && t->indexes[ki].col == idx)
+                rebuild_index = ki;
+        }
+        if (rebuild_index >= 0) {
+            if (t->indexes[rebuild_index].root)
+                btree_destroy(db, t->indexes[rebuild_index].root);
+            t->indexes[rebuild_index].root = 0;
+            t->indexes[rebuild_index].valid = 0;
+        }
+
+        c->type   = newc.type;
+        c->sub    = newc.sub;
+        c->maxlen = newc.maxlen;
+        c->is_datetime = newc.is_datetime;
+        if (db_flush_catalog(db) < 0) {
+            snprintf(err, MAX_ERR, "%s", db->err);
+            return -1;
+        }
+
+        /* Re-insert every row's key with its new type */
+        if (rebuild_index >= 0) {
+            scan_init(&sc, db, t);
+            while (scan_next(&sc, &r)) {
+                if (idx < r.ncols && r.v[idx].tag != T_NULL) {
+                    Value v = val_copy(&r.v[idx]);
+                    if (coerce_to_column(c, &v, err) < 0) {
+                        val_clear(&v); row_clear(&r);
+                        return -1;
+                    }
+                    if (btree_insert(db, &t->indexes[rebuild_index].root,
+                                     &v, r.ref, err) < 0) {
+                        val_clear(&v); row_clear(&r);
+                        return -1;
+                    }
+                    val_clear(&v);
+                }
+                row_clear(&r);
+            }
+        }
+
         printf("table '%s': column '%s' type changed\n", t->name, s->cols[0].name);
         return db_flush_catalog(db);
     }
@@ -1961,6 +2492,11 @@ static int exec_update(DB *db, Stmt *s, char *err)
     for (int i = 0; i < rs.n; i++) {
         Row *row = &rs.rows[i];
 
+        /* save the old column values so the parent-side foreign key check can
+         * see what changed */
+        Value old_v[MAX_COLS];
+        for (int c = 0; c < t->ncols; c++) old_v[c] = val_copy(&row->v[c]);
+
         /* save indexed column values before SET modifies them */
         Value old_idx_vals[MAX_INDEXES];
         for (int ki = 0; ki < t->nindexes; ki++) {
@@ -1974,12 +2510,14 @@ static int exec_update(DB *db, Stmt *s, char *err)
             Value v;
             if (eval_expr(s->sets[j].val, row, t, now, &v, err) < 0) {
                 for (int ki = 0; ki < t->nindexes; ki++) val_clear(&old_idx_vals[ki]);
+                for (int c = 0; c < t->ncols; c++) val_clear(&old_v[c]);
                 rs_free(&rs);
                 return -1;
             }
             if (coerce_to_column(&t->cols[idx], &v, err) < 0) {
                 val_clear(&v);
                 for (int ki = 0; ki < t->nindexes; ki++) val_clear(&old_idx_vals[ki]);
+                for (int c = 0; c < t->ncols; c++) val_clear(&old_v[c]);
                 rs_free(&rs);
                 return -1;
             }
@@ -1988,6 +2526,7 @@ static int exec_update(DB *db, Stmt *s, char *err)
                          t->cols[idx].name);
                 val_clear(&v);
                 for (int ki = 0; ki < t->nindexes; ki++) val_clear(&old_idx_vals[ki]);
+                for (int c = 0; c < t->ncols; c++) val_clear(&old_v[c]);
                 rs_free(&rs);
                 return -1;
             }
@@ -1997,6 +2536,25 @@ static int exec_update(DB *db, Stmt *s, char *err)
 
         if (check_unique(db, t, row, row->rid, err) < 0) {
             for (int ki = 0; ki < t->nindexes; ki++) val_clear(&old_idx_vals[ki]);
+            for (int c = 0; c < t->ncols; c++) val_clear(&old_v[c]);
+            rs_free(&rs);
+            return -1;
+        }
+        if (check_constraint(db, t, row, err) < 0) {
+            for (int ki = 0; ki < t->nindexes; ki++) val_clear(&old_idx_vals[ki]);
+            for (int c = 0; c < t->ncols; c++) val_clear(&old_v[c]);
+            rs_free(&rs);
+            return -1;
+        }
+        if (check_fk_child(db, t, row, err) < 0) {
+            for (int ki = 0; ki < t->nindexes; ki++) val_clear(&old_idx_vals[ki]);
+            for (int c = 0; c < t->ncols; c++) val_clear(&old_v[c]);
+            rs_free(&rs);
+            return -1;
+        }
+        if (fk_parent_update(db, t, old_v, row, err) < 0) {
+            for (int ki = 0; ki < t->nindexes; ki++) val_clear(&old_idx_vals[ki]);
+            for (int c = 0; c < t->ncols; c++) val_clear(&old_v[c]);
             rs_free(&rs);
             return -1;
         }
@@ -2006,6 +2564,7 @@ static int exec_update(DB *db, Stmt *s, char *err)
         if (heap_replace(db, t, row->ref, row) < 0) {
             snprintf(err, MAX_ERR, "%s", db->err);
             for (int ki = 0; ki < t->nindexes; ki++) val_clear(&old_idx_vals[ki]);
+            for (int c = 0; c < t->ncols; c++) val_clear(&old_v[c]);
             rs_free(&rs);
             return -1;
         }
@@ -2021,6 +2580,7 @@ static int exec_update(DB *db, Stmt *s, char *err)
                 btree_insert(db, &t->indexes[ki].root, &row->v[col], row->ref, err);
             val_clear(&old_idx_vals[ki]);
         }
+        for (int c = 0; c < t->ncols; c++) val_clear(&old_v[c]);
 
         mem_touch(db, t, row->ref, MEM_BOOST);
         changed++;
@@ -2058,18 +2618,23 @@ static int exec_delete(DB *db, Stmt *s, char *err)
 
     int deleted = 0;
     for (int i = 0; i < rs.n; i++) {
-        Row *row = &rs.rows[i];
-        if (heap_delete(db, t, row->ref) == 0) {
-            mem_forget_row(db, row->rid);
-            /* delete from every index */
-            for (int ki = 0; ki < t->nindexes; ki++) {
-                if (!t->indexes[ki].valid) continue;
-                int col = t->indexes[ki].col;
-                if (col < 0 || col >= row->ncols || row->v[col].tag == T_NULL) continue;
-                btree_delete(db, &t->indexes[ki].root, &row->v[col], err);
-            }
-            deleted++;
+        if (fk_parent_delete(db, t, &rs.rows[i], err, 1) < 0) {
+            rs_free(&rs);
+            return -1;
         }
+    }
+    for (int i = 0; i < rs.n; i++) {
+        Row *row = &rs.rows[i];
+        if (fk_parent_delete(db, t, row, err, 0) < 0) {
+            rs_free(&rs);
+            return -1;
+        }
+        int del = row_delete(db, t, row, err);
+        if (del < 0) {
+            rs_free(&rs);
+            return -1;
+        }
+        deleted += del;
     }
     rs_free(&rs);
 
@@ -2309,63 +2874,90 @@ static int exec_vacuum(DB *db, char *err)
     }
 
     /* open a fresh database at the temp path */
-    DB ndb;
-    memset(&ndb, 0, sizeof ndb);
-    if (db_open(&ndb, tmp) < 0) {
-        snprintf(err, MAX_ERR, "cannot create temp database for VACUUM: %s", ndb.err);
+    DB *ndb = calloc(1, sizeof(DB));
+    if (!ndb) {
+        snprintf(err, MAX_ERR, "out of memory");
         return -1;
     }
-    ndb.next_rid = db->next_rid;
+    if (db_open(ndb, tmp) < 0) {
+        snprintf(err, MAX_ERR, "cannot create temp database for VACUUM: %s", ndb->err);
+        free(ndb);
+        return -1;
+    }
+    ndb->next_rid = db->next_rid;
 
     /* recreate every table and copy indexes */
     for (int i = 0; i < db->cat.ntables; i++) {
         Table *ot = &db->cat.tables[i];
-        if (!cat_create(&ndb, ot->name, ot->cols, ot->ncols)) {
-            snprintf(err, MAX_ERR, "VACUUM: %s", ndb.err);
-            db_close(&ndb); unlink(tmp);
+        if (!cat_create(ndb, ot->name, ot->cols, ot->ncols)) {
+            snprintf(err, MAX_ERR, "VACUUM: %s", ndb->err);
+            db_close(ndb); free(ndb); unlink(tmp);
             return -1;
         }
-        Table *nt = cat_find(&ndb, ot->name);
+        Table *nt = cat_find(ndb, ot->name);
         for (int ki = 0; ki < ot->nindexes; ki++) {
             if (ot->indexes[ki].valid)
-                table_ensure_index(&ndb, nt, ot->indexes[ki].col);
+                table_ensure_index(ndb, nt, ot->indexes[ki].col);
         }
+        snprintf(nt->check, sizeof nt->check, "%s", ot->check);
+        nt->nfks = ot->nfks;
+        for (int k = 0; k < ot->nfks; k++) nt->fks[k] = ot->fks[k];
+        for (int c = 0; c < nt->ncols; c++)
+            nt->cols[c].on_delete = ot->cols[c].on_delete;
         Scan sc;
         Row r;
         scan_init(&sc, db, ot);
         while (scan_next(&sc, &r)) {
             /* heap_insert will use the row's existing rid since it's non-zero */
-            if (heap_insert(&ndb, nt, &r) < 0) {
-                snprintf(err, MAX_ERR, "VACUUM: %s", ndb.err);
-                row_clear(&r); db_close(&ndb); unlink(tmp);
+            if (heap_insert(ndb, nt, &r) < 0) {
+                snprintf(err, MAX_ERR, "VACUUM: %s", ndb->err);
+                row_clear(&r); db_close(ndb); free(ndb); unlink(tmp);
+                return -1;
+            }
+            if (index_insert_row(ndb, nt, &r, err) < 0) {
+                snprintf(err, MAX_ERR, "VACUUM: %s", err);
+                row_clear(&r); db_close(ndb); free(ndb); unlink(tmp);
                 return -1;
             }
             row_clear(&r);
         }
     }
 
+    /* copy stored views */
+    ndb->cat.nviews = db->cat.nviews;
+    for (int i = 0; i < db->cat.nviews; i++)
+        ndb->cat.views[i] = db->cat.views[i];
+
+    /* copy stored procedures */
+    ndb->cat.nprocs = db->cat.nprocs;
+    for (int i = 0; i < db->cat.nprocs; i++)
+        ndb->cat.procs[i] = db->cat.procs[i];
+
     /* copy associative memory links */
     for (uint32_t i = 0; i < db->links.n; i++) {
         Link *lk = &db->links.e[i];
         if (lk->a && lk->b)
-            mem_link_set(&ndb, lk->a, lk->b, lk->w);
+            mem_link_set(ndb, lk->a, lk->b, lk->w);
     }
 
     /* close the new database (flushes its catalog and links) */
-    db_close(&ndb);
+    db_close(ndb);
+    free(ndb);
 
     /* atomically swap files: close old, rename temp over it, reopen */
+    char final_path[512];
+    snprintf(final_path, sizeof final_path, "%s", db->path);
     db_close(db);
 
-    if (rename(tmp, db->path) < 0) {
+    if (rename(tmp, final_path) < 0) {
         snprintf(err, MAX_ERR, "VACUUM: cannot swap files: %s", strerror(errno));
         /* try to reopen the original */
         unlink(tmp);
-        db_open(db, db->path);
+        db_open(db, final_path);
         return -1;
     }
 
-    if (db_open(db, db->path) < 0) {
+    if (db_open(db, final_path) < 0) {
         snprintf(err, MAX_ERR, "VACUUM: cannot reopen database: %s", db->err);
         return -1;
     }
@@ -2396,6 +2988,26 @@ int exec_stmt(DB *db, Stmt *s, char *err)
             return -1;
         }
         Table *ct = cat_find(db, s->table);
+        if (ct && s->check[0]) {
+            snprintf(ct->check, sizeof ct->check, "%s", s->check);
+            db_flush_catalog(db);
+        }
+        int has_fk = 0;
+        for (int ci = 0; ci < s->ncols && ct && !has_fk; ci++)
+            if (s->cols[ci].refs_table[0]) has_fk = 1;
+        if (ct && (s->nfks || has_fk)) {
+            for (int i = 0; i < ct->ncols; i++) {
+                ct->cols[i].on_delete = s->cols[i].on_delete;
+            }
+            ct->nfks = s->nfks;
+            for (int i = 0; i < s->nfks; i++) ct->fks[i] = s->fks[i];
+            if (fk_validate(db, ct, err) < 0) {
+                /* undo the failed create: the table is empty and has no
+                 * indexes yet, so removing the catalog slot is enough */
+                db->cat.ntables--;
+                return -1;
+            }
+        }
         for (int ci = 0; ci < s->ncols && ct; ci++) {
             if (s->cols[ci].unique) {
                 int idx = table_ensure_index(db, ct, ci);
@@ -2411,10 +3023,124 @@ int exec_stmt(DB *db, Stmt *s, char *err)
         return 0;
     }
 
+    case ST_CREATE_VIEW: {
+        if (cat_find(db, s->table) || cat_find_view(db, s->table)) {
+            snprintf(err, MAX_ERR, "table or view '%s' already exists", s->table);
+            return -1;
+        }
+        if (db->cat.nviews >= MAX_VIEWS) {
+            snprintf(err, MAX_ERR, "too many views (max %d)", MAX_VIEWS);
+            return -1;
+        }
+        View *v = &db->cat.views[db->cat.nviews];
+        snprintf(v->name, MAX_NAME, "%s", s->table);
+        snprintf(v->sql, MAX_VIEW_SQL, "%s", s->view_sql);
+        db->cat.nviews++;
+        if (db_flush_catalog(db) < 0) {
+            snprintf(err, MAX_ERR, "%s", db->err);
+            return -1;
+        }
+        printf("view '%s' created\n", s->table);
+        return 0;
+    }
+
+    case ST_DROP_VIEW: {
+        int found = 0;
+        for (int i = 0; i < db->cat.nviews; i++) {
+            if (strcasecmp(db->cat.views[i].name, s->table) != 0) continue;
+            found = 1;
+            for (int j = i; j < db->cat.nviews - 1; j++)
+                db->cat.views[j] = db->cat.views[j + 1];
+            db->cat.nviews--;
+            break;
+        }
+        if (!found && !s->if_exists) {
+            snprintf(err, MAX_ERR, "unknown view '%s'", s->table);
+            return -1;
+        }
+        if (found && db_flush_catalog(db) < 0) {
+            snprintf(err, MAX_ERR, "%s", db->err);
+            return -1;
+        }
+        if (found) printf("view '%s' dropped\n", s->table);
+        return 0;
+    }
+
+    case ST_CREATE_PROC: {
+        if (cat_find(db, s->table) || cat_find_view(db, s->table) ||
+            cat_find_proc(db, s->table)) {
+            snprintf(err, MAX_ERR, "table, view or procedure '%s' already exists",
+                     s->table);
+            return -1;
+        }
+        if (db->cat.nprocs >= MAX_PROCS) {
+            snprintf(err, MAX_ERR, "too many procedures (max %d)", MAX_PROCS);
+            return -1;
+        }
+        Proc *p = &db->cat.procs[db->cat.nprocs];
+        snprintf(p->name, MAX_NAME, "%s", s->table);
+        snprintf(p->sql, MAX_PROC_SQL, "%s", s->proc_sql);
+        db->cat.nprocs++;
+        if (db_flush_catalog(db) < 0) {
+            snprintf(err, MAX_ERR, "%s", db->err);
+            return -1;
+        }
+        printf("procedure '%s' created\n", s->table);
+        return 0;
+    }
+
+    case ST_DROP_PROC: {
+        int found = 0;
+        for (int i = 0; i < db->cat.nprocs; i++) {
+            if (strcasecmp(db->cat.procs[i].name, s->table) != 0) continue;
+            found = 1;
+            for (int j = i; j < db->cat.nprocs - 1; j++)
+                db->cat.procs[j] = db->cat.procs[j + 1];
+            db->cat.nprocs--;
+            break;
+        }
+        if (!found && !s->if_exists) {
+            snprintf(err, MAX_ERR, "unknown procedure '%s'", s->table);
+            return -1;
+        }
+        if (found && db_flush_catalog(db) < 0) {
+            snprintf(err, MAX_ERR, "%s", db->err);
+            return -1;
+        }
+        if (found) printf("procedure '%s' dropped\n", s->table);
+        return 0;
+    }
+
+    case ST_CALL: {
+        Proc *p = cat_find_proc(db, s->table);
+        if (!p) {
+            snprintf(err, MAX_ERR, "unknown procedure '%s'", s->table);
+            return -1;
+        }
+        if (g_proc_depth >= MAX_PROC_DEPTH) {
+            snprintf(err, MAX_ERR, "procedure call depth exceeded (max %d)",
+                     MAX_PROC_DEPTH);
+            return -1;
+        }
+        Stmt inner;
+        if (parse_proc_sql(p->sql, &inner, err) < 0) return -1;
+        g_proc_depth++;
+        int rc = exec_stmt(db, &inner, err);
+        g_proc_depth--;
+        stmt_free(&inner);
+        return rc;
+    }
+
     case ST_DROP: {
         Table *t = cat_find(db, s->table);
         if (!t && s->if_exists) return 0;
         if (!t) { snprintf(err, MAX_ERR, "unknown table '%s'", s->table); return -1; }
+        if (fk_is_referenced(db, t)) {
+            snprintf(err, MAX_ERR,
+                     "cannot drop '%s': another table's FOREIGN KEY "
+                     "references it", s->table);
+            return -1;
+        }
         for (int ki = 0; ki < t->nindexes; ki++) {
             if (t->indexes[ki].root) {
                 btree_destroy(db, t->indexes[ki].root);

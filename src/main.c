@@ -5,6 +5,10 @@
  *   nexdb mydata.ndb -c "SELECT * FROM notes"
  *   nexdb serve mydata.ndb        start daemon (port 7890)
  *   nexdb --connect localhost:7890  remote REPL
+ *
+ * When the database file is already open in another nexdb process, the shell
+ * automatically routes -c/-f and the interactive prompt through that server's
+ * per-database unix socket (<db>.sock).
  */
 #define _GNU_SOURCE
 #include "nexdb.h"
@@ -321,6 +325,33 @@ static int main_server(int argc, char **argv)
     return rc ? 1 : 0;
 }
 
+/* Run a -c/-f/interactive session against a running server that owns the
+ * database file, through its deterministic per-database unix socket. */
+static int route_through_server(const char *path, const char *token,
+                                const char *command, const char *script)
+{
+    char sock[1100];
+    snprintf(sock, sizeof sock, "%s.sock", path);
+
+    int observe = exec_reinforce_enabled();
+
+    if (command)
+        return server_proxy_exec(sock, token, command, observe);
+    if (script) {
+        char *src = read_file(script);
+        if (!src) {
+            fprintf(stderr, "error: cannot read '%s'\n", script);
+            return 1;
+        }
+        int rc = server_proxy_exec(sock, token, src, observe);
+        free(src);
+        return rc;
+    }
+    /* Interactive session through the proxy REPL.  Shell commands (.read,
+     * .tables, ...) are not available over the socket. */
+    return server_connect_repl(sock, token) ? 1 : 0;
+}
+
 int main(int argc, char **argv)
 {
     /* Serve subcommand */
@@ -328,22 +359,32 @@ int main(int argc, char **argv)
         return main_server(argc - 1, argv + 1);
 
     /* Remote connect mode --client host:port (or unix path) */
+    const char *conn_token = NULL;
+    const char *connect_addr = NULL;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--connect") == 0) {
             if (i + 1 < argc)
-                return server_connect_repl(argv[i + 1]);
-            fprintf(stderr, "error: --connect requires an address (host:port or /path)\n");
-            return 2;
+                connect_addr = argv[i + 1];
+            else {
+                fprintf(stderr, "error: --connect requires an address (host:port or /path)\n");
+                return 2;
+            }
+        } else if (strcmp(argv[i], "--token") == 0 && i + 1 < argc) {
+            conn_token = argv[i + 1];
         }
     }
+    if (connect_addr)
+        return server_connect_repl(connect_addr, conn_token);
 
     const char *path = NULL;
     const char *script = NULL;
     const char *command = NULL;
+    const char *token = NULL;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-f") && i + 1 < argc)      script = argv[++i];
         else if (!strcmp(argv[i], "-c") && i + 1 < argc) command = argv[++i];
+        else if (!strcmp(argv[i], "--token") && i + 1 < argc) token = argv[++i];
         else if (!strcmp(argv[i], "-r") || !strcmp(argv[i], "--no-reinforce")) {
             exec_set_reinforce(0);
         }
@@ -354,13 +395,19 @@ int main(int argc, char **argv)
                    "  -r               observer mode: queries do not reinforce\n"
                    "                   what they read, so you can inspect the\n"
                    "                   memory without changing it\n"
+                   "  --token STR      auth token when routed through a\n"
+                   "                   running server\n"
                    "  -h               this text\n"
                    "\n"
                    "remote / server:\n"
                    "  nexdb serve <db> [--port N] [--unix PATH] [--token STR]\n"
                    "                 [--session-ttl SECS] [--daemon] [--pidfile FILE]\n"
                    "                 [--tls-cert FILE --tls-key FILE]\n"
-                   "  nexdb --connect host:port\n"
+                   "  nexdb --connect host:port [--token STR]\n"
+                   "\n"
+                   "If <database-file> is already open in another nexdb process\n"
+                   "the shell automatically routes -c, -f and the interactive\n"
+                   "prompt through that server's unix socket (<db>.sock).\n"
                    "\n"
                    "environment:\n"
                    "  NEXDB_TIME_OFFSET  seconds to add to the clock, for\n"
@@ -384,28 +431,46 @@ int main(int argc, char **argv)
 
     if (!path) path = "nexdb.ndb";
 
-    DB db;
-    if (db_open(&db, path) < 0) {
-        fprintf(stderr, "error: %s\n", db.err);
+    /* DB is over ten megabytes (the catalog holds every table's metadata), so
+     * it lives on the heap; a stack frame that big would overflow. */
+    DB *db = malloc(sizeof(DB));
+    if (!db) {
+        fprintf(stderr, "error: out of memory\n");
+        return 1;
+    }
+    if (db_open(db, path) < 0) {
+        /* The file is held by another process — almost certainly a running
+         * `nexdb serve` on the same database.  Route the request through
+         * that server's per-database unix socket (PostgreSQL-style: only
+         * the daemon ever touches the data file). */
+        if (strstr(db->err, "already open in another nexdb process")) {
+            int rc = route_through_server(path, token, command, script);
+            free(db);
+            return rc;
+        }
+        fprintf(stderr, "error: %s\n", db->err);
+        free(db);
         return 1;
     }
 
     int rc = 0;
     if (command) {
-        rc = exec_script(&db, command, 0);
+        rc = exec_script(db, command, 0);
     } else if (script) {
         char *src = read_file(script);
         if (!src) {
             fprintf(stderr, "error: cannot read '%s'\n", script);
-            db_close(&db);
+            db_close(db);
+            free(db);
             return 1;
         }
-        rc = exec_script(&db, src, 0);
+        rc = exec_script(db, src, 0);
         free(src);
     } else {
-        repl(&db);
+        repl(db);
     }
 
-    db_close(&db);
+    db_close(db);
+    free(db);
     return rc ? 1 : 0;
 }

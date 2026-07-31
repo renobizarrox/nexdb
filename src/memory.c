@@ -58,9 +58,77 @@ double mem_row_strength(const Row *r, int64_t now)
     return mem_strength_at(r->strength, r->last_access, now);
 }
 
+/* ------------------------------------------------- deferred reinforcement
+ * The TCP server runs read-only statements under a shared read lock so they
+ * can execute in parallel.  Reinforcement is normally a write (it persists
+ * strength/access metadata and link edges), so while defer is on mem_touch
+ * and mem_associate only record what happened; mem_flush_pending applies the
+ * recorded touches afterwards, under a write lock.  All state is per-thread,
+ * so concurrent readers never share it. */
+typedef struct {
+    char     table[MAX_NAME];
+    RowRef   ref;
+    uint64_t rid;    /* row identity captured at defer time */
+    float    boost;
+} PendingTouch;
+
+static __thread PendingTouch *g_pend = NULL;
+static __thread int g_pend_n = 0;
+static __thread int g_pend_cap = 0;
+static __thread uint64_t g_pend_rids[MEM_COACT_MAX];
+static __thread int g_pend_rids_n = 0;
+static __thread double g_pend_boost = 0;
+static __thread int g_defer = 0;
+
+void mem_set_defer(int on)
+{
+    g_defer = on;
+}
+
+void mem_flush_pending(DB *db)
+{
+    g_defer = 0;
+    for (int i = 0; i < g_pend_n; i++) {
+        Table *t = cat_find(db, g_pend[i].table);
+        if (!t) continue;
+        /* The row may have been deleted, or its slot reused, while we
+         * waited for the write lock; only reinforce when the same row is
+         * still at that slot. */
+        Row r;
+        if (heap_read_row(db, g_pend[i].ref, &r) == 0 &&
+            (g_pend[i].rid == 0 || r.rid == g_pend[i].rid))
+            mem_touch(db, t, g_pend[i].ref, g_pend[i].boost);
+        row_clear(&r);
+    }
+    if (g_pend_rids_n >= 2)
+        mem_associate(db, g_pend_rids, g_pend_rids_n, g_pend_boost);
+    g_pend_n = 0;
+    g_pend_rids_n = 0;
+    g_pend_boost = 0;
+}
+
 /* Reinforce one row: decay to the present, add the boost, persist. */
 int mem_touch(DB *db, Table *t, RowRef ref, double boost)
 {
+    if (g_defer) {
+        /* Record the touch; it will be applied by mem_flush_pending. */
+        if (g_pend_n >= g_pend_cap) {
+            int nc = g_pend_cap ? g_pend_cap * 2 : 32;
+            PendingTouch *np = realloc(g_pend, (size_t)nc * sizeof *np);
+            if (!np) return -1;
+            g_pend = np;
+            g_pend_cap = nc;
+        }
+        PendingTouch *p = &g_pend[g_pend_n++];
+        snprintf(p->table, sizeof p->table, "%s", t->name);
+        p->ref = ref;
+        p->rid = 0;
+        Row r;
+        if (heap_read_row(db, ref, &r) == 0) p->rid = r.rid;
+        row_clear(&r);
+        p->boost = (float)boost;
+        return 0;
+    }
     (void)t;
     int64_t now = mem_now();
     uint32_t access;
@@ -149,6 +217,14 @@ static void links_prune(LinkStore *ls)
 /* Reinforce pairwise edges between every row in rids (Hebbian co-access). */
 void mem_associate(DB *db, const uint64_t *rids, int n, double boost)
 {
+    if (g_defer) {
+        /* Buffer the co-access set; mem_flush_pending will apply it. */
+        if (n > MEM_COACT_MAX) n = MEM_COACT_MAX;
+        memcpy(g_pend_rids, rids, (size_t)n * sizeof(uint64_t));
+        g_pend_rids_n = n;
+        g_pend_boost = boost;
+        return;
+    }
     if (n < 2) return;
     if (n > MEM_COACT_MAX) n = MEM_COACT_MAX;
     LinkStore *ls = &db->links;

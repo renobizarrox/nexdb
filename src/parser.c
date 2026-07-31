@@ -77,6 +77,11 @@ void stmt_free(Stmt *s)
         free(s->derived);
         s->derived = NULL;
     }
+    if (s->set_rhs) {
+        stmt_free(s->set_rhs);
+        free(s->set_rhs);
+        s->set_rhs = NULL;
+    }
 }
 
 /* ------------------------------------------------------------- utilities */
@@ -148,8 +153,8 @@ static Expr *parse_cast(Lexer *lx, char *err);
 
 /* Flag set by parse_primary when it encounters "table.*" — the select-list
  * loop reads it to turn the item into a qualified star expansion. */
-static int  g_sel_star_qual = 0;
-static char g_sel_star_name[MAX_NAME];
+static __thread int  g_sel_star_qual = 0;
+static __thread char g_sel_star_name[MAX_NAME];
 
 /* Map a name to AggKind, or AGG_NONE if it is not an aggregate function. */
 int agg_kind_of(const char *name)
@@ -671,6 +676,70 @@ static Expr *parse_or(Lexer *lx, char *err)
     return l;
 }
 
+/* Public entry: parse a standalone expression from text.  Used by the
+ * executor to evaluate CHECK constraints stored in the catalog. */
+Expr *parse_expr_text(const char *sql, char *err)
+{
+    Lexer lx;
+    lex_init(&lx, sql);
+    if (lex_next(&lx) < 0) {
+        snprintf(err, MAX_ERR, "%s", lx.err);
+        return NULL;
+    }
+    Expr *e = parse_or(&lx, err);
+    if (!e) return NULL;
+    if (lx.cur.kind != TK_EOF) {
+        snprintf(err, MAX_ERR, "trailing tokens after expression on line %d",
+                 lx.cur.line);
+        expr_free(e);
+        return NULL;
+    }
+    return e;
+}
+
+/* After CHECK (, copy the parenthesised expression into out as text, and
+ * leave the lexer just past the closing ')'.  The expression is stored in
+ * the catalog verbatim and re-parsed at enforcement time. */
+static int parse_check_text(Lexer *lx, char *out, size_t cap, char *err)
+{
+    if (eat_kw(lx, "CHECK", err) < 0) return -1;
+    if (eat_punct(lx, "(", err) < 0) return -1;
+    size_t o = 0;
+    int depth = 1;
+    for (;;) {
+        if (lx->cur.kind == TK_EOF)
+            FAIL("unterminated CHECK constraint (missing ')')");
+        if (tok_is_punct(&lx->cur, "(")) depth++;
+        if (tok_is_punct(&lx->cur, ")")) {
+            depth--;
+            if (depth == 0) {
+                if (adv(lx, err) < 0) return -1;
+                out[o] = 0;
+                return 0;
+            }
+        }
+        const char *t = lx->cur.text;
+        size_t tl = strlen(t);
+        if (o && o + tl + 1 < cap) out[o++] = ' ';
+        /* string literals arrive unquoted, so re-quote them (escaping any
+         * embedded quotes the way the lexer unescaped them) */
+        if (lx->cur.kind == TK_STRING) {
+            if (o + 3 > cap) FAIL("CHECK constraint text is too long");
+            out[o++] = '\'';
+            for (size_t i = 0; i < tl && o + 2 < cap; i++) {
+                if (t[i] == '\'') out[o++] = '\'';
+                out[o++] = t[i];
+            }
+            out[o++] = '\'';
+        } else {
+            if (o + tl + 1 > cap) FAIL("CHECK constraint text is too long");
+            memcpy(out + o, t, tl);
+            o += tl;
+        }
+        if (adv(lx, err) < 0) return -1;
+    }
+}
+
 /* ---------------------------------------------------------- data types */
 
 /* Fills in the type, the integer width, the declared character limit and
@@ -746,6 +815,122 @@ static int parse_type(Lexer *lx, Column *c, char *err)
 
 /* ---------------------------------------------------------- statements */
 
+/* AND a CHECK expression into the statement's table-level predicate. */
+static void append_check(Stmt *s, const char *expr)
+{
+    if (s->check[0]) {
+        size_t o = strlen(s->check);
+        snprintf(s->check + o, sizeof s->check - o, " AND (%s)", expr);
+    } else {
+        snprintf(s->check, sizeof s->check, "(%s)", expr);
+    }
+}
+
+/* CREATE VIEW name AS SELECT ... — the SELECT body is validated here and
+ * stored verbatim in Stmt::view_sql for re-parsing at query time. */
+static int parse_create_view(Lexer *lx, Stmt *s, char *err)
+{
+    s->kind = ST_CREATE_VIEW;
+    if (take_ident(lx, s->table, MAX_NAME, err) < 0) return -1;
+    if (eat_kw(lx, "AS", err) < 0) return -1;
+    if (!tok_is_kw(&lx->cur, "SELECT"))
+        FAIL("a view body must be a SELECT");
+
+    const char *start = lx->src + lx->pos - strlen(lx->cur.text);
+    if (adv(lx, err) < 0) return -1;
+
+    Stmt probe;
+    memset(&probe, 0, sizeof probe);
+    probe.top = -1;
+    if (parse_select(lx, &probe, err) < 0) return -1;
+    stmt_free(&probe);
+
+    const char *end = lx->src + lx->pos;
+    while (end > start && (end[-1] == ' ' || end[-1] == '\t' ||
+                           end[-1] == '\n' || end[-1] == '\r'))
+        end--;
+    size_t n = (size_t)(end - start);
+    if (n >= MAX_VIEW_SQL) {
+        snprintf(err, MAX_ERR, "view body too long (max %d bytes)", MAX_VIEW_SQL);
+        return -1;
+    }
+    memcpy(s->view_sql, start, n);
+    s->view_sql[n] = 0;
+    return 0;
+}
+
+/* Re-parse a stored view body into a SELECT statement. */
+int parse_view_sql(const char *sql, Stmt *out, char *err)
+{
+    Lexer lx;
+    lex_init(&lx, sql);
+    if (lex_next(&lx) < 0) {
+        snprintf(err, MAX_ERR, "%s", lx.err);
+        return -1;
+    }
+    if (!tok_is_kw(&lx.cur, "SELECT")) {
+        snprintf(err, MAX_ERR, "a view body must be a SELECT");
+        return -1;
+    }
+    if (adv(&lx, err) < 0) return -1;
+    memset(out, 0, sizeof *out);
+    out->top = -1;
+    return parse_select(&lx, out, err);
+}
+
+static int parse_stmt_core(Lexer *lx, Stmt *out, char *err);
+
+/* CREATE PROCEDURE name AS <one statement> — the body is validated here and
+ * stored verbatim in Stmt::proc_sql for re-parsing at CALL time. A procedure
+ * body is exactly one statement: statement separators terminate the batch,
+ * so the parser never sees a multi-statement body. */
+static int parse_create_proc(Lexer *lx, Stmt *s, char *err)
+{
+    s->kind = ST_CREATE_PROC;
+    if (take_ident(lx, s->table, MAX_NAME, err) < 0) return -1;
+    if (eat_kw(lx, "AS", err) < 0) return -1;
+
+    const char *start = lx->src + lx->pos - strlen(lx->cur.text);
+
+    Stmt probe;
+    memset(&probe, 0, sizeof probe);
+    probe.top = -1;
+    int rc = parse_stmt_core(lx, &probe, err);
+    if (rc < 0) return -1;
+    if (rc == 0) FAIL("a procedure body must be a statement");
+    stmt_free(&probe);
+
+    const char *end = lx->src + lx->pos;
+    while (end > start && (end[-1] == ' ' || end[-1] == '\t' ||
+                           end[-1] == '\n' || end[-1] == '\r'))
+        end--;
+    size_t n = (size_t)(end - start);
+    if (n >= MAX_PROC_SQL) {
+        snprintf(err, MAX_ERR, "procedure body too long (max %d bytes)", MAX_PROC_SQL);
+        return -1;
+    }
+    memcpy(s->proc_sql, start, n);
+    s->proc_sql[n] = 0;
+    return 0;
+}
+
+/* Re-parse a stored procedure body into a statement. */
+int parse_proc_sql(const char *sql, Stmt *out, char *err)
+{
+    Lexer lx;
+    lex_init(&lx, sql);
+    if (lex_next(&lx) < 0) {
+        snprintf(err, MAX_ERR, "%s", lx.err);
+        return -1;
+    }
+    int rc = parse_stmt(&lx, out, err);
+    if (rc <= 0) {
+        snprintf(err, MAX_ERR, "a procedure body must be a statement");
+        return -1;
+    }
+    return 0;
+}
+
 static int parse_create(Lexer *lx, Stmt *s, char *err)
 {
     if (eat_kw(lx, "TABLE", err) < 0) return -1;
@@ -754,6 +939,69 @@ static int parse_create(Lexer *lx, Stmt *s, char *err)
     if (eat_punct(lx, "(", err) < 0) return -1;
 
     for (;;) {
+        /* Table-level constraint: CREATE TABLE t (a INT, CHECK (a > 0)) */
+        if (tok_is_kw(&lx->cur, "CHECK")) {
+            char tmp[512];
+            if (parse_check_text(lx, tmp, sizeof tmp, err) < 0) return -1;
+            append_check(s, tmp);
+            int more = opt_punct(lx, ",", err);
+            if (more < 0) return -1;
+            if (!more) break;
+            continue;
+        }
+        /* Table-level foreign key: FOREIGN KEY (a, b) REFERENCES p(x, y) */
+        if (tok_is_kw(&lx->cur, "FOREIGN")) {
+            if (adv(lx, err) < 0) return -1;
+            if (eat_kw(lx, "KEY", err) < 0) return -1;
+            if (s->nfks >= MAX_FKS) FAIL("too many FOREIGN KEYs (max %d)", MAX_FKS);
+            FK *fk = &s->fks[s->nfks];
+            memset(fk, 0, sizeof *fk);
+            if (eat_punct(lx, "(", err) < 0) return -1;
+            for (;;) {
+                if (fk->ncols >= MAX_FK_COLS)
+                    FAIL("too many columns in FOREIGN KEY (max %d)", MAX_FK_COLS);
+                if (take_ident(lx, fk->cols[fk->ncols], MAX_NAME, err) < 0) return -1;
+                fk->ncols++;
+                int more = opt_punct(lx, ",", err);
+                if (more < 0) return -1;
+                if (!more) break;
+            }
+            if (eat_punct(lx, ")", err) < 0) return -1;
+            if (eat_kw(lx, "REFERENCES", err) < 0) return -1;
+            if (take_ident(lx, fk->table, MAX_NAME, err) < 0) return -1;
+            if (tok_is_punct(&lx->cur, "(")) {
+                if (adv(lx, err) < 0) return -1;
+                for (int i = 0; i < fk->ncols; i++) {
+                    if (take_ident(lx, fk->refs[i], MAX_NAME, err) < 0) return -1;
+                    if (i + 1 < fk->ncols) {
+                        if (eat_punct(lx, ",", err) < 0) return -1;
+                    }
+                }
+                if (eat_punct(lx, ")", err) < 0) return -1;
+            } else {
+                for (int i = 0; i < fk->ncols; i++)
+                    snprintf(fk->refs[i], MAX_NAME, "%s", "_pk");
+            }
+            if (tok_is_kw(&lx->cur, "ON")) {
+                if (adv(lx, err) < 0) return -1;
+                if (tok_is_kw(&lx->cur, "UPDATE"))
+                    FAIL("ON UPDATE is not supported on a FOREIGN KEY");
+                if (eat_kw(lx, "DELETE", err) < 0) return -1;
+                if (tok_is_kw(&lx->cur, "CASCADE")) {
+                    if (adv(lx, err) < 0) return -1;
+                    fk->on_delete = FK_CASCADE;
+                } else if (eat_kw(lx, "NO", err) < 0) {
+                    return -1;
+                } else if (eat_kw(lx, "ACTION", err) < 0) {
+                    return -1;
+                }
+            }
+            s->nfks++;
+            int more = opt_punct(lx, ",", err);
+            if (more < 0) return -1;
+            if (!more) break;
+            continue;
+        }
         if (s->ncols >= MAX_COLS) FAIL("too many columns (max %d)", MAX_COLS);
         Column *c = &s->cols[s->ncols];
         memset(c, 0, sizeof *c);
@@ -833,6 +1081,38 @@ static int parse_create(Lexer *lx, Stmt *s, char *err)
                     if (c->id_step == 0) FAIL("IDENTITY step cannot be zero");
                     if (adv(lx, err) < 0) return -1;
                     if (eat_punct(lx, ")", err) < 0) return -1;
+                }
+            } else if (tok_is_kw(&lx->cur, "CHECK")) {
+                /* column-level constraint: qty INT CHECK (qty > 0) */
+                char tmp[512];
+                if (parse_check_text(lx, tmp, sizeof tmp, err) < 0) return -1;
+                append_check(s, tmp);
+            } else if (tok_is_kw(&lx->cur, "REFERENCES")) {
+                /* column-level foreign key: pid INT REFERENCES parent(id) */
+                if (adv(lx, err) < 0) return -1;
+                if (take_ident(lx, c->refs_table, MAX_NAME, err) < 0) return -1;
+                if (tok_is_punct(&lx->cur, "(")) {
+                    if (adv(lx, err) < 0) return -1;
+                    if (take_ident(lx, c->refs_col, MAX_NAME, err) < 0) return -1;
+                    if (eat_punct(lx, ")", err) < 0) return -1;
+                } else {
+                    /* REFERENCES parent without a column names the parent's
+                     * primary key */
+                    snprintf(c->refs_col, MAX_NAME, "%s", "_pk");
+                }
+                if (tok_is_kw(&lx->cur, "ON")) {
+                    if (adv(lx, err) < 0) return -1;
+                    if (tok_is_kw(&lx->cur, "UPDATE"))
+                        FAIL("ON UPDATE is not supported on a FOREIGN KEY");
+                    if (eat_kw(lx, "DELETE", err) < 0) return -1;
+                    if (tok_is_kw(&lx->cur, "CASCADE")) {
+                        if (adv(lx, err) < 0) return -1;
+                        c->on_delete = FK_CASCADE;
+                    } else if (eat_kw(lx, "NO", err) < 0) {
+                        return -1;
+                    } else if (eat_kw(lx, "ACTION", err) < 0) {
+                        return -1;
+                    }
                 }
             } else {
                 break;
@@ -1013,10 +1293,16 @@ static void label_for(const Expr *e, char *out, size_t cap)
     }
 }
 
-static int parse_select(Lexer *lx, Stmt *s, char *err)
+/* One SELECT operand of a compound query (or a plain SELECT when no set
+ * operator follows): DISTINCT/TOP, select list, FROM/JOIN, WHERE, GROUP BY,
+ * HAVING.  ORDER BY and LIMIT/OFFSET are handled by parse_select so they
+ * bind to the whole compound result. */
+static int parse_select_core(Lexer *lx, Stmt *s, char *err)
 {
     s->kind = ST_SELECT;
     s->top = -1;
+    s->limit = -1;
+    s->offset = 0;
 
     if (tok_is_kw(&lx->cur, "DISTINCT")) {
         s->distinct = 1;
@@ -1059,6 +1345,11 @@ static int parse_select(Lexer *lx, Stmt *s, char *err)
                    !tok_is_kw(&lx->cur, "GROUP") &&
                    !tok_is_kw(&lx->cur, "ORDER") &&
                    !tok_is_kw(&lx->cur, "HAVING") &&
+                   !tok_is_kw(&lx->cur, "UNION") &&
+                   !tok_is_kw(&lx->cur, "INTERSECT") &&
+                   !tok_is_kw(&lx->cur, "EXCEPT") &&
+                   !tok_is_kw(&lx->cur, "LIMIT") &&
+                   !tok_is_kw(&lx->cur, "OFFSET") &&
                    !tok_is_kw(&lx->cur, "GO")) {
             /* the bare-word alias form: SELECT n total FROM t */
             if (take_ident(lx, it->alias, MAX_NAME, err) < 0) return -1;
@@ -1091,6 +1382,11 @@ static int parse_select(Lexer *lx, Stmt *s, char *err)
                 tok_is_kw(&lx->cur, "GROUP") ||
                 tok_is_kw(&lx->cur, "ORDER") ||
                 tok_is_kw(&lx->cur, "HAVING") ||
+                tok_is_kw(&lx->cur, "UNION") ||
+                tok_is_kw(&lx->cur, "INTERSECT") ||
+                tok_is_kw(&lx->cur, "EXCEPT") ||
+                tok_is_kw(&lx->cur, "LIMIT") ||
+                tok_is_kw(&lx->cur, "OFFSET") ||
                 tok_is_kw(&lx->cur, "GO")) {
                 FAIL("derived table requires an alias, e.g. FROM (SELECT ...) AS t");
             }
@@ -1106,6 +1402,11 @@ static int parse_select(Lexer *lx, Stmt *s, char *err)
             !tok_is_kw(&lx->cur, "GROUP") &&
             !tok_is_kw(&lx->cur, "ORDER") &&
             !tok_is_kw(&lx->cur, "HAVING") &&
+            !tok_is_kw(&lx->cur, "UNION") &&
+            !tok_is_kw(&lx->cur, "INTERSECT") &&
+            !tok_is_kw(&lx->cur, "EXCEPT") &&
+            !tok_is_kw(&lx->cur, "LIMIT") &&
+            !tok_is_kw(&lx->cur, "OFFSET") &&
             !tok_is_kw(&lx->cur, "INNER") &&
             !tok_is_kw(&lx->cur, "LEFT") &&
             !tok_is_kw(&lx->cur, "JOIN") &&
@@ -1138,6 +1439,11 @@ static int parse_select(Lexer *lx, Stmt *s, char *err)
                 !tok_is_kw(&lx->cur, "GROUP") &&
                 !tok_is_kw(&lx->cur, "ORDER") &&
                 !tok_is_kw(&lx->cur, "HAVING") &&
+                !tok_is_kw(&lx->cur, "UNION") &&
+                !tok_is_kw(&lx->cur, "INTERSECT") &&
+                !tok_is_kw(&lx->cur, "EXCEPT") &&
+                !tok_is_kw(&lx->cur, "LIMIT") &&
+                !tok_is_kw(&lx->cur, "OFFSET") &&
                 !tok_is_kw(&lx->cur, "GO")) {
                 if (take_ident(lx, j->alias, MAX_NAME, err) < 0) return -1;
             }
@@ -1162,10 +1468,72 @@ after_derived_from:
         s->having = parse_or(lx, err);
         if (!s->having) return -1;
     }
-    if (parse_order_by(lx, s, err) < 0) return -1;
 
     if (!s->has_from && (s->where || s->ngroup || s->having))
         FAIL("WHERE, GROUP BY and HAVING need a FROM clause");
+    return 0;
+}
+
+static int parse_select(Lexer *lx, Stmt *s, char *err)
+{
+    Stmt *root = s;
+    if (parse_select_core(lx, root, err) < 0) return -1;
+
+    /* UNION [ALL] / INTERSECT / EXCEPT, left-associative: each operator
+     * binds to the previous operand, so (a UNION b) INTERSECT c. */
+    for (;;) {
+        int op = 0;
+        if      (tok_is_kw(&lx->cur, "UNION"))     op = SET_UNION;
+        else if (tok_is_kw(&lx->cur, "INTERSECT")) op = SET_INTERSECT;
+        else if (tok_is_kw(&lx->cur, "EXCEPT"))    op = SET_EXCEPT;
+        else break;
+        if (adv(lx, err) < 0) return -1;
+        if (op == SET_UNION && tok_is_kw(&lx->cur, "ALL")) {
+            if (adv(lx, err) < 0) return -1;
+            op = SET_UNION_ALL;
+        }
+        if (!tok_is_kw(&lx->cur, "SELECT"))
+            FAIL("expected SELECT after %s",
+                 op == SET_UNION_ALL ? "UNION ALL"
+                 : op == SET_UNION ? "UNION"
+                 : op == SET_INTERSECT ? "INTERSECT" : "EXCEPT");
+        if (adv(lx, err) < 0) return -1;
+        Stmt *rhs = calloc(1, sizeof(Stmt));
+        if (!rhs) FAIL("out of memory");
+        if (parse_select_core(lx, rhs, err) < 0) {
+            free(rhs);
+            return -1;
+        }
+        s->set_op = op;
+        s->set_rhs = rhs;
+        s = rhs;
+    }
+
+    /* Trailing ORDER BY / LIMIT / OFFSET apply to the compound result */
+    if (parse_order_by(lx, root, err) < 0) return -1;
+
+    /* LIMIT n [OFFSET m] or bare OFFSET m — pagination after ORDER BY */
+    if (tok_is_kw(&lx->cur, "LIMIT") || tok_is_kw(&lx->cur, "OFFSET")) {
+        if (tok_is_kw(&lx->cur, "LIMIT")) {
+            if (adv(lx, err) < 0) return -1;
+            if (lx->cur.kind != TK_NUMBER || lx->cur.is_float)
+                FAIL("LIMIT needs a whole number on line %d", lx->cur.line);
+            root->limit = (int)lx->cur.ival;
+            if (adv(lx, err) < 0) return -1;
+            if (root->limit < 0)
+                FAIL("LIMIT cannot be negative on line %d", lx->cur.line);
+        }
+        if (tok_is_kw(&lx->cur, "OFFSET")) {
+            if (adv(lx, err) < 0) return -1;
+            if (lx->cur.kind != TK_NUMBER || lx->cur.is_float)
+                FAIL("OFFSET needs a whole number on line %d", lx->cur.line);
+            root->offset = (int)lx->cur.ival;
+            if (adv(lx, err) < 0) return -1;
+            if (root->offset < 0)
+                FAIL("OFFSET cannot be negative on line %d", lx->cur.line);
+        }
+    }
+
     return 0;
 }
 
@@ -1247,7 +1615,11 @@ static int parse_show(Lexer *lx, Stmt *s, char *err)
 
 /* --------------------------------------------------------- entry point */
 
-int parse_stmt(Lexer *lx, Stmt *out, char *err)
+/* parse one statement without consuming its trailing ';'. The separator
+ * skip and the trailing-garbage boundary check are identical to parse_stmt;
+ * this exists so a CREATE PROCEDURE body probe leaves the batch's statement
+ * boundary intact for the outer statement. */
+static int parse_stmt_core(Lexer *lx, Stmt *out, char *err)
 {
     memset(out, 0, sizeof *out);
     out->top = -1;
@@ -1265,16 +1637,54 @@ int parse_stmt(Lexer *lx, Stmt *out, char *err)
     Token *t = &lx->cur;
     int rc;
 
-    if (tok_is_kw(t, "CREATE"))        { if (adv(lx, err) < 0) return -1; rc = parse_create(lx, out, err); }
-    else if (tok_is_kw(t, "DROP"))     { if (adv(lx, err) < 0) return -1;
-                                         if (eat_kw(lx, "TABLE", err) < 0) return -1;
-                                         out->kind = ST_DROP;
-                                         if (tok_is_kw(&lx->cur, "IF")) {
-                                             if (adv(lx, err) < 0) return -1;
-                                             if (eat_kw(lx, "EXISTS", err) < 0) return -1;
-                                             out->if_exists = 1;
-                                         }
-                                         rc = take_ident(lx, out->table, MAX_NAME, err); }
+    if (tok_is_kw(t, "CREATE")) {
+        if (adv(lx, err) < 0) return -1;
+        if (tok_is_kw(&lx->cur, "VIEW")) {
+            if (adv(lx, err) < 0) return -1;
+            rc = parse_create_view(lx, out, err);
+        } else if (tok_is_kw(&lx->cur, "PROCEDURE")) {
+            if (adv(lx, err) < 0) return -1;
+            rc = parse_create_proc(lx, out, err);
+        } else {
+            rc = parse_create(lx, out, err);
+        }
+    }
+    else if (tok_is_kw(t, "DROP")) {
+        if (adv(lx, err) < 0) return -1;
+        if (tok_is_kw(&lx->cur, "VIEW")) {
+            if (adv(lx, err) < 0) return -1;
+            out->kind = ST_DROP_VIEW;
+            if (tok_is_kw(&lx->cur, "IF")) {
+                if (adv(lx, err) < 0) return -1;
+                if (eat_kw(lx, "EXISTS", err) < 0) return -1;
+                out->if_exists = 1;
+            }
+            rc = take_ident(lx, out->table, MAX_NAME, err);
+        } else if (tok_is_kw(&lx->cur, "PROCEDURE")) {
+            if (adv(lx, err) < 0) return -1;
+            out->kind = ST_DROP_PROC;
+            if (tok_is_kw(&lx->cur, "IF")) {
+                if (adv(lx, err) < 0) return -1;
+                if (eat_kw(lx, "EXISTS", err) < 0) return -1;
+                out->if_exists = 1;
+            }
+            rc = take_ident(lx, out->table, MAX_NAME, err);
+        } else {
+            if (eat_kw(lx, "TABLE", err) < 0) return -1;
+            out->kind = ST_DROP;
+            if (tok_is_kw(&lx->cur, "IF")) {
+                if (adv(lx, err) < 0) return -1;
+                if (eat_kw(lx, "EXISTS", err) < 0) return -1;
+                out->if_exists = 1;
+            }
+            rc = take_ident(lx, out->table, MAX_NAME, err);
+        }
+    }
+    else if (tok_is_kw(t, "CALL")) {
+        if (adv(lx, err) < 0) return -1;
+        out->kind = ST_CALL;
+        rc = take_ident(lx, out->table, MAX_NAME, err);
+    }
     else if (tok_is_kw(t, "ALTER")) {
         if (adv(lx, err) < 0) return -1;
         if (eat_kw(lx, "TABLE", err) < 0) return -1;
@@ -1332,7 +1742,7 @@ int parse_stmt(Lexer *lx, Stmt *out, char *err)
             out->kind = ST_ALTER_TYPE;
             memset(&out->cols[0], 0, sizeof(Column));
             if (take_ident(lx, out->cols[0].name, MAX_NAME, err) < 0) return -1;
-            if (eat_kw(lx, "TYPE", err) < 0) return -1;
+            opt_kw(lx, "TYPE", err);   /* optional: ALTER COLUMN a INT */
             if (parse_type(lx, &out->cols[0], err) < 0) return -1;
             out->ncols = 1;
             rc = 0;
@@ -1414,13 +1824,8 @@ int parse_stmt(Lexer *lx, Stmt *out, char *err)
 
     /* EXPLAIN skips the boundary check — its inner statement already consumed
      * the terminator. */
-    if (out->kind == ST_EXPLAIN) {
-        /* consume an optional trailing semicolon that belongs to the inner stmt */
-        if (tok_is_punct(&lx->cur, ";")) {
-            if (adv(lx, err) < 0) { stmt_free(out); return -1; }
-        }
+    if (out->kind == ST_EXPLAIN)
         return 1;
-    }
 
     /* A statement has to end at a statement boundary: end of input, ';' or GO.
      *
@@ -1441,6 +1846,18 @@ int parse_stmt(Lexer *lx, Stmt *out, char *err)
         stmt_free(out);
         return -1;
     }
+
+    return 1;
+}
+
+int parse_stmt(Lexer *lx, Stmt *out, char *err)
+{
+    int rc = parse_stmt_core(lx, out, err);
+    if (rc <= 0) return rc;
+
+    /* EXPLAIN's inner statement already consumed the terminator */
+    if (out->kind == ST_EXPLAIN)
+        return 1;
 
     /* an optional trailing semicolon */
     if (tok_is_punct(&lx->cur, ";")) {

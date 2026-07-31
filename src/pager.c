@@ -240,8 +240,13 @@ static int write_header(DB *db)
 
 static size_t catalog_serialize(const Catalog *c, uint8_t **out)
 {
+    /* worst case per table: name + columns (with FK names) + pages + indexes +
+     * CHECK text + table-level FOREIGN KEYs */
     size_t cap = 8 + (size_t)c->ntables *
-                 (MAX_NAME + 8 + MAX_COLS * (MAX_NAME + 32 + 96) + 64);
+                 (MAX_NAME + 8 + MAX_COLS * (3 * MAX_NAME + 130) + 64 +
+                  MAX_FKS * (MAX_COLS * 4 * MAX_NAME + 256)) +
+                 4 + (size_t)c->nviews * (MAX_NAME + 4 + MAX_VIEW_SQL) +
+                 4 + (size_t)c->nprocs * (MAX_NAME + 4 + MAX_PROC_SQL);
     uint8_t *b = malloc(cap);
     if (!b) return 0;
     size_t o = 0;
@@ -266,6 +271,16 @@ static size_t catalog_serialize(const Catalog *c, uint8_t **out)
             b[o++] = cl->identity;
             wr64(b, o, (uint64_t)cl->id_next); o += 8;
             wr64(b, o, (uint64_t)cl->id_step); o += 8;
+            /* FOREIGN KEY (variable length: two length-prefixed names) */
+            size_t rtl = strlen(cl->refs_table);
+            if (rtl > 0xFFFF) rtl = 0xFFFF;
+            wr16(b, o, (uint16_t)rtl); o += 2;
+            memcpy(b + o, cl->refs_table, rtl); o += rtl;
+            size_t rcl = strlen(cl->refs_col);
+            if (rcl > 0xFFFF) rcl = 0xFFFF;
+            wr16(b, o, (uint16_t)rcl); o += 2;
+            memcpy(b + o, cl->refs_col, rcl); o += rcl;
+            b[o++] = cl->on_delete;
         }
         wr32(b, o, t->first_page); o += 4;
         wr32(b, o, t->last_page);  o += 4;
@@ -277,6 +292,55 @@ static size_t catalog_serialize(const Catalog *c, uint8_t **out)
             b[o++] = t->indexes[k].valid;
             b[o++] = 0; b[o++] = 0;
         }
+        /* CHECK constraint text (variable length, 2-byte length prefix) */
+        size_t clen = strlen(t->check);
+        if (clen > 0xFFFF) clen = 0xFFFF;
+        wr16(b, o, (uint16_t)clen); o += 2;
+        memcpy(b + o, t->check, clen); o += clen;
+        /* table-level FOREIGN KEYs; absent in files written by older versions */
+        int nfks = t->nfks > MAX_FKS ? MAX_FKS : t->nfks;
+        wr16(b, o, (uint16_t)nfks); o += 2;
+        for (int f = 0; f < nfks; f++) {
+            const FK *fk = &t->fks[f];
+            b[o++] = fk->on_delete;
+            wr16(b, o, (uint16_t)fk->ncols); o += 2;
+            for (int ci = 0; ci < fk->ncols; ci++) {
+                size_t c_len = strlen(fk->cols[ci]);
+                if (c_len > 0xFFFF) c_len = 0xFFFF;
+                wr16(b, o, (uint16_t)c_len); o += 2;
+                memcpy(b + o, fk->cols[ci], c_len); o += c_len;
+            }
+            for (int ci = 0; ci < fk->ncols; ci++) {
+                size_t r_len = strlen(fk->refs[ci]);
+                if (r_len > 0xFFFF) r_len = 0xFFFF;
+                wr16(b, o, (uint16_t)r_len); o += 2;
+                memcpy(b + o, fk->refs[ci], r_len); o += r_len;
+            }
+            size_t tl = strlen(fk->table);
+            if (tl > 0xFFFF) tl = 0xFFFF;
+            wr16(b, o, (uint16_t)tl); o += 2;
+            memcpy(b + o, fk->table, tl); o += tl;
+        }
+    }
+    /* stored views; absent in files written by older versions */
+    int nv = c->nviews > MAX_VIEWS ? MAX_VIEWS : c->nviews;
+    wr32(b, o, (uint32_t)nv); o += 4;
+    for (int i = 0; i < nv; i++) {
+        const View *v = &c->views[i];
+        memcpy(b + o, v->name, MAX_NAME); o += MAX_NAME;
+        uint32_t sl = (uint32_t)strlen(v->sql);
+        wr32(b, o, sl); o += 4;
+        memcpy(b + o, v->sql, sl); o += sl;
+    }
+    /* stored procedures; absent in files written by older versions */
+    int np = c->nprocs > MAX_PROCS ? MAX_PROCS : c->nprocs;
+    wr32(b, o, (uint32_t)np); o += 4;
+    for (int i = 0; i < np; i++) {
+        const Proc *p = &c->procs[i];
+        memcpy(b + o, p->name, MAX_NAME); o += MAX_NAME;
+        uint32_t sl = (uint32_t)strlen(p->sql);
+        wr32(b, o, sl); o += 4;
+        memcpy(b + o, p->sql, sl); o += sl;
     }
     *out = b;
     return o;
@@ -316,6 +380,29 @@ static void catalog_deserialize(Catalog *c, const uint8_t *b, size_t len)
             cl->identity    = b[o++];
             cl->id_next     = (int64_t)rd64(b, o); o += 8;
             cl->id_step     = (int64_t)rd64(b, o); o += 8;
+            /* FOREIGN KEY names; absent in files written by older versions */
+            if (o + 2 <= len) {
+                uint16_t rtl = rd16(b, o); o += 2;
+                if (rtl) {
+                    if (o + rtl > len) return;
+                    size_t copy = rtl < sizeof cl->refs_table ? rtl
+                                                              : sizeof cl->refs_table - 1;
+                    memcpy(cl->refs_table, b + o, copy);
+                    cl->refs_table[copy] = 0;
+                    o += rtl;
+                }
+                if (o + 2 > len) return;
+                uint16_t rcl = rd16(b, o); o += 2;
+                if (rcl) {
+                    if (o + rcl > len) return;
+                    size_t copy = rcl < sizeof cl->refs_col ? rcl
+                                                            : sizeof cl->refs_col - 1;
+                    memcpy(cl->refs_col, b + o, copy);
+                    cl->refs_col[copy] = 0;
+                    o += rcl;
+                }
+                if (o < len) cl->on_delete = b[o++];
+            }
         }
         if (o + 20 > len) return;
         t->first_page = rd32(b, o); o += 4;
@@ -329,7 +416,96 @@ static void catalog_deserialize(Catalog *c, const uint8_t *b, size_t len)
             t->indexes[k].col   = (int8_t)b[o++];
             t->indexes[k].valid = b[o++]; o += 2;
         }
+        /* CHECK constraint text; absent in files written by older versions */
+        if (o + 2 <= len) {
+            uint16_t clen = rd16(b, o); o += 2;
+            if (clen > 0) {
+                if (o + clen > len) clen = (uint16_t)(len - o);
+                size_t copy = clen < sizeof t->check ? clen : sizeof t->check - 1;
+                memcpy(t->check, b + o, copy);
+                t->check[copy] = 0;
+                o += clen;
+            }
+        }
+        /* table-level FOREIGN KEYs; absent in files written by older versions */
+        if (o + 2 <= len) {
+            uint16_t nfks = rd16(b, o); o += 2;
+            if (nfks > MAX_FKS) nfks = MAX_FKS;
+            t->nfks = nfks;
+            for (int f = 0; f < nfks; f++) {
+                FK *fk = &t->fks[f];
+                if (o >= len) break;
+                fk->on_delete = b[o++];
+                if (o + 2 > len) break;
+                uint16_t nc = rd16(b, o); o += 2;
+                if (nc > MAX_FK_COLS) break;
+                fk->ncols = nc;
+                for (int ci = 0; ci < nc; ci++) {
+                    if (o + 2 > len) { fk->ncols = ci; break; }
+                    uint16_t l = rd16(b, o); o += 2;
+                    if (o + l > len) { fk->ncols = ci; break; }
+                    size_t copy = l < sizeof fk->cols[ci] ? l : sizeof fk->cols[ci] - 1;
+                    memcpy(fk->cols[ci], b + o, copy);
+                    fk->cols[ci][copy] = 0;
+                    o += l;
+                }
+                if (fk->ncols != nc) break;
+                for (int ci = 0; ci < nc; ci++) {
+                    if (o + 2 > len) { fk->ncols = ci; break; }
+                    uint16_t l = rd16(b, o); o += 2;
+                    if (o + l > len) { fk->ncols = ci; break; }
+                    size_t copy = l < sizeof fk->refs[ci] ? l : sizeof fk->refs[ci] - 1;
+                    memcpy(fk->refs[ci], b + o, copy);
+                    fk->refs[ci][copy] = 0;
+                    o += l;
+                }
+                if (fk->ncols != nc) break;
+                if (o + 2 > len) break;
+                uint16_t l = rd16(b, o); o += 2;
+                if (o + l > len) break;
+                size_t copy = l < sizeof fk->table ? l : sizeof fk->table - 1;
+                memcpy(fk->table, b + o, copy);
+                fk->table[copy] = 0;
+                o += l;
+            }
+        }
         c->ntables = i + 1;
+    }
+    /* stored views; absent in files written by older versions */
+    if (o + 4 <= len) {
+        int nv = (int)rd32(b, o); o += 4;
+        if (nv < 0 || nv > MAX_VIEWS) nv = 0;
+        for (int i = 0; i < nv; i++) {
+            View *v = &c->views[i];
+            if (o + MAX_NAME + 4 > len) break;
+            memcpy(v->name, b + o, MAX_NAME); o += MAX_NAME;
+            v->name[MAX_NAME - 1] = 0;
+            uint32_t sl = rd32(b, o); o += 4;
+            if (o + sl > len) break;
+            size_t copy = sl < sizeof v->sql ? sl : sizeof v->sql - 1;
+            memcpy(v->sql, b + o, copy);
+            v->sql[copy] = 0;
+            o += sl;
+            c->nviews = i + 1;
+        }
+    }
+    /* stored procedures; absent in files written by older versions */
+    if (o + 4 <= len) {
+        int np = (int)rd32(b, o); o += 4;
+        if (np < 0 || np > MAX_PROCS) np = 0;
+        for (int i = 0; i < np; i++) {
+            Proc *p = &c->procs[i];
+            if (o + MAX_NAME + 4 > len) break;
+            memcpy(p->name, b + o, MAX_NAME); o += MAX_NAME;
+            p->name[MAX_NAME - 1] = 0;
+            uint32_t sl = rd32(b, o); o += 4;
+            if (o + sl > len) break;
+            size_t copy = sl < sizeof p->sql ? sl : sizeof p->sql - 1;
+            memcpy(p->sql, b + o, copy);
+            p->sql[copy] = 0;
+            o += sl;
+            c->nprocs = i + 1;
+        }
     }
 }
 
@@ -474,6 +650,23 @@ Table *cat_find(DB *db, const char *name)
     for (int i = 0; i < db->cat.ntables; i++)
         if (strcasecmp(db->cat.tables[i].name, name) == 0)
             return &db->cat.tables[i];
+    snprintf(db->err, MAX_ERR, "unknown table '%s'", name);
+    return NULL;
+}
+
+View *cat_find_view(DB *db, const char *name)
+{
+    for (int i = 0; i < db->cat.nviews; i++)
+        if (strcasecmp(db->cat.views[i].name, name) == 0)
+            return &db->cat.views[i];
+    return NULL;
+}
+
+Proc *cat_find_proc(DB *db, const char *name)
+{
+    for (int i = 0; i < db->cat.nprocs; i++)
+        if (strcasecmp(db->cat.procs[i].name, name) == 0)
+            return &db->cat.procs[i];
     return NULL;
 }
 
@@ -1041,20 +1234,29 @@ int pager_undo_capture(DB *db, uint32_t pno)
 void pager_undo_rollback(DB *db)
 {
     if (db->txn_depth == 0) return;
-    int target = 0;
     if (db->txn_sp_count > 0) {
-        /* Nested rollback: restore to the most recent savepoint */
-        target = db->txn_sp[--db->txn_sp_count];
+        /* Nested rollback: restore to the most recent savepoint, then
+         * return to the enclosing transaction level. */
+        int target = db->txn_sp[--db->txn_sp_count];
+        for (int i = db->undo_depth - 1; i >= target; i--) {
+            wal_append(db, db->undo[i].pno, db->undo[i].old);
+            pwrite(db->fd, db->undo[i].old, PAGE_SIZE,
+                   (off_t)db->undo[i].pno * PAGE_SIZE);
+        }
+        db->undo_depth = target;
+        db->txn_depth = db->txn_sp_count + 1;
+        db->txn_active = 1;
+        return;
     }
-    /* Restore pages in reverse order. */
-    for (int i = db->undo_depth - 1; i >= target; i--) {
+    /* Outermost rollback: restore everything and end the transaction. */
+    for (int i = db->undo_depth - 1; i >= 0; i--) {
         wal_append(db, db->undo[i].pno, db->undo[i].old);
         pwrite(db->fd, db->undo[i].old, PAGE_SIZE,
                (off_t)db->undo[i].pno * PAGE_SIZE);
     }
-    db->undo_depth = target;
-    db->txn_depth = db->txn_sp_count + 1;
-    db->txn_active = db->txn_depth > 0;
+    db->undo_depth = 0;
+    db->txn_depth = 0;
+    db->txn_active = 0;
 }
 
 void pager_undo_commit(DB *db)

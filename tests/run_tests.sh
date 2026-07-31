@@ -271,7 +271,46 @@ out=$(run "SELECT n FROM guard WHERE n = 99")
 check "...and updated nothing" "(0 rows)" "$out"
 
 out=$(run "SELECT n FROM guard ORDER BY n LIMIT 2")
-check "a trailing LIMIT on SELECT is refused" "Nothing was run" "$out"
+check "LIMIT on SELECT returns the first two rows" "1" "$out"
+out=$(run "SELECT COUNT(*) FROM guard")
+check "...and the table is untouched" "3" "$out"
+out=$(run "SELECT n FROM guard ORDER BY n LIMIT 1 OFFSET 1")
+check "LIMIT OFFSET paginates from the second row" "2" "$out"
+
+echo
+echo "-- UNION / INTERSECT / EXCEPT"
+run "CREATE TABLE seta (x INT)" >/dev/null
+run "INSERT INTO seta VALUES (1),(2),(2),(3)" >/dev/null
+run "CREATE TABLE setb (x INT)" >/dev/null
+run "INSERT INTO setb VALUES (2),(3),(4)" >/dev/null
+out=$(run "SELECT x FROM seta UNION SELECT x FROM setb ORDER BY x")
+check "UNION deduplicates across both sides" "(4 rows)" "$out"
+out=$(run "SELECT x FROM seta UNION ALL SELECT x FROM setb ORDER BY x")
+check "UNION ALL keeps duplicates" "(7 rows)" "$out"
+out=$(run "SELECT x FROM seta INTERSECT SELECT x FROM setb ORDER BY x")
+check "INTERSECT keeps rows in both sides" "(2 rows)" "$out"
+out=$(run "SELECT x FROM seta EXCEPT SELECT x FROM setb ORDER BY x")
+check "EXCEPT keeps rows only on the left" "1" "$out"
+out=$(run "SELECT x FROM seta EXCEPT SELECT x FROM seta")
+check "EXCEPT of a set with itself is empty" "(0 rows)" "$out"
+out=$(run "SELECT x FROM seta UNION SELECT x FROM setb ORDER BY x DESC LIMIT 2")
+check "trailing ORDER BY and LIMIT bind to the compound result" "(2 rows)" "$out"
+out=$(run "SELECT x FROM seta UNION SELECT x FROM setb ORDER BY x DESC LIMIT 2")
+check "...and the DESC order applies" "4" "$out"
+out=$(run "SELECT x FROM seta UNION ALL SELECT x FROM setb LIMIT 2 OFFSET 3")
+check "trailing OFFSET skips rows of the merged result" "(2 rows)" "$out"
+out=$(run "SELECT * FROM (SELECT x FROM seta UNION SELECT 9) AS u WHERE x > 1 ORDER BY x")
+check "a compound SELECT can be a derived table" "(3 rows)" "$out"
+out=$(run "SELECT 9 UNION SELECT 1 UNION SELECT 5 ORDER BY x")
+check "a three-way UNION chain is left-associative" "(3 rows)" "$out"
+run "CREATE TABLE setc (n INT)" >/dev/null
+run "INSERT INTO setc SELECT x FROM seta UNION SELECT x FROM setb" >/dev/null
+out=$(run "SELECT COUNT(*) FROM setc")
+check "INSERT..SELECT accepts a compound SELECT" "4" "$out"
+out=$(run "SELECT x FROM seta UNION SELECT x, 1 FROM setb")
+check "a set operation needs matching column counts" "different numbers of columns" "$out"
+out=$(run "SELECT 1 UNION")
+check "a set operator needs a SELECT after it" "expected SELECT after UNION" "$out"
 out=$(run "SELECT n FROM guard JOIN other ON guard.id = other.id")
 check "JOIN with missing table is refused" "unknown table" "$out"
 run "CREATE TABLE other (id INT, x INT)" >/dev/null
@@ -280,6 +319,14 @@ out=$(run "SELECT guard.n, other.x FROM guard INNER JOIN other ON guard.id = oth
 check "INNER JOIN works" "1  10" "$out"
 out=$(run "SELECT COUNT(*) FROM guard LEFT JOIN other ON guard.id = other.id")
 check "LEFT JOIN works" "3" "$out"
+out=$(run "SELECT guard.n, other.x FROM guard JOIN other ON guard.id = other.id WHERE other.x > 10")
+check "WHERE on a joined column" "2  20" "$out"
+out=$(run "SELECT guard.n, other.x FROM guard LEFT JOIN other ON guard.id = other.id WHERE other.x IS NULL")
+check "LEFT JOIN keeps unmatched rows" "3" "$out"
+out=$(run "SELECT COUNT(*) FROM guard JOIN other ON guard.id = other.id WHERE other.x > 10")
+check "aggregates over a join with WHERE" "1" "$out"
+out=$(run "SELECT COUNT(*) FROM guard JOIN other ON guard.id = other.id GROUP BY guard.n")
+check "GROUP BY with JOIN is refused, not wrong" "not yet supported" "$out"
 out=$(run "SELECT n FROM guard, other")
 check "comma join is refused rather than ignored" "Nothing was run" "$out"
 
@@ -742,6 +789,156 @@ out=$(dd_ "TRUNCATE TABLE arch")
 check "TRUNCATE removes every row" "removed" "$out"
 out=$(dd_ "SELECT COUNT(*) FROM arch")
 check "...leaving the table empty but present" "0" "$out"
+
+echo
+echo "-- ALTER COLUMN TYPE validates every stored value before narrowing"
+out=$(dd_ "CREATE TABLE wide (a BIGINT, s NVARCHAR(MAX))")
+check "a table for ALTER COLUMN TYPE" "created" "$out"
+out=$(dd_ "INSERT INTO wide (a, s) VALUES (5000000000, 'toolong'), (7, 'x')")
+check "insert values that fit only the wide types" "(2 rows inserted)" "$out"
+out=$(dd_ "ALTER TABLE wide ALTER COLUMN a INT")
+check "narrowing BIGINT to INT with an overflow is refused" "has value 5000000000" "$out"
+out=$(dd_ "ALTER TABLE wide ALTER COLUMN s NVARCHAR(2)")
+check "narrowing NVARCHAR(MAX) past a long value is refused" "the column holds 2" "$out"
+out=$(dd_ "DELETE FROM wide WHERE a = 5000000000; ALTER TABLE wide ALTER COLUMN a INT; ALTER TABLE wide ALTER COLUMN s NVARCHAR(2)")
+check "narrowing succeeds once the rows fit" "type changed" "$out"
+out=$(dd_ "SELECT a, s FROM wide")
+check "the narrowed rows read back correctly" "7" "$out"
+
+echo
+echo "-- CHECK constraints are stored, enforced, and survive a restart"
+out=$(dd_ "CREATE TABLE inv (qty INT CHECK (qty > 0), price INT, CHECK (price >= 0), note NVARCHAR(20) CHECK (note <> 'nope'))")
+check "CREATE TABLE with column- and table-level CHECK" "created" "$out"
+out=$(dd_ "INSERT INTO inv (qty, price) VALUES (5, 10)")
+check "a row satisfying every CHECK inserts" "(1 row inserted)" "$out"
+out=$(dd_ "INSERT INTO inv (qty, price, note) VALUES (5, 10, 'nope')")
+check "a column-level CHECK violation is refused" "CHECK constraint failed" "$out"
+out=$(dd_ "INSERT INTO inv (qty, price) VALUES (-1, 10)")
+check "a table-level CHECK violation is refused" "CHECK constraint failed" "$out"
+out=$(dd_ "INSERT INTO inv (qty, price, note) VALUES (3, 1, NULL)")
+check "NULL satisfies a CHECK (three-valued logic)" "(1 row inserted)" "$out"
+out=$(dd_ "UPDATE inv SET qty = -9 WHERE qty = 3")
+check "UPDATE into a CHECK violation is refused" "CHECK constraint failed" "$out"
+out=$(dd_ "UPDATE inv SET qty = 7 WHERE qty = 3")
+check "UPDATE to a valid value applies" "(1 row updated)" "$out"
+out=$(dd_ "SELECT qty FROM inv ORDER BY qty")
+check "only valid rows are present" "5" "$out"
+out=$(dd_ "INSERT INTO inv (qty, price) SELECT 9, 9")
+check "INSERT..SELECT is CHECKed too" "(1 row inserted)" "$out"
+out=$(dd_ "INSERT INTO inv (qty, price) SELECT -9, 9")
+check "...and a violation there is refused" "CHECK constraint failed" "$out"
+
+echo
+echo "-- FOREIGN KEY constraints are validated, enforced, and survive a restart"
+out=$(dd_ "CREATE TABLE par (id INT PRIMARY KEY, code NVARCHAR(10) UNIQUE); CREATE TABLE chi (x INT REFERENCES par(id) ON DELETE CASCADE, y NVARCHAR(10) REFERENCES par(code) ON DELETE CASCADE); CREATE TABLE chi2 (a INT, b NVARCHAR(10), FOREIGN KEY (a, b) REFERENCES par(id, code))")
+check "FKs on columns, CASCADE, and a table-level composite FK" "created" "$out"
+out=$(dd_ "INSERT INTO par VALUES (1, 'aa'); INSERT INTO chi VALUES (1, 'aa'); INSERT INTO chi2 VALUES (1, 'aa')")
+check "rows matching the parent insert" "(1 row inserted)" "$out"
+out=$(dd_ "INSERT INTO chi VALUES (99, 'aa')")
+check "a column-level FK violation is refused" "foreign key violation" "$out"
+out=$(dd_ "INSERT INTO chi2 VALUES (1, 'zz')")
+check "a composite FK violation is refused" "foreign key violation" "$out"
+out=$(dd_ "INSERT INTO chi VALUES (NULL, 'aa')")
+check "NULL foreign keys are allowed" "(1 row inserted)" "$out"
+out=$(dd_ "UPDATE chi SET x = 5 WHERE x = 1")
+check "UPDATE into an FK violation is refused" "foreign key violation" "$out"
+out=$(dd_ "UPDATE par SET id = 7 WHERE id = 1")
+check "changing a referenced parent key is refused" "cannot change" "$out"
+out=$(dd_ "DELETE FROM par WHERE id = 1")
+check "deleting a referenced parent row is refused" "still references it" "$out"
+out=$(dd_ "INSERT INTO par VALUES (2, 'bb'); INSERT INTO chi VALUES (2, 'bb')")
+check "a second parent row inserts" "(1 row inserted)" "$out"
+out=$(dd_ "DELETE FROM par WHERE code = 'bb'")
+check "ON DELETE CASCADE removes the children too" "(1 row deleted)" "$out"
+out=$(dd_ "SELECT COUNT(*) FROM chi")
+check "CASCADE removed the referencing chi rows" "2" "$out"
+out=$(dd_ "DROP TABLE par")
+check "a referenced table cannot be dropped" "references it" "$out"
+out=$(dd_ "CREATE TABLE bad (z INT REFERENCES par(zzz))")
+check "a missing referenced column is refused" "unknown column" "$out"
+out=$(dd_ "CREATE TABLE par2 (id INT PRIMARY KEY, val INT); CREATE TABLE bad (z INT REFERENCES par2(val))")
+check "a non-unique referenced column is refused" "not UNIQUE" "$out"
+out=$(dd_ "CREATE TABLE bad (z INT REFERENCES nosuch)")
+check "a missing referenced table is refused" "unknown table" "$out"
+out=$(dd_ "SELECT x FROM chi ORDER BY x")
+check "FK rows survive the create-time validation" "1" "$out"
+out=$(dd_ "VACUUM; INSERT INTO chi VALUES (1, 'aa'); SELECT COUNT(*) FROM chi")
+check "FKs still enforced after VACUUM" "3" "$out"
+out=$(dd_ "SELECT id FROM par WHERE id = 1")
+check "point lookups still hit the index after VACUUM" "1" "$out"
+
+echo
+echo "-- views are stored, expanded at query time, and survive a restart"
+out=$(run "CREATE TABLE base (id INT PRIMARY KEY, name NVARCHAR(20)); CREATE VIEW vw AS SELECT id, name FROM base")
+check "CREATE VIEW with a SELECT body" "created" "$out"
+out=$(run "SELECT * FROM vw")
+check "selecting from a view" "0 rows" "$out"
+out=$(run "INSERT INTO base VALUES (1, 'a'), (2, 'b'); SELECT * FROM vw")
+check "a view sees rows inserted after it was created" "2 rows" "$out"
+out=$(run "SELECT id FROM vw WHERE id = 2")
+check "WHERE on a view" "2" "$out"
+out=$(run "SELECT vw.name FROM vw ORDER BY id DESC")
+check "qualified references to a view" "b" "$out"
+out=$(run "SELECT COUNT(*) FROM (SELECT id FROM vw) AS x")
+check "a view inside a derived table" "COUNT" "$out"
+out=$(run "CREATE VIEW vw2 AS SELECT id FROM base WHERE id > 1 UNION SELECT 9; SELECT * FROM vw2")
+check "a view body may be a set operation" "9" "$out"
+out=$(run "SELECT * FROM vw")
+check "the view still works after a restart" "2 rows" "$out"
+out=$(run "CREATE VIEW vw AS SELECT 1")
+check "a duplicate view name is refused" "already exists" "$out"
+out=$(run "CREATE VIEW vbad AS SELECT bogus FROM nosuch; SELECT * FROM vbad")
+check "a view on missing tables errors when used" "unknown table" "$out"
+out=$(run "DROP VIEW vw2; SELECT * FROM vw2")
+check "DROP VIEW removes the view" "unknown table" "$out"
+out=$(run "DROP VIEW IF EXISTS nosuch")
+check_not "DROP VIEW IF EXISTS on a missing view" "error" "$out"
+out=$(run "SELECT * FROM vw")
+check "the surviving view is untouched" "2 rows" "$out"
+
+# ---------------------------------------------------------------- procedures
+
+run "CREATE TABLE pbase (id INT PRIMARY KEY, n NVARCHAR(20))" >/dev/null
+run "INSERT INTO pbase (id, n) VALUES (1,'one'),(2,'two')" >/dev/null
+out=$(run "CREATE PROCEDURE psel AS SELECT id, n FROM pbase")
+check "CREATE PROCEDURE works" "procedure 'psel' created" "$out"
+out=$(run "CALL psel")
+check "CALL runs the stored SELECT" "1   one" "$out"
+out=$(run "CALL psel")
+check "the stored body is stable across CALLs" "2   two" "$out"
+out=$(run "CREATE PROCEDURE pins AS INSERT INTO pbase VALUES (3, 'three'); CALL pins; SELECT COUNT(*) FROM pbase")
+check "CALL runs a stored INSERT" "3" "$out"
+out=$(run "CALL pins; CALL psel")
+check "a CALLed INSERT is visible to a CALLed SELECT" "3   three" "$out"
+out=$(run "CREATE PROCEDURE pdel AS DELETE FROM pbase WHERE id = 2; CALL pdel; SELECT COUNT(*) FROM pbase")
+check "CALL runs a stored DELETE" "2" "$out"
+out=$(run "CREATE PROCEDURE pmk AS CREATE TABLE pgen (x INT); CALL pmk; SELECT * FROM pgen")
+check "a procedure body may be DDL" "0 rows" "$out"
+out=$(run "CREATE PROCEDURE pbad AS SELECT bogus FROM nosuch; CALL pbad")
+check "a failing body errors at CALL time" "unknown table" "$out"
+out=$(run "CREATE PROCEDURE prec AS CALL prec; CALL prec")
+check "runaway recursion is refused" "depth exceeded" "$out"
+out=$(run "CREATE PROCEDURE pbase AS SELECT 1")
+check "a procedure cannot shadow a table name" "already exists" "$out"
+out=$(run "CREATE PROCEDURE psel AS SELECT 2")
+check "a duplicate procedure name is refused" "already exists" "$out"
+out=$(run "CREATE PROCEDURE pbad2 AS")
+check "an empty procedure body is refused" "must be a statement" "$out"
+out=$(run "CALL nosuchproc")
+check "CALL of an unknown procedure is an error" "unknown procedure" "$out"
+out=$(run "SELECT id, n FROM pbase ORDER BY id")
+check "CALL leaves the database usable" "1   one" "$out"
+out=$(run "CALL psel")
+check "procedures survive a restart" "3   three" "$out"
+out=$(run "VACUUM; CALL psel")
+check "procedures survive VACUUM" "1   one" "$out"
+out=$(run "DROP PROCEDURE psel; CALL psel")
+check "DROP PROCEDURE removes the procedure" "unknown procedure" "$out"
+out=$(run "DROP PROCEDURE IF EXISTS psel")
+check_not "DROP PROCEDURE IF EXISTS on a missing procedure" "error" "$out"
+out=$(run "CREATE PROCEDURE pins2 AS INSERT INTO pbase VALUES (4, 'four'); CALL pins2")
+check "a surviving procedure still works" "1 row inserted" "$out"
+
 rm -f "$DD" "$FN"
 
 echo

@@ -26,7 +26,12 @@
 
 /* When non-NULL, exec_select_into copies SELECT results to this capture
  * in addition to printing them (used by the TCP server for JSON output). */
-Capture *g_select_capture = NULL;
+__thread Capture *g_select_capture = NULL;
+
+/* Set-operation ORDER BY support: the comparator resolves ORDER BY
+ * expressions against the merged output columns. */
+static __thread Capture *g_set_cap;
+static __thread Stmt    *g_set_stmt;
 
 /* ---------------------------------------------------------------- join help */
 
@@ -209,6 +214,19 @@ static int collect_aggs(Expr *e, Expr **slots, int *n, int max, char *err)
     return 0;
 }
 
+/* Does the tree contain any aggregate at all? */
+static int expr_has_agg(const Expr *e)
+{
+    if (!e) return 0;
+    if (e->kind == EX_AGG) return 1;
+    if (expr_has_agg(e->l) || expr_has_agg(e->r)) return 1;
+    for (int i = 0; i < e->nitems; i++)
+        if (expr_has_agg(e->items[i])) return 1;
+    for (int i = 0; i < e->nargs; i++)
+        if (expr_has_agg(e->args[i])) return 1;
+    return 0;
+}
+
 /* Is `e` structurally one of the GROUP BY keys? Compared by shape, so
  * "GROUP BY topic" satisfies "SELECT topic" and "GROUP BY LEN(s)" satisfies
  * "SELECT LEN(s)". */
@@ -323,8 +341,8 @@ static void res_free(Res *r)
 }
 
 /* sort context */
-static Res *g_res;
-static Stmt *g_stmt;
+static __thread Res *g_res;
+static __thread Stmt *g_stmt;
 
 static int res_cmp(const void *xa, const void *xb)
 {
@@ -480,8 +498,323 @@ int exec_select(DB *db, Stmt *s, char *err)
     return exec_select_into(db, s, NULL, err);
 }
 
+/* ------------------------------------------------- set operations */
+
+static int exec_select_core(DB *db, Stmt *s, Capture *capture, char *err);
+
+/* Evaluate one ORDER BY expression of a compound query against the output
+ * columns of the merged result: by column name, by position, or by evaluating
+ * the expression against a virtual row of output values. */
+static int set_eval_order(const Expr *e, int rowidx, Value *out, char *err)
+{
+    if (e->kind == EX_COL) {
+        for (int i = 0; i < g_set_cap->ncols; i++)
+            if (strcasecmp(g_set_cap->colnames[i], e->col) == 0) {
+                *out = val_copy(&g_set_cap->cells[rowidx * g_set_cap->ncols + i]);
+                return 0;
+            }
+        snprintf(err, MAX_ERR, "no column '%s' in the set operation result",
+                 e->col);
+        return -1;
+    }
+    if (e->kind == EX_LIT && e->lit.tag == T_INT) {
+        int n = (int)e->lit.i;
+        if (n >= 1 && n <= g_set_cap->ncols) {
+            *out = val_copy(&g_set_cap->cells[rowidx * g_set_cap->ncols + n - 1]);
+            return 0;
+        }
+        snprintf(err, MAX_ERR, "ORDER BY position %d is out of range", n);
+        return -1;
+    }
+    Table vtbl;
+    memset(&vtbl, 0, sizeof vtbl);
+    vtbl.ncols = g_set_cap->ncols;
+    for (int i = 0; i < g_set_cap->ncols && i < MAX_COLS; i++)
+        snprintf(vtbl.cols[i].name, MAX_NAME, "%s", g_set_cap->colnames[i]);
+    Row row;
+    memset(&row, 0, sizeof row);
+    row.ncols = g_set_cap->ncols;
+    for (int i = 0; i < g_set_cap->ncols; i++)
+        row.v[i] = val_copy(&g_set_cap->cells[rowidx * g_set_cap->ncols + i]);
+    int rc = eval_expr(e, &row, &vtbl, mem_now(), out, err);
+    for (int i = 0; i < row.ncols; i++) val_clear(&row.v[i]);
+    return rc;
+}
+
+static int set_cmp(const void *xa, const void *xb)
+{
+    int ia = *(const int *)xa, ib = *(const int *)xb;
+    for (int k = 0; k < g_set_stmt->norder; k++) {
+        char err[MAX_ERR];
+        Value va, vb;
+        if (set_eval_order(g_set_stmt->order[k].e, ia, &va, err) < 0 ||
+            set_eval_order(g_set_stmt->order[k].e, ib, &vb, err) < 0) {
+            return 0;
+        }
+        int ok;
+        int c = val_compare(&va, &vb, &ok);
+        if (ok != 1) c = 0;
+        val_clear(&va);
+        val_clear(&vb);
+        if (c) return g_set_stmt->order[k].desc ? -c : c;
+    }
+    return 0;
+}
+
+static int cap_row_equal(const Capture *a, int i, const Capture *b, int j)
+{
+    for (int c = 0; c < a->ncols; c++) {
+        const Value *x = &a->cells[i * a->ncols + c];
+        const Value *y = &b->cells[j * b->ncols + c];
+        if (x->tag == T_NULL && y->tag == T_NULL) continue;   /* set semantics: NULL = NULL */
+        if (x->tag == T_NULL || y->tag == T_NULL) return 0;
+        int ok;
+        if (val_compare(x, y, &ok) != 0 || !ok) return 0;
+    }
+    return 1;
+}
+
+/* Does row i of `c` appear anywhere in `d`? */
+static int cap_contains(const Capture *c, int i, const Capture *d)
+{
+    for (int j = 0; j < d->nrows; j++)
+        if (cap_row_equal(c, i, d, j)) return 1;
+    return 0;
+}
+
+/* Drop duplicate rows from `c` in place, keeping the first occurrence. */
+static void cap_dedupe(Capture *c)
+{
+    int out = 0;
+    for (int i = 0; i < c->nrows; i++) {
+        int dup = 0;
+        for (int j = 0; j < out; j++)
+            if (cap_row_equal(c, i, c, j)) { dup = 1; break; }
+        if (dup) {
+            for (int k = 0; k < c->ncols; k++) val_clear(&c->cells[i * c->ncols + k]);
+            continue;
+        }
+        if (out != i) {
+            for (int k = 0; k < c->ncols; k++)
+                c->cells[out * c->ncols + k] = c->cells[i * c->ncols + k];
+        }
+        out++;
+    }
+    c->nrows = out;
+}
+
+/* Filter `a` in place: keep rows that appear in `b` when keep=1, or rows that
+ * do not appear in `b` when keep=0. */
+static void cap_filter(Capture *a, const Capture *b, int keep)
+{
+    int out = 0;
+    for (int i = 0; i < a->nrows; i++) {
+        int in_b = cap_contains(a, i, b);
+        if (in_b != keep) {
+            for (int k = 0; k < a->ncols; k++) val_clear(&a->cells[i * a->ncols + k]);
+            continue;
+        }
+        if (out != i) {
+            for (int k = 0; k < a->ncols; k++)
+                a->cells[out * a->ncols + k] = a->cells[i * a->ncols + k];
+        }
+        out++;
+    }
+    a->nrows = out;
+}
+
+/* Merge two operand captures according to the set operator.  The result
+ * replaces `a`; `b` is left untouched (the caller frees it). */
+static void cap_merge(Capture *a, const Capture *b, int op)
+{
+    if (op == SET_UNION_ALL) {
+        for (int i = 0; i < b->nrows; i++)
+            capture_push(a, &b->cells[i * b->ncols], b->ncols);
+        return;
+    }
+    if (op == SET_UNION) {
+        for (int i = 0; i < b->nrows; i++)
+            if (!cap_contains(b, i, a))
+                capture_push(a, &b->cells[i * b->ncols], b->ncols);
+        cap_dedupe(a);
+        return;
+    }
+    if (op == SET_INTERSECT) {
+        cap_filter(a, b, 1);
+        cap_dedupe(a);
+        return;
+    }
+    cap_filter(a, b, 0);   /* EXCEPT */
+    cap_dedupe(a);
+}
+
+/* Execute a compound SELECT (UNION/INTERSECT/EXCEPT) into `capture` or the
+ * printer.  `s` is the leftmost operand, carrying set_op/set_rhs plus any
+ * trailing ORDER BY / LIMIT / OFFSET that bind to the whole result. */
+static int exec_set_op(DB *db, Stmt *s, Capture *capture, char *err)
+{
+    /* Flatten the operator chain: operand[i] hangs off operand[i-1] via
+     * set_rhs, and operand[i]->set_op is the operator that follows it.  The
+     * chain is reduced left to right, so a UNION b INTERSECT c means
+     * (a UNION b) INTERSECT c. */
+    Stmt *operands[65];
+    int   opcodes[64];
+    int   n = 0;
+    operands[0] = s;
+    for (Stmt *p = s; p->set_op; p = p->set_rhs) {
+        if (n >= 64) {
+            snprintf(err, MAX_ERR, "too many set operations in one query");
+            return -1;
+        }
+        opcodes[n] = p->set_op;
+        operands[n + 1] = p->set_rhs;
+        n++;
+        if (!p->set_rhs) {
+            snprintf(err, MAX_ERR, "malformed set operation chain");
+            return -1;
+        }
+    }
+
+    Capture a;
+    memset(&a, 0, sizeof a);
+    /* The root statement is both an operand and the holder of the trailing
+     * ORDER BY / LIMIT / OFFSET that apply to the compound result.  Those
+     * must not be applied to the operand itself, so they are suspended for
+     * the duration of its evaluation. */
+    int save_limit = s->limit, save_offset = s->offset, save_norder = s->norder;
+    s->limit = -1;
+    s->offset = 0;
+    s->norder = 0;
+    int rc = exec_select_core(db, operands[0], &a, err);
+    s->limit = save_limit;
+    s->offset = save_offset;
+    s->norder = save_norder;
+    if (rc < 0) return -1;
+
+    for (int i = 0; i < n; i++) {
+        Capture b;
+        memset(&b, 0, sizeof b);
+        if (exec_select_core(db, operands[i + 1], &b, err) < 0) {
+            capture_free(&a);
+            return -1;
+        }
+        if (a.ncols != b.ncols) {
+            snprintf(err, MAX_ERR,
+                     "the two sides of a set operation return different "
+                     "numbers of columns (%d vs %d)", a.ncols, b.ncols);
+            capture_free(&a);
+            capture_free(&b);
+            return -1;
+        }
+        cap_merge(&a, &b, opcodes[i]);
+        capture_free(&b);
+    }
+
+    /* ORDER BY over the merged result: expressions are resolved against the
+     * output columns (by name), the way SQL defines compound ordering. */
+    if (s->norder && a.nrows > 1) {
+        int *order = malloc(sizeof(int) * (size_t)a.nrows);
+        if (!order) { capture_free(&a); snprintf(err, MAX_ERR, "out of memory"); return -1; }
+        for (int i = 0; i < a.nrows; i++) order[i] = i;
+        for (int k = 0; k < s->norder; k++) {
+            if (expr_has_agg(s->order[k].e)) {
+                free(order);
+                capture_free(&a);
+                snprintf(err, MAX_ERR,
+                         "aggregates are not allowed in ORDER BY of a set "
+                         "operation");
+                return -1;
+            }
+        }
+        g_set_cap = &a;
+        g_set_stmt = s;
+        qsort(order, (size_t)a.nrows, sizeof(int), set_cmp);
+        g_set_cap = NULL;
+        /* apply the permutation in place */
+        Value *tmp = malloc(sizeof(Value) * (size_t)a.ncols);
+        if (!tmp) { free(order); capture_free(&a); snprintf(err, MAX_ERR, "out of memory"); return -1; }
+        for (int i = 0; i < a.nrows; i++) {
+            while (order[i] != i) {
+                int j = order[i];
+                for (int c = 0; c < a.ncols; c++) {
+                    Value t = a.cells[i * a.ncols + c];
+                    a.cells[i * a.ncols + c] = a.cells[j * a.ncols + c];
+                    a.cells[j * a.ncols + c] = t;
+                }
+                int oi = order[i];
+                order[i] = order[j];
+                order[j] = oi;
+            }
+        }
+        free(tmp);
+        free(order);
+    }
+
+    /* LIMIT / OFFSET window over the ordered result */
+    int lo = s->offset > 0 ? s->offset : 0;
+    if (lo > a.nrows) lo = a.nrows;
+    int hi = a.nrows;
+    if (s->limit >= 0 && lo + s->limit < hi) hi = lo + s->limit;
+
+    if (capture) {
+        capture->ncols = a.ncols;
+        for (int c = 0; c < a.ncols && c < MAX_OUT_COLS; c++)
+            snprintf(capture->colnames[c], MAX_NAME, "%s", a.colnames[c]);
+        for (int i = lo; i < hi; i++)
+            if (capture_push(capture, &a.cells[i * a.ncols], a.ncols) < 0) {
+                capture_free(&a);
+                snprintf(err, MAX_ERR, "out of memory");
+                return -1;
+            }
+        capture_free(&a);
+        return 0;
+    }
+
+    /* print */
+    Grid g = {0};
+    grid_init(&g, a.ncols);
+    for (int c = 0; c < a.ncols; c++)
+        snprintf(g.head[c], MAX_NAME, "%s", a.colnames[c]);
+    for (int i = lo; i < hi; i++) {
+        char *cells[MAX_OUT_COLS];
+        for (int c = 0; c < a.ncols; c++) {
+            char buf[512];
+            val_format(&a.cells[i * a.ncols + c], buf, sizeof buf);
+            cells[c] = strdup(buf);
+        }
+        grid_row(&g, cells);
+    }
+    if (g.nrows) grid_print(&g);
+    printf("\n(%d row%s)\n", g.nrows, g.nrows == 1 ? "" : "s");
+
+    if (g_select_capture) {
+        g_select_capture->ncols = g.ncols;
+        for (int c = 0; c < g.ncols; c++)
+            snprintf(g_select_capture->colnames[c], MAX_NAME, "%s", g.head[c]);
+        for (int r = 0; r < g.nrows; r++) {
+            Value row[MAX_OUT_COLS];
+            for (int c = 0; c < g.ncols; c++)
+                row[c] = g.cells[r * g.ncols + c]
+                             ? val_text(g.cells[r * g.ncols + c])
+                             : val_null();
+            capture_push(g_select_capture, row, g.ncols);
+            for (int c = 0; c < g.ncols; c++) val_clear(&row[c]);
+        }
+    }
+    grid_free(&g);
+    capture_free(&a);
+    return 0;
+}
+
 /* Full SELECT pipeline; optionally capture rows into cap instead of printing. */
 int exec_select_into(DB *db, Stmt *s, Capture *capture, char *err)
+{
+    if (s->set_op)
+        return exec_set_op(db, s, capture, err);
+    return exec_select_core(db, s, capture, err);
+}
+
+static int exec_select_core(DB *db, Stmt *s, Capture *capture, char *err)
 {
     g_db = db;
     int64_t now = mem_now();
@@ -489,7 +822,25 @@ int exec_select_into(DB *db, Stmt *s, Capture *capture, char *err)
 
     if (s->has_from && !s->derived) {
         t = cat_find(db, s->table);
-        if (!t) { snprintf(err, MAX_ERR, "unknown table '%s'", s->table); return -1; }
+        if (!t) {
+            /* a stored view expands to its SELECT body as a derived table */
+            View *v = cat_find_view(db, s->table);
+            if (v) {
+                Stmt *vs = calloc(1, sizeof(Stmt));
+                if (!vs) { snprintf(err, MAX_ERR, "out of memory"); return -1; }
+                if (parse_view_sql(v->sql, vs, err) < 0) {
+                    char verr[MAX_ERR];
+                    snprintf(verr, sizeof verr, "%s", err);
+                    free(vs);
+                    snprintf(err, MAX_ERR, "view '%s': %s", s->table, verr);
+                    return -1;
+                }
+                s->derived = vs;
+            } else {
+                snprintf(err, MAX_ERR, "unknown table '%s'", s->table);
+                return -1;
+            }
+        }
     }
 
     /* ---- collect join tables (if any) */
@@ -786,11 +1137,8 @@ int exec_select_into(DB *db, Stmt *s, Capture *capture, char *err)
             scan_init(&psc1, db, t);
 
             while (scan_next(&psc1, &pr1)) {
-                int where_ok;
-                if (row_matches(s->where, &pr1, t, now, &where_ok, err) < 0) {
-                    row_clear(&pr1); res_free(&res); return -1;
-                }
-                if (!where_ok) { row_clear(&pr1); continue; }
+                /* WHERE is applied per joined row below, so it can reference
+                 * columns from either side of the join */
 
                 /* LEFT JOIN: always get at least one row per left row */
                 int any_match = 0;
@@ -807,6 +1155,15 @@ int exec_select_into(DB *db, Stmt *s, Capture *capture, char *err)
                         row_clear(&jr1); row_clear(&pr1); res_free(&res); return -1;
                     }
                     if (!on_ok) { row_clear(&jr1); continue; }
+
+                    /* WHERE applies to the joined row, so joined columns can
+                     * be referenced in it */
+                    int w_ok;
+                    if (row_matches_join(s->where, jtabs, jrows, alias_ptrs, 2,
+                                         now, &w_ok, err) < 0) {
+                        row_clear(&jr1); row_clear(&pr1); res_free(&res); return -1;
+                    }
+                    if (!w_ok) { row_clear(&jr1); continue; }
                     any_match = 1;
 
                     /* Feed join result into aggregates */
@@ -845,6 +1202,13 @@ int exec_select_into(DB *db, Stmt *s, Capture *capture, char *err)
                     memset(&null_r, 0, sizeof null_r);
                     null_r.ncols = join_tabs[1].table->ncols;
                     const Table *jtabs[2] = { t, join_tabs[1].table };
+                    const Row *jrows[2] = { &pr1, &null_r };
+                    int w_ok;
+                    if (row_matches_join(s->where, jtabs, jrows, alias_ptrs, 2,
+                                         now, &w_ok, err) < 0) {
+                        row_clear(&pr1); res_free(&res); return -1;
+                    }
+                    if (!w_ok) { row_clear(&pr1); continue; }
                     const Row *eval_rows[2] = { &pr1, &null_r };
                     exec_set_join_ctx(jtabs, eval_rows, alias_ptrs, 2);
                     for (int ai = 0; ai < naggs; ai++) {
@@ -910,12 +1274,8 @@ int exec_select_into(DB *db, Stmt *s, Capture *capture, char *err)
         scan_init(&psc, db, t);
 
         while (scan_next(&psc, &pr)) {
-            int where_ok;
-            if (row_matches(s->where, &pr, t, now, &where_ok, err) < 0) {
-                row_clear(&pr); res_free(&res); goto join_cleanup;
-            }
-            if (!where_ok) { row_clear(&pr); continue; }
-
+            /* WHERE is applied per joined row below, so it can reference
+             * columns from either side of the join */
             join_tabs[0].row = pr;
             join_tabs[0].matched = 0;
 
@@ -929,6 +1289,8 @@ int exec_select_into(DB *db, Stmt *s, Capture *capture, char *err)
             /* Scan the first joined table */
             Row jr;
             Scan *js = &jsc[1];
+            /* restart the join scan for every outer row */
+            scan_init(js, db, join_tabs[1].table);
             int any_match = 0;
 
             while (scan_next(js, &jr)) {
@@ -944,6 +1306,17 @@ int exec_select_into(DB *db, Stmt *s, Capture *capture, char *err)
                     row_clear(&jr); row_clear(&pr); res_free(&res); goto join_cleanup;
                 }
                 if (!on_ok) { row_clear(&jr); continue; }
+
+                const Row *w_rows[2] = { &pr, &jr };
+                {
+                    int w_ok;
+                    if (row_matches_join(s->where, jtabs, w_rows, alias_ptrs, 2,
+                                         now, &w_ok, err) < 0) {
+                        row_clear(&jr); row_clear(&pr); res_free(&res);
+                        goto join_cleanup;
+                    }
+                    if (!w_ok) { row_clear(&jr); continue; }
+                }
 
                 any_match = 1;
                 join_tabs[1].matched = 1;
@@ -986,14 +1359,29 @@ int exec_select_into(DB *db, Stmt *s, Capture *capture, char *err)
 
             /* LEFT JOIN: emit left row with NULLs for right side */
             if (s->joins[0].type == JOIN_LEFT && !any_match) {
+                Row null_r;
+                memset(&null_r, 0, sizeof null_r);
+                null_r.ncols = join_tabs[1].table->ncols;
+                {
+                    int w_ok;
+                    const Table *w_tabs[2] = { t, join_tabs[1].table };
+                    const Row *w_rows[2] = { &pr, &null_r };
+                    if (row_matches_join(s->where, w_tabs, w_rows, alias_ptrs, 2,
+                                         now, &w_ok, err) < 0) {
+                        row_clear(&pr); res_free(&res); goto join_cleanup;
+                    }
+                    if (!w_ok) { row_clear(&pr); continue; }
+                }
                 if (res_grow(&res) < 0) {
                     row_clear(&pr); res_free(&res);
                     snprintf(err, MAX_ERR, "out of memory");
                     goto join_cleanup;
                 }
-                Row null_r;
-                memset(&null_r, 0, sizeof null_r);
-                null_r.ncols = join_tabs[1].table->ncols;
+                {
+                    const Table *e_tabs[2] = { t, join_tabs[1].table };
+                    const Row *e_rows[2] = { &pr, &null_r };
+                    exec_set_join_ctx(e_tabs, e_rows, alias_ptrs, 2);
+                }
                 for (int c = 0; c < ncols; c++) {
                     Value *dst = &res.cells[res.nrows * ncols + c];
                     if (exprs[c]) {
@@ -1332,11 +1720,20 @@ emit_grouped:
         qsort(order, (size_t)res.nrows, sizeof(int), res_cmp);
     }
 
-    int limit = (s->top >= 0 && s->top < res.nrows) ? s->top : res.nrows;
+    /* ---- the row window: TOP n, LIMIT n and OFFSET m all cut the ordered
+     * rows; TOP and LIMIT cap the count, OFFSET skips leading rows */
+    int lo = s->offset > 0 ? s->offset : 0;
+    if (lo > res.nrows) lo = res.nrows;
+    int hi = res.nrows;
+    if (s->top >= 0 && lo + s->top < hi) hi = lo + s->top;
+    if (s->limit >= 0 && lo + s->limit < hi) hi = lo + s->limit;
 
     /* ---- hand the rows to the caller instead of printing, if asked */
     if (capture) {
-        for (int i = 0; i < limit; i++) {
+        capture->ncols = ncols;
+        for (int i = 0; i < ncols && i < MAX_OUT_COLS; i++)
+            snprintf(capture->colnames[i], MAX_NAME, "%s", heads[i]);
+        for (int i = lo; i < hi; i++) {
             if (capture_push(capture, &res.cells[order[i] * ncols], ncols) < 0) {
                 free(order);
                 res_free(&res);
@@ -1345,7 +1742,7 @@ emit_grouped:
             }
         }
         if (!grouped && s->has_from && exec_reinforce_enabled()) {
-            for (int i = 0; i < limit; i++)
+            for (int i = lo; i < hi; i++)
                 mem_touch(db, t, res.refs[order[i]], MEM_BOOST);
         }
         free(order);
@@ -1358,7 +1755,7 @@ emit_grouped:
     grid_init(&g, ncols);
     for (int c = 0; c < ncols; c++) snprintf(g.head[c], MAX_NAME, "%s", heads[c]);
 
-    for (int i = 0; i < limit; i++) {
+    for (int i = lo; i < hi; i++) {
         char *cells[MAX_OUT_COLS];
         int src = order[i];
         for (int c = 0; c < ncols; c++) {
@@ -1401,7 +1798,7 @@ emit_grouped:
     if (!grouped && s->has_from && exec_reinforce_enabled()) {
         uint64_t rids[MEM_COACT_MAX];
         int nr = 0;
-        for (int i = 0; i < limit; i++) {
+        for (int i = lo; i < hi; i++) {
             int src = order[i];
             if (t) mem_touch(db, t, res.refs[src], MEM_BOOST);
             if (nr < MEM_COACT_MAX) rids[nr++] = res.rids[src];

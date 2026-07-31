@@ -68,25 +68,68 @@ TTL tracking survive, so clients can reconnect with the same session token.
 
 ## 6. Execution is serialised
 
-All client requests share a single `DB` handle behind `exec_lock`. Statements
-from different clients never execute concurrently. This is safe but limits
-throughput on multi-core machines.
+**Status: fixed.** Since July 2026 the server uses a reader-writer lock
+instead of a plain mutex. Read-only statements (`SELECT`, `RECALL`, `SHOW`,
+`PRINT`, `EXPLAIN`) run concurrently under the read side of the lock; write
+statements and whole transactions (BEGIN..COMMIT) take the write side.
 
-**To fix:** Make `DB` re-entrant or use a reader-writer lock so that read-only
-queries (`SELECT`, `RECALL`, `SHOW`) can run in parallel while writes
-(`INSERT`, `UPDATE`, `DELETE`, DDL) exclude readers. This requires auditing
-every global and static variable in the executor for thread safety.
+Two details make this safe:
 
-## 7. Single process
+- **Deferred reinforcement.** A plain `SELECT` normally writes strength /
+  access metadata. While a read statement runs, `mem_touch()` and
+  `mem_associate()` only record what happened (per-thread pending buffers);
+  after the statement the server re-acquires the write lock and applies the
+  touches via `mem_flush_pending()`. Row identity is verified before a
+  deferred touch is applied, so a row deleted while the reader was waiting
+  is not reinforced.
+- **Thread-local executor state.** Every mutable global in the execution
+  path (`g_output_file`, `g_select_capture`, `g_reinforce`, aggregate/join/
+  correlation/sort contexts, parser star-column state) is now
+  `__thread`. Statement text output is captured through a per-thread
+  `tmpfile()` instead of a process-wide `dup2()` of stdout.
 
-`db_open()` acquires an advisory exclusive lock via `flock()`. A second process
-gets a clear error. Only one `nexdb` process at a time can open a given
-database file. The server accepts up to 64 concurrent clients, but they all
-share the same process.
+Transactions are still fully serialised (SQLite-style write lock held from
+BEGIN until COMMIT/ROLLBACK), and writes are excluded while readers run. All
+engine code remains single-threaded per statement; only the server layer
+coordinates the lock. Shutdown signals are handled by a dedicated `sigwait()`
+thread plus a self-pipe that wakes the accept loop, avoiding macOS's
+unreliable signal routing to multi-threaded processes.
 
-**To fix:** Replace `flock()` with a listening daemon that proxies requests
-to worker processes, or use POSIX shared memory + semaphores for multi-process
-concurrency. This is a major architectural change.
+## 7. Single process — FIXED (PostgreSQL-style daemon routing)
+
+~~`db_open()` acquires an advisory exclusive lock via `flock()`. A second
+process gets a clear error. Only one `nexdb` process at a time can open a
+given database file. The server accepts up to 64 concurrent clients, but they
+all share the same process.~~
+
+~~**To fix:** Replace `flock()` with a listening daemon that proxies requests
+to worker processes, or use POSIX shared memory + semaphores for
+multi-process concurrency. This is a major architectural change.~~
+
+Fixed (July 2026), PostgreSQL-style: the server is the only process that ever
+opens the data file; every other `nexdb` process is a client.
+
+- `nexdb serve <db>` now always creates a per-database unix socket at
+  `<db>.sock` (derived deterministically from the database path), in addition
+  to any `--unix PATH`.
+- When the CLI finds the file locked by another process (the `flock()`
+  failure in `db_open()`), it automatically connects to `<db>.sock` and
+  routes the request through the running server:
+  - `-c "<sql>"` and `-f <script>` are sent as one batch via
+    `server_proxy_exec()` and print the same output as a local run;
+  - the interactive prompt becomes a remote REPL over the socket (shell
+    commands like `.read` and `.tables` are not available in that mode);
+  - `--token STR` authenticates when the server runs with a token;
+  - `-r` (observer mode) is forwarded per request (`"observe":"0"`), so a
+    routed query still does not reinforce memory.
+- `flock()` remains in place as the ownership test — it never needs to be
+  held across processes, only to detect "someone else owns this file".
+- Remaining gaps: two `nexdb serve` invocations on the same database still
+  conflict (the second exits with the flock error, like PostgreSQL's
+  "already in use"); the interactive proxy REPL does not support shell
+  commands; clients must use the same database path string as the server for
+  auto-routing to find the socket (a different relative/absolute spelling of
+  the same file will not match `<db>.sock`).
 
 ## 8. Hard limits
 
@@ -124,20 +167,23 @@ implications:
 
 ## 9. Other gaps
 
-- **JOIN with GROUP BY on multiple joins** may have uncovered edge cases — the
-  nested-loop executor handles one join at a time.
-- **`ALTER COLUMN TYPE`** can widen a type (e.g. `INT` → `BIGINT`) but cannot
-  narrow it (e.g. `BIGINT` → `INT`) if existing values overflow.
-- **`INSERT ... SELECT`** does not support `TOP`, `ORDER BY`, or aggregates
-  in the subquery (these are evaluated per-row during the insert scan, not
-  materialised first).
-- **No `LIMIT` / `OFFSET`** — T-SQL `TOP` is the only pagination mechanism.
-- **No `UNION` / `INTERSECT` / `EXCEPT`** — set operations are not parsed.
-- **No `FOREIGN KEY`** — referential integrity is not tracked.
-- **No `CHECK` constraints** — arbitrary predicates per column are not stored.
-- **No `VIEW`** — stored queries are not supported.
+- **`GROUP BY` with `JOIN`** and **multiple `JOIN`s in one query** are refused
+  at execution; the nested-loop executor handles exactly one join at a time.
+  `WHERE` on either side of the join works, including with aggregates.
+- **`ALTER COLUMN TYPE`** can narrow a type only when every existing value
+  fits the new type; widening always works.
+- **`FOREIGN KEY`** supports `ON DELETE NO ACTION` (default) and `ON DELETE
+  CASCADE`; `ON UPDATE` is not supported, and cascades do not recurse through
+  grandchildren.
+- **Views** expand to their stored `SELECT` at query time; they cannot be used
+  as a `JOIN` operand, and outer queries over a view (or any derived table)
+  cannot use aggregates or `GROUP BY`.
 - **No `TRIGGER`** — event-driven logic is not supported.
-- **No stored procedures** — procedural SQL is not parsed.
+- **Stored procedures** hold exactly one statement (any statement, including
+  DDL and other `CALL`s). There are no parameters, variables, or control-flow
+  keywords; `BEGIN ... END` bodies are not supported — statement separators
+  end the procedure body, so multi-statement bodies are impossible by
+  construction. Procedure and table/view names share one namespace.
 - **Full-text search** is limited to the RECALL engine; no inverted index or
   tokenizer with stop-word removal exists.
 - **`VACUUM`** requires free disk space equal to the current database size

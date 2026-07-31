@@ -130,6 +130,9 @@ typedef struct {
     uint8_t  identity;     /* IDENTITY(seed, step)                        */
     int64_t  id_next;
     int64_t  id_step;
+    char     refs_table[MAX_NAME];   /* REFERENCES table, "" = none         */
+    char     refs_col[MAX_NAME];     /* REFERENCES table(col)               */
+    uint8_t  on_delete;      /* FK_NO_ACTION / FK_CASCADE (column-level)     */
 } Column;
 
 int         int_range(uint8_t sub, int64_t *lo, int64_t *hi);
@@ -144,6 +147,21 @@ typedef struct {
     uint8_t  _pad[2];
 } Index;
 
+#define MAX_FKS      8
+#define MAX_FK_COLS  8
+#define FK_NO_ACTION 0
+#define FK_CASCADE   1
+
+/* A stored foreign key: the local columns (cols[]) reference table `table`'s
+ * columns (refs[]), one pair per entry. */
+typedef struct {
+    char     table[MAX_NAME];
+    char     cols[MAX_FK_COLS][MAX_NAME];
+    char     refs[MAX_FK_COLS][MAX_NAME];
+    int      ncols;
+    uint8_t  on_delete;       /* FK_NO_ACTION / FK_CASCADE */
+} FK;
+
 typedef struct {
     char     name[MAX_NAME];
     int32_t  ncols;
@@ -153,11 +171,38 @@ typedef struct {
     int64_t  nrows;
     int32_t  nindexes;
     Index    indexes[MAX_INDEXES];
+    char     check[512];      /* CHECK constraint predicate, "" = none */
+    int32_t  nfks;
+    FK       fks[MAX_FKS];
 } Table;
+
+#define MAX_VIEWS    16
+#define MAX_VIEW_SQL 8192
+
+/* A stored view: the SELECT text, re-parsed and expanded as a derived table
+ * each time the view is referenced. */
+typedef struct {
+    char name[MAX_NAME];
+    char sql[MAX_VIEW_SQL];
+} View;
+
+#define MAX_PROCS    16
+#define MAX_PROC_SQL 8192
+
+/* A stored procedure: one SQL statement kept as text, re-parsed and executed
+ * each time the procedure is CALLed. */
+typedef struct {
+    char name[MAX_NAME];
+    char sql[MAX_PROC_SQL];
+} Proc;
 
 typedef struct {
     int32_t ntables;
     Table   tables[MAX_TABLES];
+    int32_t nviews;
+    View    views[MAX_VIEWS];
+    int32_t nprocs;
+    Proc    procs[MAX_PROCS];
 } Catalog;
 
 /* ----------------------------------------------------------------- links */
@@ -240,6 +285,8 @@ int      db_vacuum(DB *db, char *err);
 Table *cat_find(DB *db, const char *name);
 Table *cat_create(DB *db, const char *name, const Column *cols, int ncols);
 int    cat_drop(DB *db, const char *name);
+View  *cat_find_view(DB *db, const char *name);
+Proc  *cat_find_proc(DB *db, const char *name);
 int    table_col_index(const Table *t, const char *name);
 
 /* heap access */
@@ -267,6 +314,12 @@ double  mem_strength_at(double stored, int64_t last_access, int64_t now);
 double  mem_row_strength(const Row *r, int64_t now);
 int     mem_touch(DB *db, Table *t, RowRef ref, double boost);
 void    mem_associate(DB *db, const uint64_t *rids, int n, double boost);
+/* Deferred reinforcement: while defer is on, mem_touch/mem_associate record
+ * pending touches instead of writing; mem_flush_pending applies them.  The
+ * TCP server uses this so parallel read-only statements never write pages;
+ * the pending reinforcement is applied afterwards under a write lock. */
+void    mem_set_defer(int on);
+void    mem_flush_pending(DB *db);
 int     mem_neighbors(DB *db, uint64_t rid, uint64_t *out_rid, float *out_w, int max);
 int     links_flush(DB *db);
 int     links_load(DB *db);
@@ -412,6 +465,10 @@ struct Expr {
 
 void expr_free(Expr *e);
 
+/* Parse a standalone expression from text (used to evaluate CHECK
+ * constraints stored in the catalog).  Returns NULL on error. */
+Expr *parse_expr_text(const char *sql, char *err);
+
 /* A select-list entry is either '*' or an arbitrary expression. */
 typedef struct {
     int   is_star;
@@ -452,7 +509,12 @@ typedef struct {
 typedef enum {
     ST_NOOP = 0,
     ST_CREATE,
+    ST_CREATE_VIEW,
+    ST_CREATE_PROC,
     ST_DROP,
+    ST_DROP_VIEW,
+    ST_DROP_PROC,
+    ST_CALL,
     ST_ALTER_ADD,
     ST_ALTER_DROP,
     ST_ALTER_RENAME,
@@ -476,6 +538,14 @@ typedef enum {
     ST_EXPLAIN,
     ST_VACUUM
 } StKind;
+
+/* Compound SELECT operators (Stmt::set_op) */
+enum {
+    SET_UNION = 1,
+    SET_UNION_ALL,
+    SET_INTERSECT,
+    SET_EXCEPT
+};
 
 typedef struct Stmt {
     StKind kind;
@@ -508,6 +578,10 @@ typedef struct Stmt {
     struct Stmt *sub;         /* INSERT INTO ... SELECT */
     struct Stmt *derived;     /* FROM (SELECT ...) derived table */
     int      top;             /* -1 = unlimited */
+    int      limit;           /* LIMIT n, -1 = unlimited */
+    int      offset;          /* OFFSET m, 0 = from the first row */
+    struct Stmt *set_rhs;     /* right operand of UNION/INTERSECT/EXCEPT */
+    int      set_op;          /* SET_*, 0 = not a set operation */
     Join     joins[MAX_JOINS];
     int      njoins;
     /* sized to match the lexer's literal limit, so a RECALL phrase can never
@@ -520,16 +594,34 @@ typedef struct Stmt {
 
     /* PRINT */
     char msg[512];
+
+    /* CREATE TABLE CHECK constraint predicate (column- and table-level
+     * constraints combined with AND), "" = none */
+    char check[512];
+
+    /* CREATE VIEW: the stored SELECT body (also used to parse a view back
+     * into a statement at query time) */
+    char view_sql[MAX_VIEW_SQL];
+
+    /* CREATE PROCEDURE: the stored statement body, re-parsed and executed
+     * each time the procedure is CALLed */
+    char proc_sql[MAX_PROC_SQL];
+
+    /* CREATE TABLE FOREIGN KEY constraints (table-level) */
+    FK   fks[MAX_FKS];
+    int  nfks;
 } Stmt;
 
 void stmt_free(Stmt *s);
 
 /* parser.c */
 int parse_stmt(Lexer *lx, Stmt *out, char *err);   /* 1 = stmt, 0 = end, -1 = error */
+int parse_view_sql(const char *sql, Stmt *out, char *err);
+int parse_proc_sql(const char *sql, Stmt *out, char *err);
 
 /* When non-NULL, all statement output goes here instead of stdout.
  * Used by the TCP server to capture query results as text. */
-extern FILE *g_output_file;
+extern __thread FILE *g_output_file;
 
 /* exec.c */
 int exec_stmt(DB *db, Stmt *s, char *err);
@@ -575,7 +667,7 @@ typedef struct {
 int  exec_select(DB *db, Stmt *s, char *err);
 int  exec_select_into(DB *db, Stmt *s, Capture *cap, char *err);
 void capture_free(Capture *c);
-extern Capture *g_select_capture;
+extern __thread Capture *g_select_capture;
 
 /* func.c */
 int func_exists(const char *name);
