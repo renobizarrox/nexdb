@@ -188,12 +188,19 @@ typedef struct {
 
 #define MAX_PROCS    16
 #define MAX_PROC_SQL 8192
+#define MAX_PROG_STMTS 256
 
-/* A stored procedure: one SQL statement kept as text, re-parsed and executed
- * each time the procedure is CALLed. */
+typedef struct Program Program;   /* forward decl; see the full definition below */
+
+/* A stored procedure: the body kept as text, parsed lazily into cache (an
+ * in-memory Program) on the first CALL after a load. params holds the
+ * parameter list verbatim, with parentheses, e.g. "(@a INT, @b NVARCHAR(10))";
+ * "" = no parameters. */
 typedef struct {
     char name[MAX_NAME];
     char sql[MAX_PROC_SQL];
+    char params[MAX_PROC_SQL];
+    Program *cache;
 } Proc;
 
 typedef struct {
@@ -420,7 +427,8 @@ typedef enum {
     EX_AGG,       /* COUNT/SUM/AVG/MIN/MAX       */
     EX_SUBQUERY,  /* (SELECT ...) subquery       */
     EX_ANY,       /* = ANY / > ALL (subquery)    */
-    EX_ALL        /* = ALL / > ALL (subquery)    */
+    EX_ALL,       /* = ALL / > ALL (subquery)    */
+    EX_VAR        /* @name — stored-procedure variable */
 } ExprKind;
 
 #define MAX_FUNC_ARGS  16
@@ -536,7 +544,22 @@ typedef enum {
     ST_COMMIT,
     ST_ROLLBACK,
     ST_EXPLAIN,
-    ST_VACUUM
+    ST_VACUUM,
+    ST_IF,
+    ST_WHILE,
+    ST_BLOCK,
+    ST_BREAK,
+    ST_CONTINUE,
+    ST_RETURN,
+    ST_DECLARE,
+    ST_SET,
+    ST_DECLARE_CURSOR,
+    ST_OPEN,
+    ST_FETCH,
+    ST_CLOSE,
+    ST_DEALLOCATE,
+    ST_TRY,
+    ST_EXEC_SQL
 } StKind;
 
 /* Compound SELECT operators (Stmt::set_op) */
@@ -604,8 +627,38 @@ typedef struct Stmt {
     char view_sql[MAX_VIEW_SQL];
 
     /* CREATE PROCEDURE: the stored statement body, re-parsed and executed
-     * each time the procedure is CALLed */
+     * each time the procedure is CALLed; param_sql is the verbatim parameter
+     * list (with parentheses), "" = none */
     char proc_sql[MAX_PROC_SQL];
+    char param_sql[MAX_PROC_SQL];
+
+    /* CALL / EXEC: arguments (evaluated in the caller's variable frame).
+     * argnames[i] is set for a named argument (@name = expr), "" for a
+     * positional one; argout[i] marks a variable argument passed OUTPUT. */
+    Expr *args[MAX_FUNC_ARGS];
+    int   nargs;
+    char  argnames[MAX_FUNC_ARGS][MAX_NAME];
+    char  argout[MAX_FUNC_ARGS];
+    /* EXEC @rc = proc: variable receiving the procedure's return code */
+    char  retvar[MAX_NAME];
+
+    /* procedure control flow:
+     *  ST_IF:    where = condition; stmts = then-branch; else_stmts = else
+     *  ST_WHILE: where = condition; stmts = loop body
+     *  ST_BLOCK: stmts = the statement list
+     *  ST_DECLARE / ST_SET: sets[0].col = @name; ST_DECLARE cols[0] = type,
+     *  sets[0].val = optional initializer; ST_SET sets[0].val = expression
+     *  ST_RETURN: sets[0].val = optional expression
+     *  ST_DECLARE_CURSOR: table = cursor name; derived = the SELECT
+     *  ST_FETCH: table = cursor name; ins_cols[] = target variables
+     *  ST_OPEN / ST_CLOSE / ST_DEALLOCATE: table = cursor name
+     *  ST_TRY: stmts = protected block, else_stmts = CATCH block; the caught
+     *  error message is exposed as the variable @@error_message
+     *  ST_EXEC_SQL: sets[0].val = dynamic SQL string expression */
+    struct Stmt **stmts;
+    int    nstmts;
+    struct Stmt **else_stmts;
+    int    n_else;
 
     /* CREATE TABLE FOREIGN KEY constraints (table-level) */
     FK   fks[MAX_FKS];
@@ -614,10 +667,21 @@ typedef struct Stmt {
 
 void stmt_free(Stmt *s);
 
+/* A parsed procedure body: the top-level statement list. All statements in a
+ * program are heap-allocated; prog_free() releases the whole thing. */
+struct Program {
+    struct Stmt **stmts;
+    int nstmts;
+};
+
+void prog_free(Program *p);
+
 /* parser.c */
 int parse_stmt(Lexer *lx, Stmt *out, char *err);   /* 1 = stmt, 0 = end, -1 = error */
 int parse_view_sql(const char *sql, Stmt *out, char *err);
-int parse_proc_sql(const char *sql, Stmt *out, char *err);
+int parse_program(const char *sql, Program *pgm, char *err);
+int proc_parse_params(const char *text, char names[][MAX_NAME],
+                      Expr *defs[], int max, int *n, char *err);
 
 /* When non-NULL, all statement output goes here instead of stdout.
  * Used by the TCP server to capture query results as text. */
@@ -668,6 +732,10 @@ int  exec_select(DB *db, Stmt *s, char *err);
 int  exec_select_into(DB *db, Stmt *s, Capture *cap, char *err);
 void capture_free(Capture *c);
 extern __thread Capture *g_select_capture;
+/* When non-NULL, the next SELECT executed (usually from inside a CALLed
+ * procedure) hands its rows to this capture instead of printing them; the
+ * pending slot is consumed by the first SELECT, like INSERT ... EXEC. */
+extern __thread Capture *g_pending_capture;
 
 /* func.c */
 int func_exists(const char *name);

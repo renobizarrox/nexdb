@@ -63,9 +63,114 @@ static int pseudo_col(const char *name)
 static __thread const Value *g_agg_values = NULL;
 static __thread int          g_agg_count  = 0;
 
-/* Stored-procedure CALL nesting depth (bodies may CALL other procedures). */
-#define MAX_PROC_DEPTH 32
+/* Stored-procedure CALL nesting depth (bodies may CALL other procedures, and
+ * EXEC ('...') counts as a level so self-referential dynamic SQL is capped). */
+#define MAX_PROC_DEPTH 128
 static __thread int g_proc_depth = 0;
+
+/* Return code of the innermost finished CALL, written by RETURN <expr> and
+ * read by "EXEC @rc = proc" (ST_CALL retvar). */
+static __thread int g_proc_retval = 0;
+
+/* -------------------------------------------------------- procedure state */
+
+#define MAX_VARS    64
+#define MAX_CURSORS 16
+
+/* Variable frame: parameters first (in declaration order), then variables
+ * created by DECLARE as they are first executed, then any that a FETCH or
+ * DECLARE adds later. Slot 0 is always @@fetch_status, written by FETCH.
+ * Variables are block-scoped: each BEGIN ... END pushes a scope, and the
+ * variables declared inside it are removed when it closes. */
+typedef struct {
+    char  name[MAX_NAME];
+    Value v;
+} VarSlot;
+
+#define MAX_SCOPES 32
+
+typedef struct {
+    VarSlot slots[MAX_VARS];
+    int     n;
+    int     nparams;   /* slots[1 .. nparams] are the procedure's parameters */
+    int     scope_depth;
+    int     scope_overflow;   /* blocks nested beyond MAX_SCOPES: no-op scopes */
+    int     scope_base[MAX_SCOPES];  /* slots[scope_base[d] .. n) are scope d */
+} VarFrame;
+
+static __thread VarFrame *g_var_frame = NULL;
+
+/* Procedure-scoped cursors. sel is borrowed: it points into the parsed
+ * program's statement tree and lives exactly as long as the CALL. */
+typedef struct {
+    char      name[MAX_NAME];
+    Stmt     *sel;
+    Capture   cap;
+    int       opened;
+    int       pos;      /* next row to FETCH */
+} Cursor;
+
+static __thread Cursor g_cursors[MAX_CURSORS];
+static __thread int    g_ncursors = 0;
+
+static Cursor *cursor_find(const char *name)
+{
+    for (int i = 0; i < g_ncursors; i++)
+        if (strcasecmp(g_cursors[i].name, name) == 0)
+            return &g_cursors[i];
+    return NULL;
+}
+
+/* Innermost scope first, so a variable declared in an inner block shadows
+ * one with the same name in an outer block or among the parameters. */
+static VarSlot *var_find(const char *name)
+{
+    if (!g_var_frame) return NULL;
+    for (int i = g_var_frame->n - 1; i >= 0; i--)
+        if (strcasecmp(g_var_frame->slots[i].name, name) == 0)
+            return &g_var_frame->slots[i];
+    return NULL;
+}
+
+/* Push a variable scope for a BEGIN ... END block. */
+static void scope_push(VarFrame *f)
+{
+    if (f->scope_depth < MAX_SCOPES - 1) {
+        f->scope_base[++f->scope_depth] = f->n;
+    } else {
+        /* beyond the cap a scope is a no-op, so push and pop stay balanced */
+        f->scope_overflow++;
+    }
+}
+
+/* Pop the innermost scope, removing the variables declared inside it. */
+static void scope_pop(VarFrame *f)
+{
+    if (f->scope_overflow) {
+        f->scope_overflow--;
+        return;
+    }
+    if (f->scope_depth > 0) {
+        for (int i = f->scope_base[f->scope_depth]; i < f->n; i++)
+            val_clear(&f->slots[i].v);
+        f->n = f->scope_base[f->scope_depth];
+        f->scope_depth--;
+    }
+}
+
+/* True if a variable of this name exists in the current scope. */
+static int var_in_scope(const VarFrame *f, const char *name)
+{
+    for (int i = f->scope_base[f->scope_depth]; i < f->n; i++)
+        if (strcasecmp(f->slots[i].name, name) == 0)
+            return 1;
+    return 0;
+}
+
+/* control-flow return codes for exec_proc_stmt; negative = error */
+enum { P_OK = 0, P_BREAK, P_CONTINUE, P_RETURN };
+
+static int exec_proc_stmt(DB *db, Stmt *s, char *err);
 
 int pseudo_col_index(const char *name) { return pseudo_col(name); }
 
@@ -176,6 +281,17 @@ int eval_expr(const Expr *e, const Row *row, const Table *t, int64_t now,
     case EX_LIT:
         *out = val_copy(&e->lit);
         return 0;
+
+    case EX_VAR: {
+        /* @name — a stored-procedure variable or parameter */
+        VarSlot *slot = var_find(e->col);
+        if (!slot) {
+            snprintf(err, MAX_ERR, "variable '%s' is not defined", e->col);
+            return -1;
+        }
+        *out = val_copy(&slot->v);
+        return 0;
+    }
 
     case EX_AGG:
         if (!g_agg_values || e->agg_slot < 0 || e->agg_slot >= g_agg_count) {
@@ -2025,7 +2141,18 @@ static int exec_insert_select(DB *db, Stmt *s, char *err)
 
     Capture cap;
     memset(&cap, 0, sizeof cap);
-    if (exec_select_into(db, s->sub, &cap, err) < 0) {
+    if (s->sub->kind == ST_CALL) {
+        /* INSERT INTO t EXEC proc: the procedure's first result set becomes
+         * the captured rows (SELECTs inside the body hand them over via
+         * g_pending_capture instead of printing) */
+        g_pending_capture = &cap;
+        int rc = exec_stmt(db, s->sub, err);
+        g_pending_capture = NULL;
+        if (rc < 0) {
+            capture_free(&cap);
+            return -1;
+        }
+    } else if (exec_select_into(db, s->sub, &cap, err) < 0) {
         capture_free(&cap);
         return -1;
     }
@@ -2930,8 +3057,11 @@ static int exec_vacuum(DB *db, char *err)
 
     /* copy stored procedures */
     ndb->cat.nprocs = db->cat.nprocs;
-    for (int i = 0; i < db->cat.nprocs; i++)
+    for (int i = 0; i < db->cat.nprocs; i++) {
         ndb->cat.procs[i] = db->cat.procs[i];
+        /* the parsed-body cache belongs to the old DB handle */
+        ndb->cat.procs[i].cache = NULL;
+    }
 
     /* copy associative memory links */
     for (uint32_t i = 0; i < db->links.n; i++) {
@@ -2974,10 +3104,351 @@ int db_vacuum(DB *db, char *err)
 
 /* ----------------------------------------------------------- dispatcher */
 
+/* -------------------------------------------------- procedure statements */
+
+/* Parse and execute a dynamic SQL batch (EXEC ('...')). Unlike exec_script,
+ * the first failure stops the batch and reports the error to the caller, so
+ * TRY/CATCH around the EXEC sees it. Statements see the enclosing procedure's
+ * variable frame. */
+static int exec_dynamic_batch(DB *db, const char *sql, char *err)
+{
+    g_db = db;
+    Lexer lx;
+    lex_init(&lx, sql);
+    if (lex_next(&lx) < 0) {
+        snprintf(err, MAX_ERR, "%s", lx.err);
+        return -1;
+    }
+    for (;;) {
+        Stmt st;
+        int rc = parse_stmt(&lx, &st, err);
+        if (rc == 0) break;
+        if (rc < 0) {
+            if (!err[0]) snprintf(err, MAX_ERR, "%s", lx.err);
+            return -1;
+        }
+        if (exec_stmt(db, &st, err) < 0) {
+            stmt_free(&st);
+            return -1;
+        }
+        stmt_free(&st);
+    }
+    links_flush(db);
+    db_flush_catalog(db);
+    return 0;
+}
+
+/* Execute one statement inside a procedure body. Returns a control-flow code
+ * (P_OK / P_BREAK / P_CONTINUE / P_RETURN) or -1 on error. */
+static int exec_proc_stmt(DB *db, Stmt *s, char *err)
+{
+    switch (s->kind) {
+    case ST_BLOCK:
+        if (!g_var_frame) return -1;
+        scope_push(g_var_frame);
+        for (int i = 0; i < s->nstmts; i++) {
+            int rc = exec_proc_stmt(db, s->stmts[i], err);
+            if (rc != P_OK) {
+                scope_pop(g_var_frame);
+                return rc;
+            }
+        }
+        scope_pop(g_var_frame);
+        return P_OK;
+
+    case ST_IF: {
+        int take_else = 0;
+        if (s->where) {
+            Value cv;
+            if (eval_expr(s->where, NULL, NULL, mem_now(), &cv, err) < 0) return -1;
+            take_else = !val_truthy(&cv);
+            val_clear(&cv);
+        }
+        if (!take_else) {
+            for (int i = 0; i < s->nstmts; i++) {
+                int rc = exec_proc_stmt(db, s->stmts[i], err);
+                if (rc != P_OK) return rc;
+            }
+        } else {
+            for (int i = 0; i < s->n_else; i++) {
+                int rc = exec_proc_stmt(db, s->else_stmts[i], err);
+                if (rc != P_OK) return rc;
+            }
+        }
+        return P_OK;
+    }
+
+    case ST_WHILE: {
+        for (;;) {
+            Value cv;
+            if (s->where) {
+                if (eval_expr(s->where, NULL, NULL, mem_now(), &cv, err) < 0) return -1;
+            } else {
+                cv = val_null();
+            }
+            int run = val_truthy(&cv);
+            val_clear(&cv);
+            if (!run) return P_OK;
+            for (int i = 0; i < s->nstmts; i++) {
+                int rc = exec_proc_stmt(db, s->stmts[i], err);
+                if (rc == P_BREAK) return P_OK;
+                if (rc == P_CONTINUE) break;
+                if (rc != P_OK) return rc;
+            }
+        }
+    }
+
+    case ST_BREAK:
+        return P_BREAK;
+
+    case ST_CONTINUE:
+        return P_CONTINUE;
+
+    case ST_RETURN:
+        if (s->nsets && s->sets[0].val) {
+            Value rv;
+            if (eval_expr(s->sets[0].val, NULL, NULL, mem_now(), &rv, err) < 0) return -1;
+            if (rv.tag == T_INT || rv.tag == T_BIT)
+                g_proc_retval = (int)rv.i;
+            else if (rv.tag == T_FLOAT)
+                g_proc_retval = (int)rv.f;
+            else
+                g_proc_retval = 0;
+            val_clear(&rv);
+        }
+        return P_RETURN;
+
+    case ST_DECLARE: {
+        const char *name = s->sets[0].col;
+        if (name[0] == '@' && name[1] == '@') {
+            snprintf(err, MAX_ERR, "cannot declare system variable '%s'", name);
+            return -1;
+        }
+        if (!g_var_frame) {
+            snprintf(err, MAX_ERR, "DECLARE can only be used inside a procedure");
+            return -1;
+        }
+        if (var_in_scope(g_var_frame, name)) {
+            snprintf(err, MAX_ERR, "variable '%s' already declared in this scope",
+                     name);
+            return -1;
+        }
+        if (g_var_frame->n >= MAX_VARS) {
+            snprintf(err, MAX_ERR, "too many variables (max %d)", MAX_VARS);
+            return -1;
+        }
+        VarSlot *slot = &g_var_frame->slots[g_var_frame->n++];
+        snprintf(slot->name, MAX_NAME, "%s", name);
+        val_clear(&slot->v);
+        if (s->nsets && s->sets[0].val) {
+            if (eval_expr(s->sets[0].val, NULL, NULL, mem_now(), &slot->v, err) < 0)
+                return -1;
+        } else {
+            slot->v = val_null();
+        }
+        return P_OK;
+    }
+
+    case ST_SET: {
+        const char *name = s->sets[0].col;
+        if (name[0] == '@' && name[1] == '@') {
+            snprintf(err, MAX_ERR, "cannot modify system variable '%s'", name);
+            return -1;
+        }
+        VarSlot *slot = var_find(name);
+        if (!slot) {
+            snprintf(err, MAX_ERR, "variable '%s' has not been declared", name);
+            return -1;
+        }
+        Value nv;
+        if (eval_expr(s->sets[0].val, NULL, NULL, mem_now(), &nv, err) < 0) return -1;
+        val_clear(&slot->v);
+        slot->v = nv;
+        return P_OK;
+    }
+
+    case ST_DECLARE_CURSOR: {
+        if (cursor_find(s->table)) {
+            snprintf(err, MAX_ERR, "cursor '%s' already exists", s->table);
+            return -1;
+        }
+        if (g_ncursors >= MAX_CURSORS) {
+            snprintf(err, MAX_ERR, "too many cursors (max %d)", MAX_CURSORS);
+            return -1;
+        }
+        Cursor *c = &g_cursors[g_ncursors++];
+        snprintf(c->name, MAX_NAME, "%s", s->table);
+        c->sel = s->derived;   /* borrowed from the program */
+        c->opened = 0;
+        c->pos = 0;
+        return P_OK;
+    }
+
+    case ST_OPEN: {
+        Cursor *c = cursor_find(s->table);
+        if (!c) {
+            snprintf(err, MAX_ERR, "unknown cursor '%s'", s->table);
+            return -1;
+        }
+        if (!c->sel) {
+            snprintf(err, MAX_ERR, "cursor '%s' has no SELECT", s->table);
+            return -1;
+        }
+        capture_free(&c->cap);
+        if (exec_select_into(db, c->sel, &c->cap, err) < 0) return -1;
+        c->opened = 1;
+        c->pos = 0;
+        return P_OK;
+    }
+
+    case ST_FETCH: {
+        Cursor *c = cursor_find(s->table);
+        if (!c) {
+            snprintf(err, MAX_ERR, "unknown cursor '%s'", s->table);
+            return -1;
+        }
+        if (!c->opened) {
+            snprintf(err, MAX_ERR, "cursor '%s' is not open", s->table);
+            return -1;
+        }
+        int status;
+        if (c->pos < c->cap.nrows) {
+            for (int i = 0; i < s->n_ins_cols; i++) {
+                VarSlot *slot = var_find(s->ins_cols[i]);
+                if (!slot) {
+                    snprintf(err, MAX_ERR, "variable '%s' has not been declared",
+                             s->ins_cols[i]);
+                    return -1;
+                }
+                int ci = i < c->cap.ncols ? i : c->cap.ncols - 1;
+                val_clear(&slot->v);
+                slot->v = val_copy(&c->cap.cells[c->pos * c->cap.ncols + ci]);
+            }
+            c->pos++;
+            status = 0;
+        } else {
+            status = -1;
+        }
+        VarSlot *st = var_find("@@fetch_status");
+        if (st) {
+            val_clear(&st->v);
+            st->v = val_int(status);
+        }
+        return P_OK;
+    }
+
+    case ST_CLOSE: {
+        Cursor *c = cursor_find(s->table);
+        if (!c) {
+            snprintf(err, MAX_ERR, "unknown cursor '%s'", s->table);
+            return -1;
+        }
+        if (c->opened) {
+            capture_free(&c->cap);
+            c->opened = 0;
+        }
+        return P_OK;
+    }
+
+    case ST_DEALLOCATE: {
+        for (int i = 0; i < g_ncursors; i++) {
+            if (strcasecmp(g_cursors[i].name, s->table) != 0) continue;
+            capture_free(&g_cursors[i].cap);
+            for (int j = i; j < g_ncursors - 1; j++)
+                g_cursors[j] = g_cursors[j + 1];
+            g_ncursors--;
+            return P_OK;
+        }
+        snprintf(err, MAX_ERR, "unknown cursor '%s'", s->table);
+        return -1;
+    }
+
+    case ST_TRY: {
+        int rc = P_OK;
+        for (int i = 0; i < s->nstmts && rc == P_OK; i++)
+            rc = exec_proc_stmt(db, s->stmts[i], err);
+        if (rc < 0) {
+            /* the error is caught: expose its message as @@error_message and
+             * run the CATCH block, which may itself error out */
+            VarFrame *f = g_var_frame;
+            if (f) {
+                VarSlot *em = var_find("@@error_message");
+                if (!em && f->n < MAX_VARS) {
+                    em = &f->slots[f->n++];
+                    snprintf(em->name, MAX_NAME, "@@error_message");
+                }
+                if (em) {
+                    val_clear(&em->v);
+                    em->v = val_text(err[0] ? err : "error");
+                }
+            }
+            for (int i = 0; i < s->n_else && rc != P_OK; i++)
+                rc = exec_proc_stmt(db, s->else_stmts[i], err);
+            if (rc < 0) return -1;
+            return P_OK;
+        }
+        return rc;
+    }
+
+    case ST_EXEC_SQL: {
+        Value v;
+        if (eval_expr(s->sets[0].val, NULL, NULL, mem_now(), &v, err) < 0)
+            return -1;
+        if (v.tag != T_TEXT) {
+            val_clear(&v);
+            snprintf(err, MAX_ERR, "EXEC ('...') needs a string expression");
+            return -1;
+        }
+        /* guard against self-referential strings like EXEC(@s) */
+        if (g_proc_depth >= MAX_PROC_DEPTH) {
+            val_clear(&v);
+            snprintf(err, MAX_ERR, "procedure call depth exceeded (max %d)",
+                     MAX_PROC_DEPTH);
+            return -1;
+        }
+        g_proc_depth++;
+        int rc = exec_dynamic_batch(db, v.s, err);
+        g_proc_depth--;
+        val_clear(&v);
+        if (rc < 0) return -1;
+        if (s->retvar[0]) {
+            VarSlot *cs = var_find(s->retvar);
+            if (cs) {
+                val_clear(&cs->v);
+                cs->v = val_int(g_proc_retval);
+            }
+        }
+        return P_OK;
+    }
+
+    default:
+        return exec_stmt(db, s, err) < 0 ? -1 : P_OK;
+    }
+}
+
 /* Top-level statement dispatcher: CREATE, SELECT, RECALL, CHECKPOINT, etc. */
+static int exec_stmt_inner(DB *db, Stmt *s, char *err);
+
 int exec_stmt(DB *db, Stmt *s, char *err)
 {
     g_db = db;
+    /* Outside a CALL there is no variable frame; provide a scratch one so
+     * top-level TRY/CATCH can expose @@error_message and EXEC @rc = proc has
+     * somewhere to write. Nested dispatches keep using it (the check is
+     * whether one is already installed). */
+    VarFrame scratch;
+    VarFrame *saved = g_var_frame;
+    if (!saved) {
+        memset(&scratch, 0, sizeof scratch);
+        g_var_frame = &scratch;
+    }
+    int rc = exec_stmt_inner(db, s, err);
+    g_var_frame = saved;
+    return rc;
+}
+
+static int exec_stmt_inner(DB *db, Stmt *s, char *err)
+{
     switch (s->kind) {
     case ST_NOOP:
         return 0;
@@ -3067,10 +3538,10 @@ int exec_stmt(DB *db, Stmt *s, char *err)
     }
 
     case ST_CREATE_PROC: {
-        if (cat_find(db, s->table) || cat_find_view(db, s->table) ||
-            cat_find_proc(db, s->table)) {
-            snprintf(err, MAX_ERR, "table, view or procedure '%s' already exists",
-                     s->table);
+        /* procedures live in their own namespace: a procedure may share a
+         * name with a table or view (CALL and FROM look up different lists) */
+        if (cat_find_proc(db, s->table)) {
+            snprintf(err, MAX_ERR, "procedure '%s' already exists", s->table);
             return -1;
         }
         if (db->cat.nprocs >= MAX_PROCS) {
@@ -3078,8 +3549,10 @@ int exec_stmt(DB *db, Stmt *s, char *err)
             return -1;
         }
         Proc *p = &db->cat.procs[db->cat.nprocs];
+        p->cache = NULL;
         snprintf(p->name, MAX_NAME, "%s", s->table);
         snprintf(p->sql, MAX_PROC_SQL, "%s", s->proc_sql);
+        snprintf(p->params, MAX_PROC_SQL, "%s", s->param_sql);
         db->cat.nprocs++;
         if (db_flush_catalog(db) < 0) {
             snprintf(err, MAX_ERR, "%s", db->err);
@@ -3094,6 +3567,10 @@ int exec_stmt(DB *db, Stmt *s, char *err)
         for (int i = 0; i < db->cat.nprocs; i++) {
             if (strcasecmp(db->cat.procs[i].name, s->table) != 0) continue;
             found = 1;
+            if (db->cat.procs[i].cache) {
+                prog_free(db->cat.procs[i].cache);
+                free(db->cat.procs[i].cache);
+            }
             for (int j = i; j < db->cat.nprocs - 1; j++)
                 db->cat.procs[j] = db->cat.procs[j + 1];
             db->cat.nprocs--;
@@ -3122,13 +3599,143 @@ int exec_stmt(DB *db, Stmt *s, char *err)
                      MAX_PROC_DEPTH);
             return -1;
         }
-        Stmt inner;
-        if (parse_proc_sql(p->sql, &inner, err) < 0) return -1;
+
+        /* the callee's variable frame; parameters first, @@fetch_status at
+         * slot 0 (so FETCH works even before any variable is declared) */
+        VarFrame frame;
+        memset(&frame, 0, sizeof frame);
+        snprintf(frame.slots[0].name, MAX_NAME, "@@fetch_status");
+        frame.slots[0].v = val_int(0);
+        frame.n = 1;
+
+        char pnames[MAX_VARS][MAX_NAME];
+        Expr *pdefs[MAX_VARS];
+        int nparams = 0;
+        if (p->params[0]) {
+            if (proc_parse_params(p->params, pnames, pdefs, MAX_VARS, &nparams, err) < 0)
+                return -1;
+            for (int i = 0; i < nparams; i++) {
+                if (frame.n >= MAX_VARS) {
+                    snprintf(err, MAX_ERR, "too many parameters (max %d)",
+                             MAX_VARS - 1);
+                    return -1;
+                }
+                snprintf(frame.slots[frame.n].name, MAX_NAME, "%s", pnames[i]);
+                frame.slots[frame.n].v = val_null();
+                frame.n++;
+            }
+        }
+        frame.nparams = nparams;
+
+        /* map each argument to a callee frame slot; named arguments can
+         * arrive in any order, so the mapping is by name, not position */
+        int slot[MAX_FUNC_ARGS];
+        int assigned[MAX_VARS];
+        for (int j = 0; j < MAX_VARS; j++) assigned[j] = 0;
+        for (int i = 0; i < s->nargs; i++) {
+            if (s->argnames[i][0]) {
+                int k = -1;
+                for (int j = 0; j < nparams; j++)
+                    if (strcasecmp(pnames[j], s->argnames[i]) == 0) { k = j; break; }
+                if (k < 0) {
+                    snprintf(err, MAX_ERR, "procedure '%s' has no parameter '%s'",
+                             s->table, s->argnames[i]);
+                    return -1;
+                }
+                slot[i] = 1 + k;
+            } else {
+                if (i >= nparams) {
+                    snprintf(err, MAX_ERR,
+                             "procedure '%s' takes at most %d argument%s, got %d",
+                             s->table, nparams, nparams == 1 ? "" : "s", s->nargs);
+                    return -1;
+                }
+                slot[i] = 1 + i;
+            }
+            if (assigned[slot[i] - 1]) {
+                snprintf(err, MAX_ERR, "parameter '%s' was supplied more than once",
+                         pnames[slot[i] - 1]);
+                return -1;
+            }
+            assigned[slot[i] - 1] = 1;
+        }
+        /* parameters without defaults must be supplied */
+        for (int j = 0; j < nparams; j++) {
+            if (!assigned[j] && !pdefs[j]) {
+                snprintf(err, MAX_ERR, "procedure '%s' expects an argument for '%s'",
+                         s->table, pnames[j]);
+                return -1;
+            }
+        }
+
+        /* bind arguments in the caller's frame, then switch frames */
+        for (int i = 0; i < s->nargs; i++) {
+            if (eval_expr(s->args[i], NULL, NULL, mem_now(), &frame.slots[slot[i]].v, err) < 0)
+                return -1;
+        }
+
+        /* the body is parsed once and cached; DROP and DB close free it */
+        Program *pgm = p->cache;
+        if (!pgm) {
+            pgm = calloc(1, sizeof *pgm);
+            if (!pgm) {
+                snprintf(err, MAX_ERR, "out of memory");
+                return -1;
+            }
+            if (parse_program(p->sql, pgm, err) < 0) {
+                free(pgm);
+                return -1;
+            }
+            p->cache = pgm;
+        }
+
+        VarFrame *saved = g_var_frame;
+        g_var_frame = &frame;
         g_proc_depth++;
-        int rc = exec_stmt(db, &inner, err);
+        g_proc_retval = 0;
+        /* defaults run in the callee frame, so they may use earlier parameters */
+        for (int j = 0; j < nparams; j++) {
+            if (assigned[j] || !pdefs[j]) continue;
+            if (eval_expr(pdefs[j], NULL, NULL, mem_now(), &frame.slots[1 + j].v, err) < 0) {
+                g_proc_depth--;
+                g_var_frame = saved;
+                for (int k = 0; k < g_ncursors; k++)
+                    capture_free(&g_cursors[k].cap);
+                g_ncursors = 0;
+                return -1;
+            }
+        }
+        int rc = P_OK;
+        for (int i = 0; i < pgm->nstmts && rc == P_OK; i++)
+            rc = exec_proc_stmt(db, pgm->stmts[i], err);
         g_proc_depth--;
-        stmt_free(&inner);
-        return rc;
+        g_var_frame = saved;
+
+        /* cursors borrow their SELECT from this call's program, so they must
+         * all be gone before the program is freed. Sweep at every CALL (not
+         * just the outermost): cursors are call-scoped, so nothing can dangle. */
+        for (int i = 0; i < g_ncursors; i++)
+            capture_free(&g_cursors[i].cap);
+        g_ncursors = 0;
+
+        /* copy OUTPUT parameters back into the caller's variables */
+        for (int i = 0; i < s->nargs; i++) {
+            if (!s->argout[i]) continue;
+            VarSlot *cs = var_find(s->args[i]->col);
+            if (!cs) continue;
+            val_clear(&cs->v);
+            cs->v = val_copy(&frame.slots[slot[i]].v);
+        }
+        /* EXEC @rc = proc: hand over the return code */
+        if (s->retvar[0]) {
+            VarSlot *cs = var_find(s->retvar);
+            if (cs) {
+                val_clear(&cs->v);
+                cs->v = val_int(g_proc_retval);
+            }
+        }
+        if (rc < 0) return -1;
+        return 0;
     }
 
     case ST_DROP: {
@@ -3179,9 +3786,20 @@ int exec_stmt(DB *db, Stmt *s, char *err)
     case ST_SHOW_MEMORY: return exec_show_memory(db, s, err);
     case ST_SHOW_LINKS:  return exec_show_links(db, s);
 
-    case ST_PRINT:
-        printf("%s\n", s->msg);
+    case ST_PRINT: {
+        Value v;
+        if (s->nsets && s->sets[0].val) {
+            if (eval_expr(s->sets[0].val, NULL, NULL, mem_now(), &v, err) < 0)
+                return -1;
+        } else {
+            v = val_text(s->msg);
+        }
+        char buf[1024];
+        val_format(&v, buf, sizeof buf);
+        printf("%s\n", buf);
+        val_clear(&v);
         return 0;
+    }
 
     case ST_CHECKPOINT:
         /* fsync, not just pwrite: otherwise "checkpoint complete" promised
@@ -3311,6 +3929,28 @@ int exec_stmt(DB *db, Stmt *s, char *err)
 
     case ST_VACUUM:
         return exec_vacuum(db, err);
+
+    case ST_IF:
+    case ST_WHILE:
+    case ST_BLOCK:
+    case ST_BREAK:
+    case ST_CONTINUE:
+    case ST_RETURN:
+    case ST_DECLARE:
+    case ST_SET:
+    case ST_DECLARE_CURSOR:
+    case ST_OPEN:
+    case ST_FETCH:
+    case ST_CLOSE:
+    case ST_DEALLOCATE:
+        snprintf(err, MAX_ERR,
+                 "this statement can only be used inside a stored procedure body");
+        return -1;
+    case ST_TRY:
+    case ST_EXEC_SQL:
+        /* also reachable at batch level: the proc-statement dispatcher owns
+         * the implementation, and it never routes these back here */
+        return exec_proc_stmt(db, s, err) < 0 ? -1 : 0;
     }
     snprintf(err, MAX_ERR, "unimplemented statement");
     return -1;

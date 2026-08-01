@@ -179,11 +179,21 @@ implications:
   as a `JOIN` operand, and outer queries over a view (or any derived table)
   cannot use aggregates or `GROUP BY`.
 - **No `TRIGGER`** — event-driven logic is not supported.
-- **Stored procedures** hold exactly one statement (any statement, including
-  DDL and other `CALL`s). There are no parameters, variables, or control-flow
-  keywords; `BEGIN ... END` bodies are not supported — statement separators
-  end the procedure body, so multi-statement bodies are impossible by
-  construction. Procedure and table/view names share one namespace.
+- **Stored procedures** support parameters (`@name TYPE`, named arguments,
+  defaults that may reference earlier parameters, and `OUTPUT` write-back),
+  local variables (`DECLARE`/`SET`) with block-level scoping, `IF`/`ELSE`,
+  `WHILE` with `BREAK`/`CONTINUE`, `RETURN` codes (read with `EXEC @rc =
+  proc`), `PRINT` with expressions, `EXEC`/`EXECUTE` as aliases for `CALL`,
+  `BEGIN ... END` blocks, `BEGIN TRY ... END TRY BEGIN CATCH ... END CATCH`
+  error handling (`@@error_message`), dynamic SQL (`EXEC('...')`, also
+  `EXEC @rc = ('...')`), `INSERT INTO t EXEC proc` result-set capture, and
+  forward-only cursors (`DECLARE ... CURSOR FOR`, `OPEN`,
+  `FETCH NEXT FROM ... INTO`, `@@fetch_status`, `CLOSE`, `DEALLOCATE`).
+  Bodies are parsed once and cached; `DROP PROCEDURE`, `VACUUM` and closing
+  the database invalidate the cache. Bodies can nest up to a depth of 128.
+  Procedures live in their own namespace: a procedure may share its name with
+  a table or view. `DECLARE`/`SET`/control-flow statements are refused at the
+  top level (outside `TRY`/`CATCH`); dynamic SQL sees the caller's variables.
 - **Full-text search** is limited to the RECALL engine; no inverted index or
   tokenizer with stop-word removal exists.
 - **`VACUUM`** requires free disk space equal to the current database size

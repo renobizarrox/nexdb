@@ -325,7 +325,7 @@ static int sql_is_read_only(const char *sql)
     static const char *const writes[] = {
         "INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "ALTER", "TRUNCATE",
         "VACUUM", "CHECKPOINT", "BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT",
-        "RELEASE", "REMEMBER", "FORGET", "CALL", NULL
+        "RELEASE", "REMEMBER", "FORGET", "CALL", "EXEC", "EXECUTE", NULL
     };
     Lexer lx;
     lex_init(&lx, sql);

@@ -246,7 +246,7 @@ static size_t catalog_serialize(const Catalog *c, uint8_t **out)
                  (MAX_NAME + 8 + MAX_COLS * (3 * MAX_NAME + 130) + 64 +
                   MAX_FKS * (MAX_COLS * 4 * MAX_NAME + 256)) +
                  4 + (size_t)c->nviews * (MAX_NAME + 4 + MAX_VIEW_SQL) +
-                 4 + (size_t)c->nprocs * (MAX_NAME + 4 + MAX_PROC_SQL);
+                 4 + (size_t)c->nprocs * (2 * (MAX_NAME + 4 + MAX_PROC_SQL));
     uint8_t *b = malloc(cap);
     if (!b) return 0;
     size_t o = 0;
@@ -341,6 +341,10 @@ static size_t catalog_serialize(const Catalog *c, uint8_t **out)
         uint32_t sl = (uint32_t)strlen(p->sql);
         wr32(b, o, sl); o += 4;
         memcpy(b + o, p->sql, sl); o += sl;
+        /* parameter list; absent in files written by older versions */
+        uint32_t pl = (uint32_t)strlen(p->params);
+        wr32(b, o, pl); o += 4;
+        memcpy(b + o, p->params, pl); o += pl;
     }
     *out = b;
     return o;
@@ -505,6 +509,14 @@ static void catalog_deserialize(Catalog *c, const uint8_t *b, size_t len)
             p->sql[copy] = 0;
             o += sl;
             c->nprocs = i + 1;
+            /* parameter list; absent in files written by older versions */
+            if (o + 4 > len) break;
+            uint32_t pl = rd32(b, o); o += 4;
+            if (o + pl > len) break;
+            size_t pcopy = pl < sizeof p->params ? pl : sizeof p->params - 1;
+            memcpy(p->params, b + o, pcopy);
+            p->params[pcopy] = 0;
+            o += pl;
         }
     }
 }
@@ -619,6 +631,14 @@ int db_sync(DB *db)
 
 void db_close(DB *db)
 {
+    /* free the cached parsed bodies of stored procedures */
+    for (int i = 0; i < db->cat.nprocs; i++) {
+        if (db->cat.procs[i].cache) {
+            prog_free(db->cat.procs[i].cache);
+            free(db->cat.procs[i].cache);
+            db->cat.procs[i].cache = NULL;
+        }
+    }
     if (db->fd >= 0) {
         links_flush(db);
         db_flush_catalog(db);

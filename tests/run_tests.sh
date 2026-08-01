@@ -918,8 +918,12 @@ out=$(run "CREATE PROCEDURE pbad AS SELECT bogus FROM nosuch; CALL pbad")
 check "a failing body errors at CALL time" "unknown table" "$out"
 out=$(run "CREATE PROCEDURE prec AS CALL prec; CALL prec")
 check "runaway recursion is refused" "depth exceeded" "$out"
-out=$(run "CREATE PROCEDURE pbase AS SELECT 1")
-check "a procedure cannot shadow a table name" "already exists" "$out"
+out=$(run "CREATE PROCEDURE pbase AS SELECT 1; CALL pbase")
+check "a procedure may share a table's name (separate namespaces)" "1" "$out"
+out=$(run "DROP PROCEDURE pbase; CREATE PROCEDURE pbase AS SELECT 1")
+check "a procedure may share a table's name after dropping its shadow" "created" "$out"
+out=$(run "DROP PROCEDURE pbase; SELECT id, n FROM pbase ORDER BY id")
+check "a table named like a dropped procedure still works" "1   one" "$out"
 out=$(run "CREATE PROCEDURE psel AS SELECT 2")
 check "a duplicate procedure name is refused" "already exists" "$out"
 out=$(run "CREATE PROCEDURE pbad2 AS")
@@ -938,6 +942,100 @@ out=$(run "DROP PROCEDURE IF EXISTS psel")
 check_not "DROP PROCEDURE IF EXISTS on a missing procedure" "error" "$out"
 out=$(run "CREATE PROCEDURE pins2 AS INSERT INTO pbase VALUES (4, 'four'); CALL pins2")
 check "a surviving procedure still works" "1 row inserted" "$out"
+
+out=$(run "DROP PROCEDURE psel; DROP PROCEDURE pins; DROP PROCEDURE pdel; DROP PROCEDURE pmk; DROP PROCEDURE pbad; DROP PROCEDURE prec; DROP PROCEDURE pins2")
+check "old test procedures can be dropped" "dropped" "$out"
+
+out=$(run "CREATE PROCEDURE padd (@a INT, @b NVARCHAR(20)) AS INSERT INTO pbase VALUES (@a, @b); CALL padd(5, 'five'); SELECT id, n FROM pbase WHERE id = 5")
+check "parameters are passed to the body" "5   five" "$out"
+out=$(run "CALL padd(1, 'x', 2)")
+check "too many arguments are refused" "takes at most 2" "$out"
+out=$(run "CREATE PROCEDURE pwhat AS SELECT @x; CALL pwhat")
+check "an undeclared variable is an error" "not defined" "$out"
+out=$(run "CREATE PROCEDURE pvars AS BEGIN DECLARE @a INT = 1; DECLARE @b NVARCHAR(10); SET @b = 'hi'; SELECT @a, @b; END; CALL pvars")
+check "DECLARE and SET work" "1     hi" "$out"
+out=$(run "CREATE PROCEDURE pif (@x INT) AS IF @x > 0 SELECT 'pos' ELSE SELECT 'neg'; CALL pif(3); CALL pif(-1)")
+check "IF/ELSE branches" "pos" "$out"
+out=$(run "CREATE PROCEDURE pwhile AS BEGIN DECLARE @i INT = 10; WHILE @i < 14 BEGIN SET @i = @i + 1; IF @i = 12 CONTINUE; INSERT INTO pbase VALUES (@i, 'w'); END END; CALL pwhile; SELECT id, n FROM pbase WHERE n = 'w' ORDER BY id")
+check "WHILE with CONTINUE works" "11  w" "$out"
+out=$(run "CREATE PROCEDURE pbrk AS BEGIN DECLARE @i INT = 0; WHILE 1 = 1 BEGIN SET @i = @i + 1; IF @i >= 3 BREAK; END SELECT @i; END; CALL pbrk")
+check "BREAK exits the loop" "3" "$out"
+out=$(run "CREATE PROCEDURE pret AS BEGIN IF 1 = 0 RETURN; SELECT 'no'; END; CALL pret")
+check "RETURN stops the procedure" "no" "$out"
+out=$(run "CREATE PROCEDURE pcur AS BEGIN DECLARE @a INT; DECLARE c CURSOR FOR SELECT id FROM pbase WHERE id <= 5 ORDER BY id; OPEN c; FETCH NEXT FROM c INTO @a; WHILE @@fetch_status = 0 BEGIN INSERT INTO pbase VALUES (100 + @a, 'cur'); FETCH NEXT FROM c INTO @a; END CLOSE c; DEALLOCATE c; END; CALL pcur; SELECT COUNT(*) FROM pbase WHERE n = 'cur'")
+check "a cursor walks the rows" "4" "$out"
+out=$(run "CREATE PROCEDURE pcur2 AS BEGIN DECLARE @a INT; DECLARE c CURSOR FOR SELECT id FROM pbase WHERE id < 0; OPEN c; FETCH NEXT FROM c INTO @a; SELECT @@fetch_status; CLOSE c; END; CALL pcur2")
+check "an empty cursor gives fetch status -1" "-1" "$out"
+out=$(run "CREATE PROCEDURE pnest AS CALL padd(6, 'six'); CALL pnest; SELECT id, n FROM pbase WHERE id = 6")
+check "nested CALLs with parameters work" "6   six" "$out"
+out=$(run "CREATE PROCEDURE pbeg AS BEGIN INSERT INTO pbase VALUES (7, 'seven'); INSERT INTO pbase VALUES (8, 'eight'); END; CALL pbeg; SELECT COUNT(*) FROM pbase WHERE n = 'seven' OR n = 'eight'")
+check "a BEGIN...END body runs every statement" "2" "$out"
+out=$(run "IF 1 = 1 SELECT 1")
+check "IF at the top level is refused" "unrecognised statement" "$out"
+out=$(run "DECLARE @x INT")
+check "DECLARE at the top level is refused" "unrecognised statement" "$out"
+out=$(run "CREATE PROCEDURE pgotcha AS BEGIN SELECT CASE WHEN 1 = 1 THEN 'yes' END; END; CALL pgotcha")
+check "a CASE expression inside a body works" "yes" "$out"
+out=$(run "DROP PROCEDURE pwhat; DROP PROCEDURE pvars; DROP PROCEDURE pif; DROP PROCEDURE pwhile; DROP PROCEDURE pbrk; DROP PROCEDURE pret; DROP PROCEDURE pcur; DROP PROCEDURE pcur2; DROP PROCEDURE pnest; DROP PROCEDURE pbeg; DROP PROCEDURE pgotcha")
+check "finished test procedures can be dropped" "dropped" "$out"
+
+out=$(run "CREATE PROCEDURE pdef (@a INT = 5) AS SELECT @a; CALL pdef")
+check "a default parameter is used when the argument is omitted" "5" "$out"
+out=$(run "CALL pdef(9)")
+check "a supplied argument overrides the default" "9" "$out"
+out=$(run "CREATE PROCEDURE pboth (@a INT = 2, @b INT = @a * 10) AS SELECT @a, @b; CALL pboth")
+check "a default may use earlier parameters" "2     20" "$out"
+out=$(run "CALL pboth(@b = 99, @a = 1)")
+check "named arguments may arrive in any order" "1     99" "$out"
+out=$(run "CREATE PROCEDURE pneed (@a INT) AS SELECT @a; CALL pneed")
+check "a missing argument without a default is an error" "expects an argument" "$out"
+out=$(run "CALL pneed(@z = 1)")
+check "an unknown parameter name is an error" "has no parameter" "$out"
+out=$(run "CALL pboth(@a = 1, @a = 2)")
+check "a parameter supplied twice is an error" "more than once" "$out"
+out=$(run "CREATE PROCEDURE pdbl (@a INT, @b INT OUTPUT) AS SET @b = @a * 2; CREATE PROCEDURE pwo AS BEGIN DECLARE @x INT; CALL pdbl(21, @x OUTPUT); PRINT @x; END; CALL pwo")
+check "OUTPUT parameters write back to the caller" "42" "$out"
+out=$(run "CALL pdbl(1, 2 OUTPUT)")
+check "an OUTPUT argument must be a variable" "must be a variable" "$out"
+out=$(run "CREATE PROCEDURE pwo2 AS BEGIN DECLARE @x INT; EXEC pdbl(@a = 8, @b = @x OUTPUT); PRINT @x; END; CALL pwo2")
+check "named OUTPUT arguments write back" "16" "$out"
+out=$(run "EXEC padd 15, 'fifteen'; SELECT id, n FROM pbase WHERE id = 15")
+check "EXEC calls a procedure with bare arguments" "15  fifteen" "$out"
+out=$(run "CREATE PROCEDURE prc AS RETURN 42; CREATE PROCEDURE prt AS BEGIN DECLARE @r INT; EXEC @r = prc; PRINT @r; END; CALL prt")
+check "EXEC reads the return code" "42" "$out"
+out=$(run "PRINT 1 + 2 * 3")
+check "PRINT evaluates expressions" "7" "$out"
+
+out=$(run "CREATE TABLE pcap (a INT, b NVARCHAR(20)); CREATE PROCEDURE pinser AS BEGIN SELECT 1, 'one'; SELECT 2, 'two'; END; INSERT INTO pcap EXEC pinser; SELECT COUNT(*) FROM pcap")
+check "INSERT ... EXEC captures the first result set" "2" "$out"
+out=$(run "CREATE PROCEDURE pinser2 AS BEGIN DECLARE @i INT = 1; WHILE @i < 4 BEGIN SELECT @i, 'x'; SET @i = @i + 1; END END; INSERT INTO pcap EXEC pinser2; SELECT COUNT(*) FROM pcap")
+check "a later SELECT in the body is not captured" "3" "$out"
+
+out=$(run "CREATE PROCEDURE pscop AS BEGIN DECLARE @x INT = 3; BEGIN DECLARE @x INT = 2; SELECT @x AS inner_v; END; SELECT @x AS outer_v; END; CALL pscop")
+check "a block-local DECLARE shadows the outer variable" "inner_v" "$out"
+check "the outer variable is restored after the block" "3" "$out"
+out=$(run "CREATE PROCEDURE pdup AS BEGIN DECLARE @x INT; DECLARE @x INT; END; CALL pdup")
+check "re-declaring a variable in the same scope is refused" "already declared" "$out"
+run "DROP PROCEDURE pscop; DROP PROCEDURE pdup" >/dev/null
+
+out=$(run "CREATE PROCEDURE perr AS BEGIN DECLARE @x INT; SET @x = 1 / 0; END; BEGIN TRY EXEC perr; SELECT 'unreached'; END TRY BEGIN CATCH SELECT CONCAT('caught: ', @@error_message) AS m; END CATCH")
+check "TRY/CATCH catches a body error" "caught: division by zero" "$out"
+check_not "TRY/CATCH skips the rest of the TRY block" "unreached" "$out"
+out=$(run "BEGIN TRY SET @x = 1 / 0; END TRY BEGIN CATCH SELECT 'topcatch'; END CATCH")
+check "TRY/CATCH works at the top level" "topcatch" "$out"
+out=$(run "BEGIN TRY EXEC ('SELECT * FROM nosuch'); END TRY BEGIN CATCH SELECT 'dyncaught'; END CATCH")
+check "a dynamic SQL failure is catchable" "dyncaught" "$out"
+
+out=$(run "CREATE PROCEDURE pdyn AS BEGIN DECLARE @q NVARCHAR(100); SET @q = 'SELECT 42 AS v'; EXEC (@q); END; CALL pdyn")
+check "EXEC ('...') runs dynamic SQL in the caller frame" "42" "$out"
+out=$(run "CREATE PROCEDURE pdyn2 AS BEGIN DECLARE @r INT; EXEC @r = ('SELECT 7'); SELECT @r AS v; END; CALL pdyn2")
+check "EXEC @rc = ('...') returns the dynamic SELECT value" "7" "$out"
+
+out=$(run "CREATE PROCEDURE pcache AS SELECT 1; CALL pcache; DROP PROCEDURE pcache; CREATE PROCEDURE pcache AS SELECT 2; CALL pcache")
+check "the parsed body is refreshed after DROP + CREATE" "2" "$out"
+
+out=$(run "CREATE PROCEDURE pdeep (@i INT) AS BEGIN IF @i < 40 CALL pdeep(@i + 1); END; CALL pdeep(0); SELECT 'deep-ok'")
+check "recursion can nest past 32 levels" "deep-ok" "$out"
 
 rm -f "$DD" "$FN"
 

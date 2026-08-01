@@ -204,7 +204,7 @@ FORGET FROM notes WHERE id = 8;     -- zero the strength, keep the row and its l
 | Queries | `SELECT [ALL\|DISTINCT] [TOP n]` with expressions, column aliases, `FROM` (table, subquery, joins), `WHERE`, `GROUP BY` + `HAVING`, `ORDER BY`, `LIMIT n [OFFSET m]` |
 | Set ops | `UNION`, `UNION ALL`, `INTERSECT`, `EXCEPT`, with trailing `ORDER BY` / `LIMIT` / `OFFSET` on the combined result |
 | Views | `CREATE VIEW name AS SELECT ...`, `DROP VIEW [IF EXISTS]` — stored, expanded at query time, persistent |
-| Stored procedures | `CREATE PROCEDURE name AS <statement>`, `CALL name`, `DROP PROCEDURE [IF EXISTS]` — stored, persistent, may nest |
+| Stored procedures | `CREATE PROCEDURE name [(@a TYPE [= default] [OUTPUT], ...)] AS <statement | BEGIN ... END>`, `CALL name(args)`, `EXEC [@rc =] name [args]`, `EXEC ('...')` dynamic SQL, `DROP PROCEDURE [IF EXISTS]` — stored, persistent, may nest 128 deep (bodies parsed once and cached); parameters (named args, defaults, `OUTPUT` write-back, `RETURN` codes via `EXEC @rc =`), `DECLARE`/`SET` variables with block scoping, `IF`/`ELSE`, `WHILE` with `BREAK`/`CONTINUE`, `RETURN`, `PRINT <expr>`, `BEGIN TRY ... END TRY BEGIN CATCH ... END CATCH` (`@@error_message`), `INSERT INTO t EXEC proc`, and cursors (`DECLARE ... CURSOR FOR` / `OPEN` / `FETCH NEXT FROM ... INTO` / `@@fetch_status` / `CLOSE` / `DEALLOCATE`) |
 | Joins | `INNER JOIN`, `LEFT JOIN`, `table.*` expansion, qualified `table.col` references |
 | Predicates | `= <> != < <= > >=`, `AND`/`OR`/`NOT`, `LIKE` with `%`/`_` and `ESCAPE`, `IN (...)`, `IS [NOT] NULL`, `BETWEEN`/`NOT BETWEEN` |
 | Expressions | Arithmetic `+ - * / %`, `CASE` (simple and searched), `CAST`, scalar functions, subqueries (scalar, `IN`, `EXISTS`, `ANY`/`ALL`, correlated) |

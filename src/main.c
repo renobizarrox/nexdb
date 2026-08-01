@@ -181,6 +181,31 @@ static int ends_with_semicolon(const char *buf)
     return n && buf[n - 1] == ';';
 }
 
+/* True if the buffered text is inside an unclosed BEGIN ... END block or
+ * CASE expression. The REPL uses this so a multi-line CREATE PROCEDURE body
+ * is not fired off at the first interior ';'. */
+static int block_balance(const char *buf)
+{
+    Lexer lx;
+    lex_init(&lx, buf);
+    int bal = 0;
+    while (lex_next(&lx) == 0 && lx.cur.kind != TK_EOF) {
+        if (lx.cur.kind != TK_IDENT) continue;
+        if (strcasecmp(lx.cur.text, "BEGIN") == 0) {
+            Token *pk = lex_peek(&lx);
+            if (!(pk->kind == TK_IDENT &&
+                  (strcasecmp(pk->text, "TRANSACTION") == 0 ||
+                   strcasecmp(pk->text, "TRAN") == 0)))
+                bal++;
+        } else if (strcasecmp(lx.cur.text, "CASE") == 0) {
+            bal++;
+        } else if (strcasecmp(lx.cur.text, "END") == 0) {
+            bal--;
+        }
+    }
+    return bal;
+}
+
 /* Interactive read-eval-print loop: buffer SQL until ';' or GO, then execute. */
 static void repl(DB *db)
 {
@@ -211,7 +236,7 @@ static void repl(DB *db)
             blen += ll;
         }
 
-        int run = go || (blen && ends_with_semicolon(batch));
+        int run = go || (blen && ends_with_semicolon(batch) && block_balance(batch) <= 0);
         if (run && blen) {
             exec_script(db, batch, 0);
             blen = 0;

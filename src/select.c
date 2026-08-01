@@ -27,6 +27,7 @@
 /* When non-NULL, exec_select_into copies SELECT results to this capture
  * in addition to printing them (used by the TCP server for JSON output). */
 __thread Capture *g_select_capture = NULL;
+__thread Capture *g_pending_capture = NULL;
 
 /* Set-operation ORDER BY support: the comparator resolves ORDER BY
  * expressions against the merged output columns. */
@@ -495,6 +496,13 @@ static int capture_push(Capture *c, const Value *row, int ncols)
 /* Public entry: run a SELECT and print results to stdout. */
 int exec_select(DB *db, Stmt *s, char *err)
 {
+    if (g_pending_capture) {
+        /* INSERT ... EXEC: the first SELECT of the CALLed procedure hands
+         * its rows to the capture instead of printing them */
+        Capture *cap = g_pending_capture;
+        g_pending_capture = NULL;
+        return exec_select_into(db, s, cap, err);
+    }
     return exec_select_into(db, s, NULL, err);
 }
 

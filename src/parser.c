@@ -82,6 +82,51 @@ void stmt_free(Stmt *s)
         free(s->set_rhs);
         s->set_rhs = NULL;
     }
+    for (int i = 0; i < s->nargs; i++) {
+        expr_free(s->args[i]);
+        s->args[i] = NULL;
+    }
+    s->nargs = 0;
+    if (s->stmts) {
+        for (int i = 0; i < s->nstmts; i++) {
+            if (s->stmts[i]) {
+                stmt_free(s->stmts[i]);
+                free(s->stmts[i]);
+                s->stmts[i] = NULL;
+            }
+        }
+        free(s->stmts);
+        s->stmts = NULL;
+        s->nstmts = 0;
+    }
+    if (s->else_stmts) {
+        for (int i = 0; i < s->n_else; i++) {
+            if (s->else_stmts[i]) {
+                stmt_free(s->else_stmts[i]);
+                free(s->else_stmts[i]);
+                s->else_stmts[i] = NULL;
+            }
+        }
+        free(s->else_stmts);
+        s->else_stmts = NULL;
+        s->n_else = 0;
+    }
+}
+
+/* Release a parsed procedure program (the statement list and every statement). */
+void prog_free(Program *p)
+{
+    if (!p) return;
+    for (int i = 0; i < p->nstmts; i++) {
+        if (p->stmts[i]) {
+            stmt_free(p->stmts[i]);
+            free(p->stmts[i]);
+            p->stmts[i] = NULL;
+        }
+    }
+    free(p->stmts);
+    p->stmts = NULL;
+    p->nstmts = 0;
 }
 
 /* ------------------------------------------------------------- utilities */
@@ -292,6 +337,15 @@ static Expr *parse_primary(Lexer *lx, char *err)
     }
 
     if (t->kind == TK_IDENT) {
+        /* @name — a stored-procedure variable or parameter. Resolved against
+         * the current variable frame at evaluation time. */
+        if (t->text[0] == '@') {
+            Expr *e = ex_new(EX_VAR);
+            if (!e) { snprintf(err, MAX_ERR, "out of memory"); return NULL; }
+            snprintf(e->col, MAX_NAME, "%s", t->text);
+            if (adv(lx, err) < 0) { expr_free(e); return NULL; }
+            return e;
+        }
         if (tok_is_kw(t, "NULL")) {
             Expr *e = ex_new(EX_LIT);
             if (!e) { snprintf(err, MAX_ERR, "out of memory"); return NULL; }
@@ -878,27 +932,500 @@ int parse_view_sql(const char *sql, Stmt *out, char *err)
     return parse_select(&lx, out, err);
 }
 
-static int parse_stmt_core(Lexer *lx, Stmt *out, char *err);
+static int parse_stmt_nobound(Lexer *lx, Stmt *out, char *err);
+static int parse_block_list(Lexer *lx, Stmt ***list, int *n, char *err);
+static int parse_branch_statement(Lexer *lx, Stmt *s, char *err);
 
-/* CREATE PROCEDURE name AS <one statement> — the body is validated here and
- * stored verbatim in Stmt::proc_sql for re-parsing at CALL time. A procedure
- * body is exactly one statement: statement separators terminate the batch,
- * so the parser never sees a multi-statement body. */
+/* Append a heap-allocated statement to a statement list (cap MAX_PROG_STMTS). */
+static int list_append(Stmt ***list, int *n, Stmt *st, char *err)
+{
+    if (*n >= MAX_PROG_STMTS) FAIL("procedure body too long (max %d statements)",
+                                   MAX_PROG_STMTS);
+    Stmt **grown = realloc(*list, (size_t)(*n + 1) * sizeof(Stmt *));
+    if (!grown) FAIL("out of memory");
+    *list = grown;
+    (*list)[(*n)++] = st;
+    return 0;
+}
+
+/* Parse one statement that may appear inside a procedure body: the control
+ * flow statements (BEGIN block, IF, WHILE, BREAK, CONTINUE, RETURN, DECLARE,
+ * SET) and cursor statements (DECLARE CURSOR, OPEN, FETCH, CLOSE,
+ * DEALLOCATE), falling back to any regular SQL statement. Returns 1 = parsed,
+ * 0 = end of input, -1 = error. */
+static int parse_proc_statement(Lexer *lx, Stmt *s, char *err)
+{
+    Token *t = &lx->cur;
+
+    /* BEGIN TRY ... END TRY BEGIN CATCH ... END CATCH */
+    if (tok_is_kw(t, "BEGIN") && tok_is_kw(lex_peek(lx), "TRY")) {
+        if (adv(lx, err) < 0) return -1;
+        if (adv(lx, err) < 0) return -1;
+        s->kind = ST_TRY;
+        if (parse_block_list(lx, &s->stmts, &s->nstmts, err) < 0) return -1;
+        if (eat_kw(lx, "TRY", err) < 0) return -1;
+        if (!(tok_is_kw(&lx->cur, "BEGIN") && tok_is_kw(lex_peek(lx), "CATCH")))
+            FAIL("expected BEGIN CATCH after END TRY");
+        if (adv(lx, err) < 0) return -1;
+        if (adv(lx, err) < 0) return -1;
+        if (parse_block_list(lx, &s->else_stmts, &s->n_else, err) < 0) return -1;
+        if (eat_kw(lx, "CATCH", err) < 0) return -1;
+        return 1;
+    }
+
+    if (tok_is_kw(t, "BEGIN") &&
+        !tok_is_kw(lex_peek(lx), "TRANSACTION") &&
+        !tok_is_kw(lex_peek(lx), "TRAN") &&
+        !tok_is_kw(lex_peek(lx), "TRY") &&
+        !tok_is_kw(lex_peek(lx), "CATCH")) {
+        if (adv(lx, err) < 0) return -1;
+        s->kind = ST_BLOCK;
+        if (parse_block_list(lx, &s->stmts, &s->nstmts, err) < 0) return -1;
+        return 1;
+    }
+
+    if (tok_is_kw(t, "IF")) {
+        if (adv(lx, err) < 0) return -1;
+        s->kind = ST_IF;
+        int paren = tok_is_punct(&lx->cur, "(");
+        if (paren && adv(lx, err) < 0) return -1;
+        s->where = parse_or(lx, err);
+        if (!s->where) return -1;
+        if (paren && !tok_is_punct(&lx->cur, ")")) {
+            snprintf(err, MAX_ERR, "expected ')' after IF condition");
+            return -1;
+        }
+        if (paren && adv(lx, err) < 0) return -1;
+        Stmt *then_b = calloc(1, sizeof(Stmt));
+        if (!then_b) FAIL("out of memory");
+        then_b->top = -1;
+        if (parse_branch_statement(lx, then_b, err) < 0) { free(then_b); return -1; }
+        s->stmts = malloc(sizeof(Stmt *));
+        if (!s->stmts) FAIL("out of memory");
+        s->stmts[0] = then_b;
+        s->nstmts = 1;
+        /* optional ELSE (separators allowed between the branches) */
+        for (;;) {
+            if (tok_is_punct(&lx->cur, ";") || tok_is_kw(&lx->cur, "GO")) {
+                if (adv(lx, err) < 0) return -1;
+                continue;
+            }
+            break;
+        }
+        if (tok_is_kw(&lx->cur, "ELSE")) {
+            if (adv(lx, err) < 0) return -1;
+            Stmt *else_b = calloc(1, sizeof(Stmt));
+            if (!else_b) FAIL("out of memory");
+            else_b->top = -1;
+            if (parse_branch_statement(lx, else_b, err) < 0) { free(else_b); return -1; }
+            s->else_stmts = malloc(sizeof(Stmt *));
+            if (!s->else_stmts) FAIL("out of memory");
+            s->else_stmts[0] = else_b;
+            s->n_else = 1;
+        }
+        return 1;
+    }
+
+    if (tok_is_kw(t, "WHILE")) {
+        if (adv(lx, err) < 0) return -1;
+        s->kind = ST_WHILE;
+        int paren = tok_is_punct(&lx->cur, "(");
+        if (paren && adv(lx, err) < 0) return -1;
+        s->where = parse_or(lx, err);
+        if (!s->where) return -1;
+        if (paren && !tok_is_punct(&lx->cur, ")")) {
+            snprintf(err, MAX_ERR, "expected ')' after WHILE condition");
+            return -1;
+        }
+        if (paren && adv(lx, err) < 0) return -1;
+        Stmt *body = calloc(1, sizeof(Stmt));
+        if (!body) FAIL("out of memory");
+        body->top = -1;
+        if (parse_branch_statement(lx, body, err) < 0) { free(body); return -1; }
+        s->stmts = malloc(sizeof(Stmt *));
+        if (!s->stmts) FAIL("out of memory");
+        s->stmts[0] = body;
+        s->nstmts = 1;
+        return 1;
+    }
+
+    if (tok_is_kw(t, "BREAK")) {
+        s->kind = ST_BREAK;
+        if (adv(lx, err) < 0) return -1;
+        return 1;
+    }
+    if (tok_is_kw(t, "CONTINUE")) {
+        s->kind = ST_CONTINUE;
+        if (adv(lx, err) < 0) return -1;
+        return 1;
+    }
+    if (tok_is_kw(t, "RETURN")) {
+        s->kind = ST_RETURN;
+        if (adv(lx, err) < 0) return -1;
+        /* optional result expression, evaluated for its side effects only */
+        if (!(lx->cur.kind == TK_EOF ||
+              tok_is_punct(&lx->cur, ";") ||
+              tok_is_kw(&lx->cur, "GO") ||
+              tok_is_kw(&lx->cur, "END") ||
+              tok_is_kw(&lx->cur, "ELSE"))) {
+            s->sets[0].val = parse_or(lx, err);
+            if (!s->sets[0].val) return -1;
+            s->nsets = 1;
+        }
+        return 1;
+    }
+
+    if (tok_is_kw(t, "DECLARE")) {
+        if (adv(lx, err) < 0) return -1;
+        if (lx->cur.kind != TK_IDENT)
+            FAIL("DECLARE needs a variable name starting with '@' or a cursor name");
+        /* DECLARE name CURSOR FOR SELECT ... */
+        if (tok_is_kw(lex_peek(lx), "CURSOR")) {
+            s->kind = ST_DECLARE_CURSOR;
+            if (take_ident(lx, s->table, MAX_NAME, err) < 0) return -1;
+            if (eat_kw(lx, "CURSOR", err) < 0) return -1;
+            if (eat_kw(lx, "FOR", err) < 0) return -1;
+            if (!tok_is_kw(&lx->cur, "SELECT"))
+                FAIL("a cursor must be FOR SELECT ...");
+            s->derived = calloc(1, sizeof(Stmt));
+            if (!s->derived) FAIL("out of memory");
+            s->derived->top = -1;
+            if (adv(lx, err) < 0) return -1;
+            if (parse_select(lx, s->derived, err) < 0) return -1;
+            return 1;
+        }
+        if (lx->cur.text[0] != '@')
+            FAIL("DECLARE needs a variable name starting with '@'");
+        s->kind = ST_DECLARE;
+        if (take_ident(lx, s->sets[0].col, MAX_NAME, err) < 0) return -1;
+        memset(&s->cols[0], 0, sizeof s->cols[0]);
+        if (parse_type(lx, &s->cols[0], err) < 0) return -1;
+        s->ncols = 1;
+        if (tok_is_punct(&lx->cur, "=")) {
+            if (adv(lx, err) < 0) return -1;
+            s->sets[0].val = parse_or(lx, err);
+            if (!s->sets[0].val) return -1;
+            s->nsets = 1;
+        }
+        return 1;
+    }
+
+    if (tok_is_kw(t, "SET")) {
+        if (adv(lx, err) < 0) return -1;
+        s->kind = ST_SET;
+        if (lx->cur.kind != TK_IDENT || lx->cur.text[0] != '@')
+            FAIL("SET needs a variable name starting with '@'");
+        if (take_ident(lx, s->sets[0].col, MAX_NAME, err) < 0) return -1;
+        if (eat_punct(lx, "=", err) < 0) return -1;
+        s->sets[0].val = parse_or(lx, err);
+        if (!s->sets[0].val) return -1;
+        s->nsets = 1;
+        return 1;
+    }
+
+    if (tok_is_kw(t, "OPEN")) {
+        s->kind = ST_OPEN;
+        if (adv(lx, err) < 0) return -1;
+        if (take_ident(lx, s->table, MAX_NAME, err) < 0) return -1;
+        return 1;
+    }
+    if (tok_is_kw(t, "CLOSE")) {
+        s->kind = ST_CLOSE;
+        if (adv(lx, err) < 0) return -1;
+        if (take_ident(lx, s->table, MAX_NAME, err) < 0) return -1;
+        return 1;
+    }
+    if (tok_is_kw(t, "DEALLOCATE")) {
+        s->kind = ST_DEALLOCATE;
+        if (adv(lx, err) < 0) return -1;
+        if (take_ident(lx, s->table, MAX_NAME, err) < 0) return -1;
+        return 1;
+    }
+    if (tok_is_kw(t, "FETCH")) {
+        if (adv(lx, err) < 0) return -1;
+        s->kind = ST_FETCH;
+        if (opt_kw(lx, "NEXT", err) < 0) return -1;
+        if (eat_kw(lx, "FROM", err) < 0) return -1;
+        if (take_ident(lx, s->table, MAX_NAME, err) < 0) return -1;
+        if (eat_kw(lx, "INTO", err) < 0) return -1;
+        for (;;) {
+            if (s->n_ins_cols >= MAX_COLS)
+                FAIL("too many FETCH INTO targets (max %d)", MAX_COLS);
+            if (lx->cur.kind != TK_IDENT || lx->cur.text[0] != '@')
+                FAIL("FETCH INTO targets must be variables starting with '@'");
+            if (take_ident(lx, s->ins_cols[s->n_ins_cols], MAX_NAME, err) < 0) return -1;
+            s->n_ins_cols++;
+            int more = opt_punct(lx, ",", err);
+            if (more < 0) return -1;
+            if (!more) break;
+        }
+        return 1;
+    }
+
+    /* any regular SQL statement; it must end at a statement boundary or at a
+     * keyword that the enclosing structure consumes (END, ELSE) */
+    int rc = parse_stmt_nobound(lx, s, err);
+    if (rc <= 0) return rc;
+    if (s->kind == ST_EXPLAIN) return 1;
+    if (!(lx->cur.kind == TK_EOF ||
+          tok_is_punct(&lx->cur, ";") ||
+          tok_is_kw(&lx->cur, "GO") ||
+          tok_is_kw(&lx->cur, "END") ||
+          tok_is_kw(&lx->cur, "ELSE"))) {
+        snprintf(err, MAX_ERR,
+                 "unexpected '%s' on line %d, after what otherwise looked like "
+                 "a complete statement - this dialect may not support that "
+                 "clause. Nothing was run.",
+                 lx->cur.text, lx->cur.line);
+        stmt_free(s);
+        return -1;
+    }
+    return 1;
+}
+
+/* The body of IF/WHILE: either a BEGIN ... END block or a single statement. */
+static int parse_branch_statement(Lexer *lx, Stmt *s, char *err)
+{
+    if (tok_is_kw(&lx->cur, "BEGIN") &&
+        !tok_is_kw(lex_peek(lx), "TRANSACTION") &&
+        !tok_is_kw(lex_peek(lx), "TRAN") &&
+        !tok_is_kw(lex_peek(lx), "TRY") &&
+        !tok_is_kw(lex_peek(lx), "CATCH")) {
+        if (adv(lx, err) < 0) return -1;
+        s->kind = ST_BLOCK;
+        if (parse_block_list(lx, &s->stmts, &s->nstmts, err) < 0) return -1;
+        return 0;
+    }
+    return parse_proc_statement(lx, s, err);
+}
+
+/* Parse statements until the matching END (which is consumed) or end of
+ * input. Used for BEGIN ... END blocks and procedure bodies. */
+static int parse_block_list(Lexer *lx, Stmt ***list, int *n, char *err)
+{
+    for (;;) {
+        if (lx->cur.kind == TK_EOF) {
+            snprintf(err, MAX_ERR, "expected END to close the block on line %d",
+                     lx->cur.line);
+            return -1;
+        }
+        if (tok_is_kw(&lx->cur, "END")) {
+            if (adv(lx, err) < 0) return -1;
+            return 1;   /* block closed */
+        }
+        if (tok_is_punct(&lx->cur, ";") || tok_is_kw(&lx->cur, "GO")) {
+            if (adv(lx, err) < 0) return -1;
+            continue;
+        }
+        Stmt *st = calloc(1, sizeof(Stmt));
+        if (!st) FAIL("out of memory");
+        st->top = -1;
+        int rc = parse_proc_statement(lx, st, err);
+        if (rc < 0) {
+            stmt_free(st);
+            free(st);
+            return -1;
+        }
+        if (rc == 0) {
+            free(st);
+            snprintf(err, MAX_ERR, "expected END to close the block on line %d",
+                     lx->cur.line);
+            return -1;
+        }
+        if (list_append(list, n, st, err) < 0) {
+            stmt_free(st);
+            free(st);
+            return -1;
+        }
+    }
+}
+
+/* Parse a procedure body in place from a lexer: either a BEGIN ... END block
+ * or a single statement (legacy bodies). On success the lexer sits right after
+ * the body, so the caller can slice the source text. */
+static int parse_program_raw(Lexer *lx, Program *pgm, char *err)
+{
+    memset(pgm, 0, sizeof *pgm);
+    if (lx->cur.kind == TK_EOF) return 0;
+    if (tok_is_kw(&lx->cur, "BEGIN") &&
+        !tok_is_kw(lex_peek(lx), "TRANSACTION") &&
+        !tok_is_kw(lex_peek(lx), "TRAN") &&
+        !tok_is_kw(lex_peek(lx), "TRY") &&
+        !tok_is_kw(lex_peek(lx), "CATCH")) {
+        if (adv(lx, err) < 0) return -1;
+        return parse_block_list(lx, &pgm->stmts, &pgm->nstmts, err);
+    }
+    Stmt *st = calloc(1, sizeof(Stmt));
+    if (!st) FAIL("out of memory");
+    st->top = -1;
+    int rc = parse_proc_statement(lx, st, err);
+    if (rc < 0) {
+        stmt_free(st);
+        free(st);
+        return -1;
+    }
+    if (rc == 0) {
+        free(st);
+        return 0;
+    }
+    if (list_append(&pgm->stmts, &pgm->nstmts, st, err) < 0) {
+        stmt_free(st);
+        free(st);
+        return -1;
+    }
+    return 1;
+}
+
+/* Re-parse a stored procedure body into a program. */
+int parse_program(const char *sql, Program *pgm, char *err)
+{
+    Lexer lx;
+    lex_init(&lx, sql);
+    if (lex_next(&lx) < 0) {
+        snprintf(err, MAX_ERR, "%s", lx.err);
+        return -1;
+    }
+    int rc = parse_program_raw(&lx, pgm, err);
+    if (rc < 0) { prog_free(pgm); return -1; }
+    if (rc == 0) {
+        prog_free(pgm);
+        snprintf(err, MAX_ERR, "a procedure body must be a statement or a BEGIN ... END block");
+        return -1;
+    }
+    /* the body must be the whole text */
+    while (tok_is_punct(&lx.cur, ";") || tok_is_kw(&lx.cur, "GO")) {
+        if (adv(&lx, err) < 0) { prog_free(pgm); return -1; }
+    }
+    if (lx.cur.kind != TK_EOF) {
+        prog_free(pgm);
+        snprintf(err, MAX_ERR, "unexpected '%s' after the procedure body",
+                 lx.cur.text);
+        return -1;
+    }
+    return 0;
+}
+
+/* Re-parse a stored procedure parameter list "(@a INT = 5, @b NVARCHAR(10))"
+ * into names and optional default expressions. Used at CALL time to build the
+ * variable frame; defaults are evaluated in the callee frame, so they may
+ * reference earlier parameters. The list was already validated when the
+ * procedure was created. */
+int proc_parse_params(const char *text, char names[][MAX_NAME], Expr *defs[],
+                      int max, int *n, char *err)
+{
+    Lexer lx;
+    lex_init(&lx, text);
+    if (lex_next(&lx) < 0) {
+        snprintf(err, MAX_ERR, "%s", lx.err);
+        return -1;
+    }
+    *n = 0;
+    if (eat_punct(&lx, "(", err) < 0) return -1;
+    for (;;) {
+        if (tok_is_punct(&lx.cur, ")")) {
+            if (adv(&lx, err) < 0) return -1;
+            break;
+        }
+        if (*n >= max) FAIL("too many parameters (max %d)", max);
+        if (lx.cur.kind != TK_IDENT || lx.cur.text[0] != '@') {
+            snprintf(err, MAX_ERR, "malformed stored parameter list '%s'", text);
+            return -1;
+        }
+        if (take_ident(&lx, names[*n], MAX_NAME, err) < 0) return -1;
+        Column pt;
+        memset(&pt, 0, sizeof pt);
+        if (parse_type(&lx, &pt, err) < 0) return -1;
+        defs[*n] = NULL;
+        if (tok_is_punct(&lx.cur, "=")) {
+            if (adv(&lx, err) < 0) return -1;
+            defs[*n] = parse_or(&lx, err);
+            if (!defs[*n]) return -1;
+        }
+        /* OUTPUT is accepted (it is validated at CREATE time); the frame has
+         * no notion of direction, only the caller's OUTPUT arguments matter */
+        if (tok_is_kw(&lx.cur, "OUTPUT") || tok_is_kw(&lx.cur, "OUT")) {
+            if (adv(&lx, err) < 0) return -1;
+        }
+        (*n)++;
+        if (tok_is_punct(&lx.cur, ",")) {
+            if (adv(&lx, err) < 0) return -1;
+            continue;
+        }
+        if (tok_is_punct(&lx.cur, ")")) {
+            if (adv(&lx, err) < 0) return -1;
+            break;
+        }
+        snprintf(err, MAX_ERR, "malformed stored parameter list '%s'", text);
+        return -1;
+    }
+    return 0;
+}
+
+/* CREATE PROCEDURE name [( @a TYPE, @b TYPE ... )] AS <body> — the parameter
+ * list and the body are validated here and stored verbatim in Stmt::param_sql
+ * and Stmt::proc_sql for re-parsing at CALL time. The body is either a
+ * BEGIN ... END block or a single statement. */
 static int parse_create_proc(Lexer *lx, Stmt *s, char *err)
 {
     s->kind = ST_CREATE_PROC;
     if (take_ident(lx, s->table, MAX_NAME, err) < 0) return -1;
+
+    /* optional parameter list: (@a INT, @b NVARCHAR(10)) */
+    if (tok_is_punct(&lx->cur, "(")) {
+        const char *pstart = lx->src + lx->pos - 1;   /* include '(' */
+        if (adv(lx, err) < 0) return -1;
+        for (;;) {
+            if (tok_is_punct(&lx->cur, ")")) break;   /* zero parameters */
+            if (lx->cur.kind != TK_IDENT || lx->cur.text[0] != '@')
+                FAIL("expected a parameter like @name TYPE");
+            if (adv(lx, err) < 0) return -1;
+            Column pt;
+            memset(&pt, 0, sizeof pt);
+            if (parse_type(lx, &pt, err) < 0) return -1;
+            /* optional default: @a INT = 5 (stored verbatim, so only the
+             * syntax needs validating here) */
+            if (tok_is_punct(&lx->cur, "=")) {
+                if (adv(lx, err) < 0) return -1;
+                Expr *d = parse_or(lx, err);
+                if (!d) return -1;
+                expr_free(d);
+            }
+            /* optional OUTPUT marker: @b INT OUTPUT */
+            if (tok_is_kw(&lx->cur, "OUTPUT") || tok_is_kw(&lx->cur, "OUT")) {
+                if (adv(lx, err) < 0) return -1;
+            }
+            if (tok_is_punct(&lx->cur, ",")) {
+                if (adv(lx, err) < 0) return -1;
+                continue;
+            }
+            if (!tok_is_punct(&lx->cur, ")"))
+                FAIL("expected ',' or ')' in the parameter list");
+            break;
+        }
+        const char *pend = lx->src + lx->pos + 1;      /* include ')' */
+        size_t pn = (size_t)(pend - pstart);
+        if (pn >= MAX_PROC_SQL) {
+            snprintf(err, MAX_ERR, "parameter list too long (max %d bytes)",
+                     MAX_PROC_SQL);
+            return -1;
+        }
+        memcpy(s->param_sql, pstart, pn);
+        s->param_sql[pn] = 0;
+        if (adv(lx, err) < 0) return -1;
+    }
+
     if (eat_kw(lx, "AS", err) < 0) return -1;
 
     const char *start = lx->src + lx->pos - strlen(lx->cur.text);
 
-    Stmt probe;
-    memset(&probe, 0, sizeof probe);
-    probe.top = -1;
-    int rc = parse_stmt_core(lx, &probe, err);
+    Program probe;
+    int rc = parse_program_raw(lx, &probe, err);
     if (rc < 0) return -1;
-    if (rc == 0) FAIL("a procedure body must be a statement");
-    stmt_free(&probe);
+    if (rc == 0) {
+        prog_free(&probe);
+        FAIL("a procedure body must be a statement or a BEGIN ... END block");
+    }
+    prog_free(&probe);
 
     const char *end = lx->src + lx->pos;
     while (end > start && (end[-1] == ' ' || end[-1] == '\t' ||
@@ -911,23 +1438,6 @@ static int parse_create_proc(Lexer *lx, Stmt *s, char *err)
     }
     memcpy(s->proc_sql, start, n);
     s->proc_sql[n] = 0;
-    return 0;
-}
-
-/* Re-parse a stored procedure body into a statement. */
-int parse_proc_sql(const char *sql, Stmt *out, char *err)
-{
-    Lexer lx;
-    lex_init(&lx, sql);
-    if (lex_next(&lx) < 0) {
-        snprintf(err, MAX_ERR, "%s", lx.err);
-        return -1;
-    }
-    int rc = parse_stmt(&lx, out, err);
-    if (rc <= 0) {
-        snprintf(err, MAX_ERR, "a procedure body must be a statement");
-        return -1;
-    }
     return 0;
 }
 
@@ -1168,6 +1678,27 @@ static int parse_insert(Lexer *lx, Stmt *s, char *err)
         return 0;
     }
 
+    /* INSERT INTO t (cols) EXEC proc [args] — rows come from the
+     * procedure's first result set */
+    if (tok_is_kw(&lx->cur, "EXEC") || tok_is_kw(&lx->cur, "EXECUTE") ||
+        tok_is_kw(&lx->cur, "CALL")) {
+        Stmt *sub = calloc(1, sizeof(Stmt));
+        if (!sub) FAIL("out of memory");
+        sub->top = -1;
+        if (parse_stmt_nobound(lx, sub, err) < 0) {
+            stmt_free(sub);
+            free(sub);
+            return -1;
+        }
+        if (sub->kind != ST_CALL) {
+            stmt_free(sub);
+            free(sub);
+            FAIL("INSERT ... EXEC expects a procedure call");
+        }
+        s->sub = sub;
+        return 0;
+    }
+
     if (eat_kw(lx, "VALUES", err) < 0) return -1;
 
     for (;;) {
@@ -1350,6 +1881,8 @@ static int parse_select_core(Lexer *lx, Stmt *s, char *err)
                    !tok_is_kw(&lx->cur, "EXCEPT") &&
                    !tok_is_kw(&lx->cur, "LIMIT") &&
                    !tok_is_kw(&lx->cur, "OFFSET") &&
+                   !tok_is_kw(&lx->cur, "END") &&
+                   !tok_is_kw(&lx->cur, "ELSE") &&
                    !tok_is_kw(&lx->cur, "GO")) {
             /* the bare-word alias form: SELECT n total FROM t */
             if (take_ident(lx, it->alias, MAX_NAME, err) < 0) return -1;
@@ -1411,6 +1944,8 @@ static int parse_select_core(Lexer *lx, Stmt *s, char *err)
             !tok_is_kw(&lx->cur, "LEFT") &&
             !tok_is_kw(&lx->cur, "JOIN") &&
             !tok_is_kw(&lx->cur, "ON") &&
+            !tok_is_kw(&lx->cur, "END") &&
+            !tok_is_kw(&lx->cur, "ELSE") &&
             !tok_is_kw(&lx->cur, "GO")) {
             if (take_ident(lx, s->alias, MAX_NAME, err) < 0) return -1;
         }
@@ -1615,11 +2150,69 @@ static int parse_show(Lexer *lx, Stmt *s, char *err)
 
 /* --------------------------------------------------------- entry point */
 
-/* parse one statement without consuming its trailing ';'. The separator
- * skip and the trailing-garbage boundary check are identical to parse_stmt;
- * this exists so a CREATE PROCEDURE body probe leaves the batch's statement
- * boundary intact for the outer statement. */
-static int parse_stmt_core(Lexer *lx, Stmt *out, char *err)
+/* parse one statement without any trailing-garbage boundary check. This is
+ * the common core of batch statements and procedure-body statements; the
+ * callers add their own boundary rules. */
+/* One CALL/EXEC argument: [@name =] <expr> [OUTPUT]. The named form is
+ * detected before parse_or runs, so the '=' in "@a = 1" is not misread as a
+ * comparison. */
+static int parse_one_call_arg(Lexer *lx, Stmt *out, char *err)
+{
+    if (out->nargs >= MAX_FUNC_ARGS)
+        FAIL("too many CALL arguments (max %d)", MAX_FUNC_ARGS);
+    int i = out->nargs;
+    if (lx->cur.kind == TK_IDENT && lx->cur.text[0] == '@' &&
+        tok_is_punct(lex_peek(lx), "=")) {
+        snprintf(out->argnames[i], MAX_NAME, "%s", lx->cur.text);
+        if (adv(lx, err) < 0) return -1;
+        if (adv(lx, err) < 0) return -1;
+    }
+    out->args[i] = parse_or(lx, err);
+    if (!out->args[i]) return -1;
+    out->nargs++;
+    if (tok_is_kw(&lx->cur, "OUTPUT") || tok_is_kw(&lx->cur, "OUT")) {
+        if (out->args[i]->kind != EX_VAR) {
+            snprintf(err, MAX_ERR, "an OUTPUT argument must be a variable");
+            return -1;
+        }
+        out->argout[i] = 1;
+        if (adv(lx, err) < 0) return -1;
+    }
+    return 0;
+}
+
+/* Procedure arguments: CALL p(1, @x OUTPUT, @a = 2) or the parenthesised form
+ * EXEC p(1) — and bare form EXEC p 1, 'x' — arguments run up to the statement
+ * terminator (or END/ELSE inside a procedure body). */
+static int parse_call_args(Lexer *lx, Stmt *out, char *err)
+{
+    if (tok_is_punct(&lx->cur, "(")) {
+        if (adv(lx, err) < 0) return -1;
+        if (tok_is_punct(&lx->cur, ")")) {
+            if (adv(lx, err) < 0) return -1;
+            return 0;
+        }
+        for (;;) {
+            if (parse_one_call_arg(lx, out, err) < 0) return -1;
+            int more = opt_punct(lx, ",", err);
+            if (more < 0) return -1;
+            if (!more) break;
+        }
+        return eat_punct(lx, ")", err);
+    }
+    for (;;) {
+        if (lx->cur.kind == TK_EOF || tok_is_punct(&lx->cur, ";") ||
+            tok_is_kw(&lx->cur, "GO") || tok_is_kw(&lx->cur, "END") ||
+            tok_is_kw(&lx->cur, "ELSE"))
+            return 0;
+        if (parse_one_call_arg(lx, out, err) < 0) return -1;
+        int more = opt_punct(lx, ",", err);
+        if (more < 0) return -1;
+        if (!more) return 0;
+    }
+}
+
+static int parse_stmt_nobound(Lexer *lx, Stmt *out, char *err)
 {
     memset(out, 0, sizeof *out);
     out->top = -1;
@@ -1680,10 +2273,36 @@ static int parse_stmt_core(Lexer *lx, Stmt *out, char *err)
             rc = take_ident(lx, out->table, MAX_NAME, err);
         }
     }
-    else if (tok_is_kw(t, "CALL")) {
+    else if (tok_is_kw(t, "CALL") || tok_is_kw(t, "EXEC") || tok_is_kw(t, "EXECUTE")) {
+        int exec_form = !tok_is_kw(t, "CALL");
         if (adv(lx, err) < 0) return -1;
         out->kind = ST_CALL;
+        if (exec_form) {
+            /* EXEC @rc = proc ... — the return-code target */
+            if (lx->cur.kind == TK_IDENT && lx->cur.text[0] == '@' &&
+                tok_is_punct(lex_peek(lx), "=")) {
+                snprintf(out->retvar, MAX_NAME, "%s", lx->cur.text);
+                if (adv(lx, err) < 0) return -1;
+                if (adv(lx, err) < 0) return -1;
+            }
+            /* EXEC ('...') / EXEC @rc = ('...') — dynamic SQL */
+            if (tok_is_punct(&lx->cur, "(")) {
+                if (adv(lx, err) < 0) return -1;
+                out->kind = ST_EXEC_SQL;
+                out->sets[0].val = parse_or(lx, err);
+                if (!out->sets[0].val) return -1;
+                out->nsets = 1;
+                if (eat_punct(lx, ")", err) < 0) return -1;
+                rc = 0;
+                goto exec_done;
+            }
+        }
         rc = take_ident(lx, out->table, MAX_NAME, err);
+        if (rc < 0) return rc;
+        if (parse_call_args(lx, out, err) < 0) return -1;
+        rc = 0;
+    exec_done:
+        ;
     }
     else if (tok_is_kw(t, "ALTER")) {
         if (adv(lx, err) < 0) return -1;
@@ -1768,11 +2387,25 @@ static int parse_stmt_core(Lexer *lx, Stmt *out, char *err)
     else if (tok_is_kw(t, "CHECKPOINT")) { out->kind = ST_CHECKPOINT; rc = adv(lx, err); }
     else if (tok_is_kw(t, "PRINT")) {
         if (adv(lx, err) < 0) return -1;
-        if (lx->cur.kind != TK_STRING && lx->cur.kind != TK_NUMBER)
-            FAIL("PRINT expects a literal on line %d", lx->cur.line);
-        snprintf(out->msg, sizeof out->msg, "%s", lx->cur.text);
         out->kind = ST_PRINT;
-        rc = adv(lx, err);
+        out->sets[0].val = parse_or(lx, err);
+        if (!out->sets[0].val) return -1;
+        out->nsets = 1;
+        rc = 0;
+    }
+    else if (tok_is_kw(t, "BEGIN") && tok_is_kw(lex_peek(lx), "TRY")) {
+        if (adv(lx, err) < 0) return -1;
+        if (adv(lx, err) < 0) return -1;
+        out->kind = ST_TRY;
+        if (parse_block_list(lx, &out->stmts, &out->nstmts, err) < 0) return -1;
+        if (eat_kw(lx, "TRY", err) < 0) return -1;
+        if (!(tok_is_kw(&lx->cur, "BEGIN") && tok_is_kw(lex_peek(lx), "CATCH")))
+            FAIL("expected BEGIN CATCH after END TRY");
+        if (adv(lx, err) < 0) return -1;
+        if (adv(lx, err) < 0) return -1;
+        if (parse_block_list(lx, &out->else_stmts, &out->n_else, err) < 0) return -1;
+        if (eat_kw(lx, "CATCH", err) < 0) return -1;
+        rc = 0;
     }
     else if (tok_is_kw(t, "BEGIN")) {
         out->kind = ST_BEGIN;
@@ -1824,6 +2457,22 @@ static int parse_stmt_core(Lexer *lx, Stmt *out, char *err)
 
     /* EXPLAIN skips the boundary check — its inner statement already consumed
      * the terminator. */
+    if (out->kind == ST_EXPLAIN)
+        return 1;
+
+    return 1;
+}
+
+/* parse one statement without consuming its trailing ';'. The separator
+ * skip and the trailing-garbage boundary check are identical to parse_stmt;
+ * this exists so a CREATE PROCEDURE body probe leaves the batch's statement
+ * boundary intact for the outer statement. */
+static int parse_stmt_core(Lexer *lx, Stmt *out, char *err)
+{
+    int rc = parse_stmt_nobound(lx, out, err);
+    if (rc <= 0) return rc;
+
+    /* EXPLAIN's inner statement already consumed the terminator */
     if (out->kind == ST_EXPLAIN)
         return 1;
 
