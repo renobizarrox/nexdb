@@ -255,91 +255,16 @@ static void btree_remove_entry(uint8_t *pg, int pos)
     wr16(pg, BT_NKEYS, (uint16_t)(n - 1));
 }
 
-static int btree_split_child(DB *db, uint8_t *parent, int pos, uint32_t parent_pno, uint32_t *root_ptr, char *err)
-{
-    (void)root_ptr;
-    int leaf = parent[BT_FLAGS] & BT_LEAF;
-    if (leaf) {
-        snprintf(err, MAX_ERR, "cannot split leaf from internal caller");
-        return -1;
-    }
-
-    size_t p_off = BT_HDR_SIZE + 4;
-    for (int i = 0; i < pos; i++)
-        p_off += entry_size(parent, p_off, 0);
-
-    uint32_t child_pno = rd32(parent, p_off - 4);
-    uint8_t child[PAGE_SIZE];
-    if (pager_read(db, child_pno, child) < 0) return -1;
-
-    int n = rd16(child, BT_NKEYS);
-    int cleft = child[BT_FLAGS] & BT_LEAF;
-#ifdef DEBUG_SPLIT
-    fprintf(stderr, "SPLIT child=%u n=%d cleft=%d pos=%d parent_pno=%u\n",
-            child_pno, n, cleft, pos, parent_pno);
-#endif
-
-    int split = n / 2;
-
-    uint32_t right_pno = pager_alloc(db);
-    if (right_pno == 0) return -1;
-    uint8_t right[PAGE_SIZE];
-    memset(right, 0, PAGE_SIZE);
-    right[BT_FLAGS] = (uint8_t)(cleft ? BT_LEAF : 0);
-
-    if (cleft)
-        wr32(right, BT_NEXT, rd32(child, BT_NEXT));
-
-    size_t left_used = BT_HDR_SIZE;
-    if (!cleft) left_used += 4;
-    for (int i = 0; i < split; i++)
-        left_used += entry_size(child, left_used, cleft);
-
-    size_t right_off = BT_HDR_SIZE;
-    if (!cleft) right_off += 4;
-    size_t child_off = left_used;
-    for (int i = split; i < n; i++) {
-        size_t es = entry_size(child, child_off, cleft);
-        memmove(right + right_off, child + child_off, es);
-        right_off += es;
-        child_off += es;
-    }
-
-    int right_n = n - split;
-    wr16(right, BT_NKEYS, (uint16_t)right_n);
-
-    wr16(child, BT_NKEYS, (uint16_t)split);
-
-    Value mid_key;
-    size_t mid_off = BT_HDR_SIZE;
-    if (!cleft) mid_off += 4;
-    for (int i = 0; i < split; i++)
-        mid_off += entry_size(child, mid_off, cleft);
-    size_t mk_c;
-    if (key_decode(child + mid_off, PAGE_SIZE - mid_off, &mid_key, &mk_c) < 0) {
-        snprintf(err, MAX_ERR, "btree: corrupt node");
-        return -1;
-    }
-
-    btree_insert_entry(parent, pos, &mid_key, right_pno, (RowRef){0,0}, 0);
-    val_clear(&mid_key);
-
-    wr32(child, BT_NEXT, right_pno);
-
-    if (pager_write(db, child_pno, child) < 0) return -1;
-    if (pager_write(db, right_pno, right) < 0) return -1;
-    if (pager_write(db, parent_pno, parent) < 0) return -1;
-
-    return 0;
-}
-
-static int btree_insert_nonfull(DB *db, uint32_t pno, const Value *key, RowRef ref, int dup, uint32_t *root, char *err)
+static int btree_insert_level(DB *db, uint32_t pno, const Value *key, RowRef ref,
+                              int dup, Value *promote, uint32_t *promote_right,
+                              char *err)
 {
 #ifdef DEBUG_SPLIT
     fprintf(stderr, "IN pno=%u key=%s\n", pno, key->tag == T_TEXT ? key->s : "?");
 #endif
     uint8_t pg[PAGE_SIZE];
     if (pager_read(db, pno, pg) < 0) return -1;
+    size_t off;
 
     if (pg[BT_FLAGS] & BT_LEAF) {
         int exact;
@@ -349,109 +274,93 @@ static int btree_insert_nonfull(DB *db, uint32_t pno, const Value *key, RowRef r
             snprintf(err, MAX_ERR, "duplicate key violates UNIQUE constraint");
             return -1;
         }
-
         size_t need = key_size(key) + 6;
-        size_t used = total_used(pg);
-        if (used + need > PAGE_SIZE) {
-            uint8_t new_root[PAGE_SIZE];
-            memset(new_root, 0, PAGE_SIZE);
-            new_root[BT_FLAGS] = BT_ROOT;
-            wr16(new_root, BT_NKEYS, 0);
-
-            uint32_t left_pno = pno;
-            uint32_t right_pno = pager_alloc(db);
-            if (right_pno == 0) return -1;
-
-            int n = rd16(pg, BT_NKEYS);
-            uint32_t *all_pages = malloc(sizeof(uint32_t) * (size_t)(n + 2));
-            RowRef  *all_refs  = malloc(sizeof(RowRef) * (size_t)(n + 2));
-            Value   *all_keys  = malloc(sizeof(Value) * (size_t)(n + 2));
-            if (!all_pages || !all_refs || !all_keys) {
-                free(all_pages); free(all_refs); free(all_keys);
-                snprintf(err, MAX_ERR, "out of memory");
-                return -1;
-            }
-
-            size_t off = BT_HDR_SIZE;
-            for (int i = 0; i < n; i++) {
-                size_t c;
-                if (key_decode(pg + off, PAGE_SIZE - off, &all_keys[i], &c) < 0) {
-                    free(all_pages); free(all_refs); free(all_keys);
-                    return -1;
-                }
-                off += c;
-                all_refs[i].page = rd32(pg, off);
-                all_refs[i].slot = rd16(pg, off + 4);
-                off += 6;
-                all_pages[i] = 0;
-            }
-
-            all_keys[n] = val_copy(key);
-            all_refs[n] = ref;
-            all_pages[n] = 0;
-            n++;
-
-            for (int i = 0; i < n; i++) {
-                for (int j = i + 1; j < n; j++) {
-                    int ok;
-                    if (val_compare(&all_keys[i], &all_keys[j], &ok) > 0 && ok == 1) {
-                        Value tk = all_keys[i]; all_keys[i] = all_keys[j]; all_keys[j] = tk;
-                        RowRef tr = all_refs[i]; all_refs[i] = all_refs[j]; all_refs[j] = tr;
-                    }
-                }
-            }
-
-            int half = n / 2;
-            uint32_t old_next = rd32(pg, BT_NEXT);
-
-            memset(pg, 0, PAGE_SIZE);
-            pg[BT_FLAGS] = BT_LEAF;
-            off = BT_HDR_SIZE;
-            for (int i = 0; i < half; i++) {
-                off += key_encode(&all_keys[i], pg + off, PAGE_SIZE - off);
-                wr32(pg, off, all_refs[i].page); off += 4;
-                wr16(pg, off, all_refs[i].slot); off += 2;
-            }
-            wr16(pg, BT_NKEYS, (uint16_t)half);
-            wr32(pg, BT_NEXT, right_pno);
-
-            uint8_t right_buf[PAGE_SIZE];
-            memset(right_buf, 0, PAGE_SIZE);
-            right_buf[BT_FLAGS] = BT_LEAF;
-            wr32(right_buf, BT_NEXT, old_next);
-            off = BT_HDR_SIZE;
-            for (int i = half; i < n; i++) {
-                off += key_encode(&all_keys[i], right_buf + off, PAGE_SIZE - off);
-                wr32(right_buf, off, all_refs[i].page); off += 4;
-                wr16(right_buf, off, all_refs[i].slot); off += 2;
-            }
-            wr16(right_buf, BT_NKEYS, (uint16_t)(n - half));
-
-            Value promote = val_copy(&all_keys[half]);
-
-            new_root[BT_FLAGS] = BT_ROOT;
-            size_t ro = BT_HDR_SIZE + 4;
-            ro += key_encode(&promote, new_root + ro, PAGE_SIZE - ro);
-            wr32(new_root, ro, right_pno);
-            wr16(new_root, BT_NKEYS, 1);
-            wr32(new_root, BT_HDR_SIZE, left_pno);
-
-            for (int i = 0; i < n; i++) val_clear(&all_keys[i]);
-            val_clear(&promote);
-            free(all_pages); free(all_refs); free(all_keys);
-
-            uint32_t new_root_pno = pager_alloc(db);
-            if (new_root_pno == 0) return -1;
-            if (pager_write(db, new_root_pno, new_root) < 0) return -1;
-            if (pager_write(db, left_pno, pg) < 0) return -1;
-            if (pager_write(db, right_pno, right_buf) < 0) return -1;
-
-            *root = new_root_pno;
-            return 0;
+        if (total_used(pg) + need <= PAGE_SIZE) {
+            btree_insert_entry(pg, pos, key, 0, ref, 1);
+            return pager_write(db, pno, pg);
         }
 
-        btree_insert_entry(pg, pos, key, 0, ref, 1);
-        return pager_write(db, pno, pg);
+        /* The leaf is full: fold the new entry in and split into a left part
+         * (this page) and a fresh right part. The first key of the right part
+         * is promoted to the parent and stays in the right leaf, which is the
+         * standard B+tree convention: a promoted separator is never removed
+         * from the leaves. Leaf-to-leaf chains are threaded left -> right. */
+        int n = rd16(pg, BT_NKEYS);
+        Value  *all_keys = malloc(sizeof(Value) * (size_t)(n + 2));
+        RowRef *all_refs = malloc(sizeof(RowRef) * (size_t)(n + 2));
+        if (!all_keys || !all_refs) {
+            free(all_keys); free(all_refs);
+            snprintf(err, MAX_ERR, "out of memory");
+            return -1;
+        }
+        off = BT_HDR_SIZE;
+        for (int i = 0; i < n; i++) {
+            size_t c;
+            if (key_decode(pg + off, PAGE_SIZE - off, &all_keys[i], &c) < 0) {
+                free(all_keys); free(all_refs);
+                return -1;
+            }
+            off += c;
+            all_refs[i].page = rd32(pg, off);
+            all_refs[i].slot = rd16(pg, off + 4);
+            off += 6;
+        }
+        all_keys[n] = val_copy(key);
+        all_refs[n] = ref;
+        n++;
+
+        for (int i = 0; i < n; i++) {
+            for (int j = i + 1; j < n; j++) {
+                int ok;
+                if (val_compare(&all_keys[i], &all_keys[j], &ok) > 0 && ok == 1) {
+                    Value tk = all_keys[i]; all_keys[i] = all_keys[j]; all_keys[j] = tk;
+                    RowRef tr = all_refs[i]; all_refs[i] = all_refs[j]; all_refs[j] = tr;
+                }
+            }
+        }
+
+        int half = n / 2;
+        uint32_t old_next = rd32(pg, BT_NEXT);
+        uint32_t right_pno = pager_alloc(db);
+        if (right_pno == 0) {
+            for (int i = 0; i < n; i++) val_clear(&all_keys[i]);
+            free(all_keys); free(all_refs);
+            return -1;
+        }
+
+        uint8_t right_buf[PAGE_SIZE];
+        memset(right_buf, 0, PAGE_SIZE);
+        right_buf[BT_FLAGS] = BT_LEAF;
+        wr32(right_buf, BT_NEXT, old_next);
+
+        memset(pg, 0, PAGE_SIZE);
+        pg[BT_FLAGS] = BT_LEAF;
+        wr32(pg, BT_NEXT, right_pno);
+        off = BT_HDR_SIZE;
+        for (int i = 0; i < half; i++) {
+            off += key_encode(&all_keys[i], pg + off, PAGE_SIZE - off);
+            wr32(pg, off, all_refs[i].page); off += 4;
+            wr16(pg, off, all_refs[i].slot); off += 2;
+        }
+        wr16(pg, BT_NKEYS, (uint16_t)half);
+
+        off = BT_HDR_SIZE;
+        for (int i = half; i < n; i++) {
+            off += key_encode(&all_keys[i], right_buf + off, PAGE_SIZE - off);
+            wr32(right_buf, off, all_refs[i].page); off += 4;
+            wr16(right_buf, off, all_refs[i].slot); off += 2;
+        }
+        wr16(right_buf, BT_NKEYS, (uint16_t)(n - half));
+
+        *promote = val_copy(&all_keys[half]);
+        *promote_right = right_pno;
+
+        for (int i = 0; i < n; i++) val_clear(&all_keys[i]);
+        free(all_keys); free(all_refs);
+
+        if (pager_write(db, pno, pg) < 0) return -1;
+        if (pager_write(db, right_pno, right_buf) < 0) return -1;
+        return 1;
     }
 
     int exact;
@@ -460,24 +369,96 @@ static int btree_insert_nonfull(DB *db, uint32_t pno, const Value *key, RowRef r
 
     uint32_t child_pno = btree_child(pg, pos, key, dup ? 0 : 1);
 
-    uint8_t child[PAGE_SIZE];
-    if (pager_read(db, child_pno, child) < 0) return -1;
+    int rc = btree_insert_level(db, child_pno, key, ref, dup,
+                                promote, promote_right, err);
+    if (rc <= 0) return rc;
 
-    size_t child_used = total_used(child);
-    size_t child_need = key_size(key) + (child[BT_FLAGS] & BT_LEAF ? 6 : 4);
-    if (child_used + child_need > PAGE_SIZE) {
-        if (btree_split_child(db, pg, (pos == 0) ? 0 : pos - 1, pno, root, err) < 0)
-            return -1;
-        if (pager_read(db, pno, pg) < 0) return -1;
-
-        int e2;
-        pos = btree_search_pos(pg, key, &e2, err);
-        if (pos < 0) return -1;
-
-        child_pno = btree_child(pg, pos, key, dup ? 0 : 1);
+    /* The child split and asked us to absorb (promote, promote_right). */
+    size_t pneed = key_size(promote) + 4;
+    if (total_used(pg) + pneed <= PAGE_SIZE) {
+        int pe;
+        int ppos = btree_search_pos(pg, promote, &pe, err);
+        if (ppos < 0) return -1;
+        btree_insert_entry(pg, ppos, promote, *promote_right, (RowRef){0,0}, 0);
+        val_clear(promote);
+        return pager_write(db, pno, pg);
     }
 
-    return btree_insert_nonfull(db, child_pno, key, ref, dup, root, err);
+    /* This internal node is full too: fold the promotion in, split in two and
+     * pass an even higher separator upward. The promoted key is removed from
+     * the right part, whose leading child becomes the promoted key's former
+     * right subtree. */
+    int n = rd16(pg, BT_NKEYS);
+    Value     *pk = malloc(sizeof(Value) * (size_t)(n + 2));
+    uint32_t  *pc = malloc(sizeof(uint32_t) * (size_t)(n + 2));
+    if (!pk || !pc) {
+        free(pk); free(pc);
+        snprintf(err, MAX_ERR, "out of memory");
+        return -1;
+    }
+    uint32_t leftmost = rd32(pg, BT_HDR_SIZE);
+    off = BT_HDR_SIZE + 4;
+    for (int i = 0; i < n; i++) {
+        size_t c;
+        if (key_decode(pg + off, PAGE_SIZE - off, &pk[i], &c) < 0) {
+            for (int j = 0; j < i; j++) val_clear(&pk[j]);
+            free(pk); free(pc);
+            return -1;
+        }
+        off += c;
+        pc[i] = rd32(pg, off);
+        off += 4;
+    }
+    pk[n] = *promote;               /* transfer ownership upward fold-in */
+    pc[n] = *promote_right;
+    n++;
+
+    for (int i = 0; i < n; i++) {
+        for (int j = i + 1; j < n; j++) {
+            int ok;
+            if (val_compare(&pk[i], &pk[j], &ok) > 0 && ok == 1) {
+                Value tk = pk[i]; pk[i] = pk[j]; pk[j] = tk;
+                uint32_t tc = pc[i]; pc[i] = pc[j]; pc[j] = tc;
+            }
+        }
+    }
+
+    int half = n / 2;
+    uint32_t right_pno = pager_alloc(db);
+    if (right_pno == 0) {
+        for (int i = 0; i < n; i++) val_clear(&pk[i]);
+        free(pk); free(pc);
+        return -1;
+    }
+
+    uint8_t rb[PAGE_SIZE];
+    memset(rb, 0, PAGE_SIZE);
+    off = BT_HDR_SIZE + 4;
+    wr32(rb, BT_HDR_SIZE, pc[half]);           /* leading child of right part */
+    for (int i = half + 1; i < n; i++) {
+        off += key_encode(&pk[i], rb + off, PAGE_SIZE - off);
+        wr32(rb, off, pc[i]); off += 4;
+    }
+    wr16(rb, BT_NKEYS, (uint16_t)(n - half - 1));
+
+    *promote = val_copy(&pk[half]);
+    *promote_right = right_pno;
+
+    memset(pg, 0, PAGE_SIZE);
+    wr32(pg, BT_HDR_SIZE, leftmost);
+    off = BT_HDR_SIZE + 4;
+    for (int i = 0; i < half; i++) {
+        off += key_encode(&pk[i], pg + off, PAGE_SIZE - off);
+        wr32(pg, off, pc[i]); off += 4;
+    }
+    wr16(pg, BT_NKEYS, (uint16_t)half);
+
+    for (int i = 0; i < n; i++) val_clear(&pk[i]);
+    free(pk); free(pc);
+
+    if (pager_write(db, pno, pg) < 0) return -1;
+    if (pager_write(db, right_pno, rb) < 0) return -1;
+    return 1;
 }
 
 int btree_create(Index *idx)
@@ -534,7 +515,26 @@ int btree_insert(DB *db, uint32_t *root, const Value *key, RowRef ref, char *err
         return pager_write(db, *root, pg);
     }
 
-    return btree_insert_nonfull(db, *root, key, ref, 0, root, err);
+    Value promote;
+    uint32_t right_pno;
+    int rc = btree_insert_level(db, *root, key, ref, 0, &promote, &right_pno, err);
+    if (rc < 0) return -1;
+    if (rc == 1) {
+        uint8_t nr[PAGE_SIZE];
+        memset(nr, 0, PAGE_SIZE);
+        nr[BT_FLAGS] = BT_ROOT;
+        size_t ro = BT_HDR_SIZE + 4;
+        ro += key_encode(&promote, nr + ro, PAGE_SIZE - ro);
+        wr32(nr, ro, right_pno);
+        wr16(nr, BT_NKEYS, 1);
+        wr32(nr, BT_HDR_SIZE, *root);
+        val_clear(&promote);
+        uint32_t np = pager_alloc(db);
+        if (np == 0) return -1;
+        if (pager_write(db, np, nr) < 0) return -1;
+        *root = np;
+    }
+    return 0;
 }
 
 /* Like btree_insert but for non-unique keys (GIN posting lists): equal keys
@@ -553,7 +553,26 @@ int btree_insert_dup(DB *db, uint32_t *root, const Value *key, RowRef ref, char 
         return pager_write(db, *root, pg);
     }
 
-    return btree_insert_nonfull(db, *root, key, ref, 1, root, err);
+    Value promote;
+    uint32_t right_pno;
+    int rc = btree_insert_level(db, *root, key, ref, 1, &promote, &right_pno, err);
+    if (rc < 0) return -1;
+    if (rc == 1) {
+        uint8_t nr[PAGE_SIZE];
+        memset(nr, 0, PAGE_SIZE);
+        nr[BT_FLAGS] = BT_ROOT;
+        size_t ro = BT_HDR_SIZE + 4;
+        ro += key_encode(&promote, nr + ro, PAGE_SIZE - ro);
+        wr32(nr, ro, right_pno);
+        wr16(nr, BT_NKEYS, 1);
+        wr32(nr, BT_HDR_SIZE, *root);
+        val_clear(&promote);
+        uint32_t np = pager_alloc(db);
+        if (np == 0) return -1;
+        if (pager_write(db, np, nr) < 0) return -1;
+        *root = np;
+    }
+    return 0;
 }
 
 int btree_delete(DB *db, uint32_t *root, const Value *key, char *err)

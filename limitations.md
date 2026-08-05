@@ -6,8 +6,9 @@ What is still missing and what it would take to fix it.
 
 `WHERE pk = literal` uses the B-tree for O(log n) point lookups. Range queries
 (`WHERE pk > 10`, `WHERE pk BETWEEN 1 AND 100`) still do a full table scan.
-Secondary indexes exist for UNIQUE constraint enforcement but are not used by
-`SELECT` at all.
+Secondary B-tree indexes exist for UNIQUE constraint enforcement and are not
+used by `SELECT` at all — the one exception is GIN full-text indexes, which
+`SELECT` does use (see § 9) to evaluate `@@` predicates.
 
 **To fix:** Extend `scan_init()` to accept an optional index + range (start key,
 end key, inclusive/exclusive flags). The executor (`exec.c`) already
@@ -194,7 +195,38 @@ implications:
   Procedures live in their own namespace: a procedure may share its name with
   a table or view. `DECLARE`/`SET`/control-flow statements are refused at the
   top level (outside `TRY`/`CATCH`); dynamic SQL sees the caller's variables.
-- **Full-text search** is limited to the RECALL engine; no inverted index or
-  tokenizer with stop-word removal exists.
+- **Full-text search** is built on a GIN inverted index (see
+  `CREATE INDEX ... USING GIN`): `to_tsvector(text)` lowercases and
+  tokenizes a value, drops English stop words, and records each lexeme's
+  position; `to_tsquery()` (with `&`, `|`, `!`) and `plainto_tsquery()`
+  (AND of words) build tsquery trees; the `@@` operator matches them, using
+  the index posting list as a candidate generator with the full predicate
+  re-applied for exactness; `ts_rank()` scores matches 0.0–1.0. Remaining
+  gaps: `to_tsvector` must be applied to the indexed column itself (there is
+  no `tsvector` column type, so the index cannot be based on an arbitrary
+  expression); no phrase/prefix/wildcard search (positions are recorded but
+  not used for phrase matching); `ts_rank` has no normalization options;
+  index maintenance is synchronous per statement, not asynchronous.
 - **`VACUUM`** requires free disk space equal to the current database size
   (it writes a temp file, then atomically replaces the original).
+
+## 10. B-tree inserts could corrupt the tree — FIXED
+
+~~Insertion was top-down: `btree_insert_nonfull()` pre-split children from
+the root down so every node would have room. Two bugs followed from this.
+First, the child-index arithmetic passed `pos - 1` when splitting, so the
+wrong child page was promoted (and its original parent slot went
+uninitialized), corrupting index structure. Second, when a non-root leaf
+overflowed anyway — easily triggered by GIN bulk loads of duplicate-key
+posting lists, since the free space reserved in the parent was sized to the
+*incoming* key while the split's promoted separator key could be longer —
+the handler re-rooted the tree at the leaf's original page, orphaning
+siblings and silently dropping rows from index-scanned results.~~
+
+Fixed: insertion is now a bottom-up B+ tree (`btree_insert_level()`). A node
+folds the new entry in; if it does not fit, the node is split with verified
+free space and the separator is promoted to the parent. Every level absorbs a
+promotion only when it fits; when the *root* splits, `btree_insert()` /
+`btree_insert_dup()` allocate a new root page. GIN posting lists are exact at
+scale (1500-row stress: 0 errors; DELETE/UPDATE churn verified to the row),
+and the integration suite runs clean under AddressSanitizer.

@@ -10,9 +10,10 @@ often it gets used, and rows that keep showing up together become linked. Over
 time the database develops an opinion about what matters to you — not because
 you set a priority column, but as a side effect of how you used it.
 
-Written from scratch in C11 with no dependencies: about 9,900 lines covering the
-storage layer, the SQL parser, the executor, the associative memory model,
-a write-ahead log, a JSON-over-TCP server, and B-tree indexes.
+Written from scratch in C11 with no dependencies: about 15,000 lines covering
+the storage layer, the SQL parser, the executor, the associative memory model,
+a write-ahead log, a JSON-over-TCP server, and B-tree plus GIN (full-text)
+indexes.
 
 ## Quick start
 
@@ -23,7 +24,7 @@ Ubuntu, `sudo apt install build-essential`.
 ```sh
 cd ~/Documents/nexdb
 make          # compiles build/nexdb, takes a couple of seconds
-make test     # 228 integration tests, expect "228 passed, 2 failed"
+make test     # 358 integration tests, expect "358 passed, 2 failed"
 make demo     # the five minute guided tour
 make run      # interactive shell on a database called brain.ndb
 ```
@@ -214,7 +215,8 @@ FORGET FROM notes WHERE id = 8;     -- zero the strength, keep the row and its l
 | T-SQL surface | `GO` batches, `--` and `/* */` comments, `[bracketed]` and `"quoted"` identifiers, `N'literals'`, `''` escapes, `PRINT` |
 | Memory | `RECALL`, `REMEMBER`, `FORGET`, `SHOW TABLES`, `SHOW MEMORY`, `SHOW LINKS` |
 | Utility | `BEGIN`/`COMMIT`/`ROLLBACK`, `CHECKPOINT`, `EXPLAIN`, `VACUUM` |
-| Indexing | B-tree indexes on `PRIMARY KEY` and `UNIQUE` columns; O(log n) point lookups |
+| Indexing | B-tree indexes on `PRIMARY KEY` and `UNIQUE` columns (O(log n) point lookups); GIN inverted full-text indexes for `@@` |
+| Full-text search | `to_tsvector(text)`, `to_tsquery(...)` / `plainto_tsquery(...)` (with `&`/`\|`/`!`), the `@@` operator, `ts_rank`, `CREATE INDEX ... USING GIN`, `DROP INDEX [IF EXISTS]` |
 
 Everything is case-insensitive, including string comparison.
 
@@ -235,6 +237,36 @@ SELECT * FROM t WHERE id < 'banana';         -- no meaningful ordering
 Numeric text compares numerically. Non-numeric text compared against a number
 is an error.
 
+### Full-text search
+
+An index built with `USING GIN` maintains an inverted index of lexemes over a
+text column: values are lowercased, split on punctuation, and common English
+stop words are dropped. Query it with the `@@` operator (`tsvector @@ tsquery`):
+
+```sql
+CREATE INDEX notes_fts ON notes (body) USING GIN;
+
+SELECT id FROM notes WHERE to_tsvector(body) @@ to_tsquery('coffee & grind');
+SELECT id FROM notes WHERE to_tsvector(body) @@ to_tsquery('extract | brew');
+SELECT id FROM notes WHERE to_tsvector(body) @@ to_tsquery('!decaf');
+SELECT id FROM notes WHERE to_tsvector(body) @@ plainto_tsquery('grind finer');
+
+SELECT id, ts_rank(to_tsvector(body), to_tsquery('coffee')) AS r
+FROM notes
+WHERE to_tsvector(body) @@ to_tsquery('coffee')
+ORDER BY r DESC;
+
+DROP INDEX notes_fts;
+```
+
+`to_tsquery` accepts `&` (and), `|` (or) and `!` (not); `plainto_tsquery`
+treats its argument as an AND of its words, so the example above behaves like
+`grind & finer`. `ts_rank` scores each match (0.0–1.0) and can be used in
+`ORDER BY` to push the strongest matches to the top. The GIN index is
+lossy-safe: the posting list produces candidate rows and the full predicate is
+re-applied on top, so results are always exact even when several rows share a
+lexeme. A query made entirely of stop words matches nothing.
+
 ## Watching a month pass in a second
 
 Decay is slow by design, which makes it awkward to see. Two flags help:
@@ -252,23 +284,24 @@ your own interference. It is also the right flag for dashboards and backups.
 ## How it works inside
 
 ```
-include/nexdb.h   all types and interfaces (586 lines)
+include/nexdb.h   all types and interfaces (783 lines)
 include/server.h  server public API
 include/wal.h     WAL page types
 
-src/pager.c       paged file, slotted heap pages, free list, catalog (1048 lines)
-src/memory.c      strength decay, Hebbian association table (341 lines)
-src/btree.c       B-tree index on PK and UNIQUE columns (638 lines)
-src/lexer.c       tokenizer (224 lines)
-src/parser.c      recursive-descent parser → AST (1450 lines)
-src/exec.c        executor, reinforcement, result formatting (2612 lines)
-src/select.c      GROUP BY, aggregation, capture for server (1415 lines)
-src/func.c        scalar functions, UUID support (474 lines)
+src/pager.c       paged file, slotted heap pages, free list, catalog (1319 lines)
+src/memory.c      strength decay, Hebbian association table (417 lines)
+src/btree.c       B-tree and GIN index, bottom-up splits (850 lines)
+src/fulltext.c    tokenizer, stop words, tsvector/tsquery/ts_rank, @@ (625 lines)
+src/lexer.c       tokenizer (238 lines)
+src/parser.c      recursive-descent parser → AST (2547 lines)
+src/exec.c        executor, reinforcement, result formatting (4191 lines)
+src/select.c      GROUP BY, aggregation, capture for server (1952 lines)
+src/func.c        scalar functions, UUID support (505 lines)
 src/wal.c         write-ahead log for crash safety (234 lines)
-src/server.c      JSON-over-TCP server, sessions, auth, proxy client (1250 lines)
-src/main.c        shell, script runner, CLI, auto-routing (470 lines)
+src/server.c      JSON-over-TCP server, sessions, auth, proxy client (1220 lines)
+src/main.c        shell, script runner, CLI, auto-routing (501 lines)
 src/value.c       value API, type conversion (322 lines)
-tests/            228 integration tests, run with `make test`
+tests/            358 integration tests, run with `make test`
 ```
 
 The whole database is one file. Page 0 is the header; the catalog and the
@@ -292,16 +325,15 @@ make asan
 
 See `limitations.md` for the full list. The short version:
 
-- **No range scans via indexes.** `WHERE pk = literal` uses the B-tree, but
-  range queries still do a full table scan. B-tree pages freed by `DROP TABLE`
-  are not recycled.
+- **No range scans via indexes.** `WHERE pk = literal` uses the B-tree (and
+  `@@` full-text predicates use the GIN index), but range queries still do a
+  full table scan.
 - **TLS is now built-in** (since July 2026). Pass `--tls-cert cert.pem --tls-key key.pem`
   to `serve` to enable OpenSSL encryption on TCP connections. The default is still
   cleartext for local development. Build with `NEXDB_TLS=1 make` to link OpenSSL.
 - **Writes are serialised.** Read-only statements run in parallel under the
   reader-writer lock, but writes and whole transactions take the write side
   (SQLite-style), so write throughput is single-threaded per database.
-- **No nested transactions.** `UNDO_MAX` is a single level.
 - **Session persistence.** Sessions are saved to `<database>.sessions` on every
   state change and restored on restart. In-flight transactions are not carried
   across restarts (the WAL protects committed data).
