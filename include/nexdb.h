@@ -133,6 +133,7 @@ typedef struct {
     char     refs_table[MAX_NAME];   /* REFERENCES table, "" = none         */
     char     refs_col[MAX_NAME];     /* REFERENCES table(col)               */
     uint8_t  on_delete;      /* FK_NO_ACTION / FK_CASCADE (column-level)     */
+    uint8_t  on_update;      /* FK_NO_ACTION / FK_CASCADE (column-level)     */
 } Column;
 
 int         int_range(uint8_t sub, int64_t *lo, int64_t *hi);
@@ -162,6 +163,7 @@ typedef struct {
     char     refs[MAX_FK_COLS][MAX_NAME];
     int      ncols;
     uint8_t  on_delete;       /* FK_NO_ACTION / FK_CASCADE */
+    uint8_t  on_update;       /* FK_NO_ACTION / FK_CASCADE */
 } FK;
 
 typedef struct {

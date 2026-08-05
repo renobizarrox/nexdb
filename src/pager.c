@@ -281,6 +281,7 @@ static size_t catalog_serialize(const Catalog *c, uint8_t **out)
             wr16(b, o, (uint16_t)rcl); o += 2;
             memcpy(b + o, cl->refs_col, rcl); o += rcl;
             b[o++] = cl->on_delete;
+            b[o++] = cl->on_update;
         }
         wr32(b, o, t->first_page); o += 4;
         wr32(b, o, t->last_page);  o += 4;
@@ -310,6 +311,7 @@ static size_t catalog_serialize(const Catalog *c, uint8_t **out)
         for (int f = 0; f < nfks; f++) {
             const FK *fk = &t->fks[f];
             b[o++] = fk->on_delete;
+            b[o++] = fk->on_update;
             wr16(b, o, (uint16_t)fk->ncols); o += 2;
             for (int ci = 0; ci < fk->ncols; ci++) {
                 size_t c_len = strlen(fk->cols[ci]);
@@ -413,6 +415,7 @@ static void catalog_deserialize(Catalog *c, const uint8_t *b, size_t len)
                     o += rcl;
                 }
                 if (o < len) cl->on_delete = b[o++];
+                if (o < len) cl->on_update = b[o++];
             }
         }
         if (o + 20 > len) return;
@@ -462,6 +465,7 @@ static void catalog_deserialize(Catalog *c, const uint8_t *b, size_t len)
                 FK *fk = &t->fks[f];
                 if (o >= len) break;
                 fk->on_delete = b[o++];
+                if (o < len) fk->on_update = b[o++];
                 if (o + 2 > len) break;
                 uint16_t nc = rd16(b, o); o += 2;
                 if (nc > MAX_FK_COLS) break;

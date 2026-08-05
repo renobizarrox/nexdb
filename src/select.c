@@ -911,6 +911,23 @@ static int exec_select_core(DB *db, Stmt *s, Capture *capture, char *err)
     }
 
     /* ---- collect join tables (if any) */
+    if (s->has_from && s->njoins > 0) {
+        /* A view in FROM had already been expanded into s->derived; the
+         * nested-loop executor never runs joins for derived tables, so
+         * refuse instead of silently dropping the JOIN (wrong results). */
+        if (s->derived) {
+            snprintf(err, MAX_ERR,
+                     "a view cannot be used as a JOIN operand (query the view "
+                     "on its own)");
+            return -1;
+        }
+        /* Only the first ON clause is ever evaluated; refuse extra joins so
+         * they cannot silently disappear (on empty tables or in aggregates). */
+        if (s->njoins > 1) {
+            snprintf(err, MAX_ERR, "multiple JOINs are not yet supported");
+            return -1;
+        }
+    }
     JoinTab join_tabs[1 + MAX_JOINS];
     int njoin_tabs = 0;
     if (s->has_from && s->njoins > 0) {
@@ -1358,14 +1375,7 @@ static int exec_select_core(DB *db, Stmt *s, Capture *capture, char *err)
             join_tabs[0].row = pr;
             join_tabs[0].matched = 0;
 
-            /* For each join table, do nested-loop */
-            /* We use a simple approach: 1 join at a time for now */
-            if (njoin_tabs > 2) {
-                snprintf(err, MAX_ERR, "multiple JOINs are not yet supported");
-                row_clear(&pr); res_free(&res); goto join_cleanup;
-            }
-
-            /* Scan the first joined table */
+            /* Nested-loop join: one join at a time (enforced above). */
             Row jr;
             Scan *js = &jsc[1];
             /* restart the join scan for every outer row */

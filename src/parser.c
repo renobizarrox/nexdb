@@ -1442,6 +1442,27 @@ static int parse_create_proc(Lexer *lx, Stmt *s, char *err)
     return 0;
 }
 
+/* Parse one referential action of a FOREIGN KEY: CASCADE, or the two tokens
+ * NO ACTION.  Returns FK_CASCADE / FK_NO_ACTION, or -1 (via FAIL). */
+static int parse_fk_action(Lexer *lx, const char *context, char *err)
+{
+    if (tok_is_kw(&lx->cur, "CASCADE")) {
+        if (adv(lx, err) < 0) return -1;
+        return FK_CASCADE;
+    }
+    if (tok_is_kw(&lx->cur, "NO")) {
+        if (adv(lx, err) < 0) return -1;
+        if (eat_kw(lx, "ACTION", err) < 0) return -1;
+        return FK_NO_ACTION;
+    }
+    if (tok_is_kw(&lx->cur, "ACTION")) {
+        if (adv(lx, err) < 0) return -1;
+        return FK_NO_ACTION;
+    }
+    FAIL("expected CASCADE or NO ACTION after %s", context);
+    return -1;
+}
+
 static int parse_create(Lexer *lx, Stmt *s, char *err)
 {
     if (eat_kw(lx, "TABLE", err) < 0) return -1;
@@ -1493,19 +1514,23 @@ static int parse_create(Lexer *lx, Stmt *s, char *err)
                 for (int i = 0; i < fk->ncols; i++)
                     snprintf(fk->refs[i], MAX_NAME, "%s", "_pk");
             }
-            if (tok_is_kw(&lx->cur, "ON")) {
+            while (tok_is_kw(&lx->cur, "ON")) {
                 if (adv(lx, err) < 0) return -1;
-                if (tok_is_kw(&lx->cur, "UPDATE"))
-                    FAIL("ON UPDATE is not supported on a FOREIGN KEY");
-                if (eat_kw(lx, "DELETE", err) < 0) return -1;
-                if (tok_is_kw(&lx->cur, "CASCADE")) {
+                if (tok_is_kw(&lx->cur, "UPDATE")) {
                     if (adv(lx, err) < 0) return -1;
-                    fk->on_delete = FK_CASCADE;
-                } else if (eat_kw(lx, "NO", err) < 0) {
-                    return -1;
-                } else if (eat_kw(lx, "ACTION", err) < 0) {
-                    return -1;
+                    int a = parse_fk_action(lx, "ON UPDATE", err);
+                    if (a < 0) return -1;
+                    fk->on_update = (uint8_t)a;
+                    continue;
                 }
+                if (tok_is_kw(&lx->cur, "DELETE")) {
+                    if (adv(lx, err) < 0) return -1;
+                    int a = parse_fk_action(lx, "ON DELETE", err);
+                    if (a < 0) return -1;
+                    fk->on_delete = (uint8_t)a;
+                    continue;
+                }
+                FAIL("expected UPDATE or DELETE after ON");
             }
             s->nfks++;
             int more = opt_punct(lx, ",", err);
@@ -1611,19 +1636,23 @@ static int parse_create(Lexer *lx, Stmt *s, char *err)
                      * primary key */
                     snprintf(c->refs_col, MAX_NAME, "%s", "_pk");
                 }
-                if (tok_is_kw(&lx->cur, "ON")) {
+                while (tok_is_kw(&lx->cur, "ON")) {
                     if (adv(lx, err) < 0) return -1;
-                    if (tok_is_kw(&lx->cur, "UPDATE"))
-                        FAIL("ON UPDATE is not supported on a FOREIGN KEY");
-                    if (eat_kw(lx, "DELETE", err) < 0) return -1;
-                    if (tok_is_kw(&lx->cur, "CASCADE")) {
+                    if (tok_is_kw(&lx->cur, "UPDATE")) {
                         if (adv(lx, err) < 0) return -1;
-                        c->on_delete = FK_CASCADE;
-                    } else if (eat_kw(lx, "NO", err) < 0) {
-                        return -1;
-                    } else if (eat_kw(lx, "ACTION", err) < 0) {
-                        return -1;
+                        int a = parse_fk_action(lx, "ON UPDATE", err);
+                        if (a < 0) return -1;
+                        c->on_update = (uint8_t)a;
+                        continue;
                     }
+                    if (tok_is_kw(&lx->cur, "DELETE")) {
+                        if (adv(lx, err) < 0) return -1;
+                        int a = parse_fk_action(lx, "ON DELETE", err);
+                        if (a < 0) return -1;
+                        c->on_delete = (uint8_t)a;
+                        continue;
+                    }
+                    FAIL("expected UPDATE or DELETE after ON");
                 }
             } else {
                 break;

@@ -201,7 +201,7 @@ FORGET FROM notes WHERE id = 8;     -- zero the strength, keep the row and its l
 | --- | --- |
 | DDL | `CREATE TABLE`, `DROP TABLE [IF EXISTS]`, `TRUNCATE TABLE`, `ALTER TABLE` (ADD/DROP/RENAME/ALTER COLUMN TYPE) |
 | Types | `TINYINT`/`SMALLINT`/`INT`/`BIGINT`, `FLOAT`/`REAL`/`DECIMAL`/`MONEY`, `NVARCHAR(n)`/`VARCHAR`/`TEXT`, `BIT`, `DATETIME`, `UNIQUEIDENTIFIER` |
-| Constraints | `NOT NULL`/`NULL`, `PRIMARY KEY`, `UNIQUE`, `DEFAULT` (literal, `GETDATE()`, `NEWID()`), `IDENTITY(seed,step)`, `CHECK (expr)`, `FOREIGN KEY` / `REFERENCES ... ON DELETE CASCADE` — all enforced |
+| Constraints | `NOT NULL`/`NULL`, `PRIMARY KEY`, `UNIQUE`, `DEFAULT` (literal, `GETDATE()`, `NEWID()`), `IDENTITY(seed,step)`, `CHECK (expr)`, `FOREIGN KEY` / `REFERENCES` with `ON DELETE`/`ON UPDATE` `NO ACTION` or `CASCADE` (recursing through grandchildren, cycle-safe) — all enforced |
 | Queries | `SELECT [ALL\|DISTINCT] [TOP n]` with expressions, column aliases, `FROM` (table, subquery, joins), `WHERE`, `GROUP BY` + `HAVING`, `ORDER BY`, `LIMIT n [OFFSET m]` |
 | Set ops | `UNION`, `UNION ALL`, `INTERSECT`, `EXCEPT`, with trailing `ORDER BY` / `LIMIT` / `OFFSET` on the combined result |
 | Views | `CREATE VIEW name AS SELECT ...`, `DROP VIEW [IF EXISTS]` — stored, expanded at query time, persistent |

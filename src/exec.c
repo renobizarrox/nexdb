@@ -1663,6 +1663,28 @@ static int check_constraint(DB *db, Table *t, Row *row, char *err)
 
 /* ------------------------------------------------------- foreign keys */
 
+/* Depth cap for the recursive FK cascade walks.  A legitimate chain cannot
+ * exceed the number of tables (<= MAX_TABLES), so this only trips on
+ * reference cycles that the ancestor path failed to break. */
+#define FK_CASCADE_MAX  256
+
+/* One entry of the ancestor path threaded through a recursive FK cascade
+ * walk.  If a walk reaches a (table, rid) it is already processing, the
+ * reference graph is cyclic; re-entering it would loop forever, so it is
+ * skipped (its subtree was already walked, or its row was already written). */
+typedef struct {
+    const Table *t;
+    uint64_t rid;
+} FkAncestor;
+
+static int fk_on_path(const FkAncestor *path, int depth, const Table *t,
+                      uint64_t rid)
+{
+    for (int i = 0; i < depth; i++)
+        if (path[i].t == t && path[i].rid == rid) return 1;
+    return 0;
+}
+
 /* Does the child's FK column match the parent's referenced column? */
 static int fk_cols_match(const Row *prow, int pcol, const Row *crow, int ccol)
 {
@@ -1874,13 +1896,47 @@ static int row_delete(DB *db, Table *t, Row *row, char *err)
     return 1;
 }
 
-/* Parent-side enforcement for DELETE: NO ACTION refuses to remove a row that
- * children reference; CASCADE removes the referencing rows first (and their
- * children in turn).  With check_only, NO ACTION refusals are reported but no
- * cascade deletions happen, so a multi-row DELETE can verify every row before
- * mutating anything. */
+/* Forward declaration (mutually recursive with fk_parent_delete). */
 static int fk_parent_delete(DB *db, Table *t, const Row *del, char *err,
-                            int check_only)
+                            int check_only, FkAncestor *path, int depth);
+
+/* Delete one row and, through FK ON DELETE CASCADE, everything that (directly
+ * or transitively) references it.  The row is deleted first, then the
+ * referencing rows are walked by table scan, so in a reference cycle every
+ * row disappears from the scan as soon as it is deleted and the walk
+ * terminates; the ancestor path provides the same guarantee for the
+ * non-mutating check pass.  With check_only, nothing is deleted: the walk
+ * reports the first NO ACTION refusal in the whole cascade closure, so a
+ * multi-row DELETE can verify everything before mutating anything.  Returns
+ * 1 if the row was deleted, 0 if it was already gone, -1 on error. */
+static int fk_delete_recursive(DB *db, Table *t, Row *r, char *err,
+                               int check_only, FkAncestor *path, int depth)
+{
+    if (fk_on_path(path, depth, t, r->rid)) return 0;
+    if (depth >= FK_CASCADE_MAX) {
+        snprintf(err, MAX_ERR, "foreign key cascade is too deep or cyclic");
+        return -1;
+    }
+    path[depth].t = t;
+    path[depth].rid = r->rid;
+
+    int del = 0;
+    if (!check_only) {
+        del = row_delete(db, t, r, err);
+        if (del < 0) return -1;
+    }
+    if (fk_parent_delete(db, t, r, err, check_only, path, depth) < 0)
+        return -1;
+    return del;
+}
+
+/* Parent-side enforcement for DELETE: NO ACTION refuses to remove a row that
+ * children reference; CASCADE removes the referencing rows first, recursing
+ * through grandchildren.  With check_only, NO ACTION refusals are reported
+ * but no cascade deletions happen, so a multi-row DELETE can verify every
+ * row before mutating anything. */
+static int fk_parent_delete(DB *db, Table *t, const Row *del, char *err,
+                            int check_only, FkAncestor *path, int depth)
 {
     for (int ti = 0; ti < db->cat.ntables; ti++) {
         Table *child = &db->cat.tables[ti];
@@ -1895,9 +1951,13 @@ static int fk_parent_delete(DB *db, Table *t, const Row *del, char *err,
             scan_init(&sc, db, child);
             while (scan_next(&sc, &r)) {
                 if (!fk_cols_match(del, pcol, &r, c)) { row_clear(&r); continue; }
-                if (cascade && !check_only) {
-                    row_delete(db, child, &r, err);
-                } else if (!cascade) {
+                if (cascade) {
+                    if (fk_delete_recursive(db, child, &r, err, check_only,
+                                            path, depth) < 0) {
+                        row_clear(&r);
+                        return -1;
+                    }
+                } else {
                     char shown[128];
                     val_format(&del->v[pcol], shown, sizeof shown);
                     snprintf(err, MAX_ERR,
@@ -1927,9 +1987,13 @@ static int fk_parent_delete(DB *db, Table *t, const Row *del, char *err,
                         all = 0;
                 }
                 if (!all) { row_clear(&r); continue; }
-                if (fk->on_delete == FK_CASCADE && !check_only) {
-                    row_delete(db, child, &r, err);
-                } else if (fk->on_delete != FK_CASCADE) {
+                if (fk->on_delete == FK_CASCADE) {
+                    if (fk_delete_recursive(db, child, &r, err, check_only,
+                                            path, depth) < 0) {
+                        row_clear(&r);
+                        return -1;
+                    }
+                } else {
                     int pcol = table_col_index(t, fk->refs[0]);
                     char shown[128];
                     val_format(&del->v[pcol >= 0 ? pcol : 0], shown,
@@ -1951,83 +2015,152 @@ static int fk_parent_delete(DB *db, Table *t, const Row *del, char *err,
     return 0;
 }
 
-/* Parent-side enforcement for UPDATE: when a referenced key changes, children
- * pointing at the old value would be orphaned, so the change is refused.
- * (NO ACTION is the only ON UPDATE policy.) */
-static int fk_parent_update(DB *db, Table *t, const Value *oldcols,
-                            const Row *newrow, char *err)
-{
-    Row oldrow;
-    memset(&oldrow, 0, sizeof oldrow);
-    oldrow.ncols = t->ncols;
-    for (int c = 0; c < t->ncols; c++) oldrow.v[c] = oldcols[c];
+/* Parent-side enforcement for UPDATE.  The statement evaluates the new row
+ * (`newrow`) against the old one (`oldrow`) and calls this twice per row:
+ * first with apply = 0, before the parent row is replaced, to refuse every
+ * ON UPDATE NO ACTION policy in the whole cascade closure; then with
+ * apply = 1, after the parent row and its indexes are updated, to rewrite
+ * the CASCADE children (recursively through grandchildren).  Either pass
+ * failing aborts the statement. */
+static int fk_update_walk(DB *db, Table *t, const Row *oldrow,
+                          const Row *newrow, char *err, int apply,
+                          FkAncestor *path, int depth);
 
+/* For one FK (a column-level FK with n = 1, or a table-level FK), walk every
+ * row of `child` whose referencing columns (ccols[]) match the parent's OLD
+ * key values (pcols[]).  With apply, ON UPDATE CASCADE rewrites the child's
+ * referencing columns to the parent's new values (validating the child like
+ * a statement would, then recursing so grandchildren follow); NO ACTION rows
+ * are refused.  Without apply nothing is written: NO ACTION rows are refused
+ * and CASCADE subtrees are walked with the prospective child row, so a
+ * multi-row UPDATE verifies the whole cascade closure before touching
+ * anything. */
+static int fk_update_fk_rows(DB *db, Table *child, Table *t, int n,
+                             const int *pcols, const int *ccols, int policy,
+                             const Row *oldrow, const Row *newrow,
+                             char *err, int apply, FkAncestor *path, int depth)
+{
+    Scan sc;
+    Row r;
+    scan_init(&sc, db, child);
+    while (scan_next(&sc, &r)) {
+        int match = 1;
+        for (int i = 0; i < n && match; i++)
+            if (!fk_cols_match(oldrow, pcols[i], &r, ccols[i])) match = 0;
+        if (!match) { row_clear(&r); continue; }
+        if (policy != FK_CASCADE) {
+            char shown[128];
+            val_format(&oldrow->v[pcols[0]], shown, sizeof shown);
+            snprintf(err, MAX_ERR,
+                     "cannot change %s.%s from '%s': row %llu of '%s' "
+                     "still references it",
+                     t->name, t->cols[pcols[0]].name, shown,
+                     (unsigned long long)r.rid, child->name);
+            row_clear(&r);
+            return -1;
+        }
+        if (fk_on_path(path, depth, child, r.rid)) { row_clear(&r); continue; }
+        path[depth].t = child;
+        path[depth].rid = r.rid;
+
+        /* the child's prospective row: referencing columns take the new
+         * parent values, everything else stays as it is */
+        Row cr;
+        memset(&cr, 0, sizeof cr);
+        cr.ref = r.ref;
+        cr.rid = r.rid;
+        cr.access_count = r.access_count;
+        cr.last_access = r.last_access;
+        cr.strength = r.strength;
+        cr.ncols = r.ncols;
+        for (int c = 0; c < r.ncols; c++) cr.v[c] = val_copy(&r.v[c]);
+        for (int i = 0; i < n; i++) {
+            val_clear(&cr.v[ccols[i]]);
+            cr.v[ccols[i]] = val_copy(&newrow->v[pcols[i]]);
+        }
+        if (apply) {
+            if (check_unique(db, child, &cr, r.rid, err) < 0 ||
+                check_constraint(db, child, &cr, err) < 0 ||
+                check_fk_child(db, child, &cr, err) < 0) {
+                row_clear(&cr);
+                row_clear(&r);
+                return -1;
+            }
+            if (heap_replace(db, child, r.ref, &cr) < 0) {
+                snprintf(err, MAX_ERR, "%s", db->err);
+                row_clear(&cr);
+                row_clear(&r);
+                return -1;
+            }
+            for (int ki = 0; ki < child->nindexes; ki++) {
+                if (!child->indexes[ki].valid) continue;
+                int col = child->indexes[ki].col;
+                if (col < 0) continue;
+                uint32_t old_root = child->indexes[ki].root;
+                if (r.v[col].tag != T_NULL)
+                    index_value_delete(db, &child->indexes[ki], &r.v[col],
+                                       r.ref, err);
+                if (cr.v[col].tag != T_NULL)
+                    index_value_insert(db, &child->indexes[ki], &cr.v[col],
+                                       cr.ref, err);
+                if (child->indexes[ki].root != old_root)
+                    db_flush_catalog(db);
+            }
+        }
+        int rc = fk_update_walk(db, child, &r, &cr, err, apply, path,
+                                depth + 1);
+        row_clear(&cr);
+        row_clear(&r);
+        if (rc < 0) return -1;
+    }
+    return 0;
+}
+
+static int fk_update_walk(DB *db, Table *t, const Row *oldrow,
+                          const Row *newrow, char *err, int apply,
+                          FkAncestor *path, int depth)
+{
+    if (depth >= FK_CASCADE_MAX) {
+        snprintf(err, MAX_ERR,
+                 "foreign key ON UPDATE cascade is too deep or cyclic");
+        return -1;
+    }
     for (int ti = 0; ti < db->cat.ntables; ti++) {
         Table *child = &db->cat.tables[ti];
         for (int c = 0; c < child->ncols; c++) {
-            if (!child->cols[c].refs_table[0]) continue;
-            if (strcasecmp(child->cols[c].refs_table, t->name) != 0) continue;
-            int pcol = table_col_index(t, child->cols[c].refs_col);
+            Column *cl = &child->cols[c];
+            if (!cl->refs_table[0]) continue;
+            if (strcasecmp(cl->refs_table, t->name) != 0) continue;
+            int pcol = table_col_index(t, cl->refs_col);
             if (pcol < 0 || pcol >= t->ncols) continue;
-            if (fk_cols_match(&oldrow, pcol, newrow, pcol)) continue;
-            Scan sc;
-            Row r;
-            scan_init(&sc, db, child);
-            while (scan_next(&sc, &r)) {
-                if (fk_cols_match(&oldrow, pcol, &r, c)) {
-                    char shown[128];
-                    val_format(&oldcols[pcol], shown, sizeof shown);
-                    snprintf(err, MAX_ERR,
-                             "cannot change %s.%s from '%s': row %llu of "
-                             "'%s' still references it",
-                             t->name, t->cols[pcol].name, shown,
-                             (unsigned long long)r.rid, child->name);
-                    row_clear(&r);
-                    return -1;
-                }
-                row_clear(&r);
-            }
+            if (fk_cols_match(oldrow, pcol, newrow, pcol)) continue;
+            if (fk_update_fk_rows(db, child, t, 1, &pcol, &c, cl->on_update,
+                                  oldrow, newrow, err, apply, path, depth) < 0)
+                return -1;
         }
         for (int k = 0; k < child->nfks; k++) {
             const FK *fk = &child->fks[k];
             if (strcasecmp(fk->table, t->name) != 0) continue;
+            int pcols[MAX_FK_COLS];
+            int ccols[MAX_FK_COLS];
+            int n = 0;
             int changed = 0;
-            for (int i = 0; i < fk->ncols && !changed; i++) {
-                int pcol = table_col_index(t, fk->refs[i]);
-                if (pcol >= 0 && pcol < t->ncols &&
-                    !fk_cols_match(&oldrow, pcol, newrow, pcol))
+            for (int i = 0; i < fk->ncols; i++) {
+                int pc = table_col_index(t, fk->refs[i]);
+                int cc = table_col_index(child, fk->cols[i]);
+                if (pc < 0 || cc < 0) continue;
+                pcols[n] = pc;
+                ccols[n] = cc;
+                n++;
+                if (pc >= t->ncols ||
+                    !fk_cols_match(oldrow, pc, newrow, pc))
                     changed = 1;
             }
-            if (!changed) continue;
-            Scan sc;
-            Row r;
-            scan_init(&sc, db, child);
-            while (scan_next(&sc, &r)) {
-                int all = 1;
-                for (int i = 0; i < fk->ncols && all; i++) {
-                    int pcol = table_col_index(t, fk->refs[i]);
-                    int ccol = table_col_index(child, fk->cols[i]);
-                    if (pcol < 0 || ccol < 0 ||
-                        !fk_cols_match(&oldrow, pcol, &r, ccol))
-                        all = 0;
-                }
-                if (all) {
-                    int pcol0 = table_col_index(t, fk->refs[0]);
-                    char shown[128];
-                    val_format(&oldcols[pcol0 >= 0 ? pcol0 : 0], shown,
-                               sizeof shown);
-                    snprintf(err, MAX_ERR,
-                             "cannot change %s.%s from '%s': row %llu of "
-                             "'%s' still references it",
-                             t->name,
-                             pcol0 >= 0 ? t->cols[pcol0].name : "?",
-                             shown,
-                             (unsigned long long)r.rid, child->name);
-                    row_clear(&r);
-                    return -1;
-                }
-                row_clear(&r);
-            }
+            if (n == 0 || !changed) continue;
+            if (fk_update_fk_rows(db, child, t, n, pcols, ccols,
+                                  fk->on_update, oldrow, newrow, err,
+                                  apply, path, depth) < 0)
+                return -1;
         }
     }
     return 0;
@@ -2750,7 +2883,14 @@ static int exec_update(DB *db, Stmt *s, char *err)
             rs_free(&rs);
             return -1;
         }
-        if (fk_parent_update(db, t, old_v, row, err) < 0) {
+        /* the old row, for the recursive ON UPDATE cascade walks (borrows the
+         * old_v values, which are cleaned up below) */
+        Row oldrow;
+        memset(&oldrow, 0, sizeof oldrow);
+        oldrow.ncols = t->ncols;
+        for (int c = 0; c < t->ncols; c++) oldrow.v[c] = old_v[c];
+        FkAncestor walk_path[FK_CASCADE_MAX];
+        if (fk_update_walk(db, t, &oldrow, row, err, 0, walk_path, 0) < 0) {
             for (int ki = 0; ki < t->nindexes; ki++) val_clear(&old_idx_vals[ki]);
             for (int c = 0; c < t->ncols; c++) val_clear(&old_v[c]);
             rs_free(&rs);
@@ -2782,6 +2922,16 @@ static int exec_update(DB *db, Stmt *s, char *err)
             if (t->indexes[ki].root != old_root)
                 db_flush_catalog(db);
             val_clear(&old_idx_vals[ki]);
+        }
+
+        /* only after the parent row and its indexes carry the new value:
+         * rewrite the referencing CASCADE children (recursively).  Must run
+         * before old_v is cleared: the walk matches children against the old
+         * key values. */
+        if (fk_update_walk(db, t, &oldrow, row, err, 1, walk_path, 0) < 0) {
+            for (int c = 0; c < t->ncols; c++) val_clear(&old_v[c]);
+            rs_free(&rs);
+            return -1;
         }
         for (int c = 0; c < t->ncols; c++) val_clear(&old_v[c]);
 
@@ -2829,8 +2979,9 @@ static int exec_delete(DB *db, Stmt *s, char *err)
     }
 
     int deleted = 0;
+    FkAncestor walk_path[FK_CASCADE_MAX];
     for (int i = 0; i < rs.n; i++) {
-        if (fk_parent_delete(db, t, &rs.rows[i], err, 1) < 0) {
+        if (fk_delete_recursive(db, t, &rs.rows[i], err, 1, walk_path, 0) < 0) {
 #ifdef DEBUG_DELETE
             fprintf(stderr, "DBG fk check_only fail i=%d err='%s'\n", i, err);
 #endif
@@ -2840,18 +2991,10 @@ static int exec_delete(DB *db, Stmt *s, char *err)
     }
     for (int i = 0; i < rs.n; i++) {
         Row *row = &rs.rows[i];
-        if (fk_parent_delete(db, t, row, err, 0) < 0) {
-#ifdef DEBUG_DELETE
-            fprintf(stderr, "DBG fk real fail i=%d err='%s'\n", i, err);
-#endif
-            rs_free(&rs);
-            return -1;
-        }
-        int del = row_delete(db, t, row, err);
+        int del = fk_delete_recursive(db, t, row, err, 0, walk_path, 0);
         if (del < 0) {
 #ifdef DEBUG_DELETE
-            fprintf(stderr, "DBG row_delete fail: rid=%llu ref=(%u,%u) err='%s'\n",
-                    (unsigned long long)row->rid, row->ref.page, row->ref.slot, err);
+            fprintf(stderr, "DBG fk real fail i=%d err='%s'\n", i, err);
 #endif
             rs_free(&rs);
             return -1;
@@ -3131,7 +3274,7 @@ static int exec_vacuum(DB *db, char *err)
         nt->nfks = ot->nfks;
         for (int k = 0; k < ot->nfks; k++) nt->fks[k] = ot->fks[k];
         for (int c = 0; c < nt->ncols; c++)
-            nt->cols[c].on_delete = ot->cols[c].on_delete;
+            nt->cols[c] = ot->cols[c];
         Scan sc;
         Row r;
         scan_init(&sc, db, ot);
@@ -3571,9 +3714,8 @@ static int exec_stmt_inner(DB *db, Stmt *s, char *err)
         for (int ci = 0; ci < s->ncols && ct && !has_fk; ci++)
             if (s->cols[ci].refs_table[0]) has_fk = 1;
         if (ct && (s->nfks || has_fk)) {
-            for (int i = 0; i < ct->ncols; i++) {
-                ct->cols[i].on_delete = s->cols[i].on_delete;
-            }
+            for (int i = 0; i < ct->ncols; i++)
+                ct->cols[i] = s->cols[i];
             ct->nfks = s->nfks;
             for (int i = 0; i < s->nfks; i++) ct->fks[i] = s->fks[i];
             if (fk_validate(db, ct, err) < 0) {

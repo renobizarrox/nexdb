@@ -168,17 +168,22 @@ implications:
 
 ## 9. Other gaps
 
-- **`GROUP BY` with `JOIN`** and **multiple `JOIN`s in one query** are refused
-  at execution; the nested-loop executor handles exactly one join at a time.
-  `WHERE` on either side of the join works, including with aggregates.
+- **One `JOIN` per query.** The nested-loop executor evaluates only the first
+  `ON` clause, so multiple `JOIN`s in one query are refused outright (refused
+  up front — even on empty tables or in aggregates — rather than silently
+  dropping the extra joins), and `GROUP BY` with a `JOIN` is refused too.
+  `WHERE` on either side of the single join works, including with aggregates
+  (aggregate joins fold every matching row into one group).
 - **`ALTER COLUMN TYPE`** can narrow a type only when every existing value
   fits the new type; widening always works.
-- **`FOREIGN KEY`** supports `ON DELETE NO ACTION` (default) and `ON DELETE
-  CASCADE`; `ON UPDATE` is not supported, and cascades do not recurse through
-  grandchildren.
+- **`FOREIGN KEY`** supports `ON DELETE` and `ON UPDATE` with `NO ACTION`
+  (default) or `CASCADE`; cascades recurse through grandchildren, with a
+  cycle guard so self-/mutually-referencing tables terminate.
 - **Views** expand to their stored `SELECT` at query time; they cannot be used
-  as a `JOIN` operand, and outer queries over a view (or any derived table)
-  cannot use aggregates or `GROUP BY`.
+  as a `JOIN` operand (refused — a view's `JOIN`s would otherwise be silently
+  ignored, since the view expands to a derived table that the executor never
+  joins), and outer queries over a view (or any derived table) cannot use
+  aggregates or `GROUP BY`.
 - **No `TRIGGER`** — event-driven logic is not supported.
 - **Stored procedures** support parameters (`@name TYPE`, named arguments,
   defaults that may reference earlier parameters, and `OUTPUT` write-back),

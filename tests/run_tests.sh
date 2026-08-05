@@ -327,6 +327,11 @@ out=$(run "SELECT COUNT(*) FROM guard JOIN other ON guard.id = other.id WHERE ot
 check "aggregates over a join with WHERE" "1" "$out"
 out=$(run "SELECT COUNT(*) FROM guard JOIN other ON guard.id = other.id GROUP BY guard.n")
 check "GROUP BY with JOIN is refused, not wrong" "not yet supported" "$out"
+run "CREATE TABLE third (id INT)" >/dev/null
+out=$(run "SELECT guard.n, other.x FROM guard JOIN other ON guard.id = other.id JOIN third ON TRUE")
+check "multiple JOINs are refused" "multiple JOINs" "$out"
+out=$(run "SELECT COUNT(*) FROM guard JOIN other ON guard.id = other.id JOIN third ON TRUE")
+check "multiple JOINs with aggregates are refused, not silently wrong" "multiple JOINs" "$out"
 out=$(run "SELECT n FROM guard, other")
 check "comma join is refused rather than ignored" "Nothing was run" "$out"
 
@@ -868,6 +873,25 @@ out=$(dd_ "SELECT id FROM par WHERE id = 1")
 check "point lookups still hit the index after VACUUM" "1" "$out"
 
 echo
+echo "-- ON UPDATE / ON DELETE CASCADE recurse through grandchildren, cycle-safe"
+out=$(dd_ "CREATE TABLE fkpar (id INT PRIMARY KEY); CREATE TABLE fkchild (id INT PRIMARY KEY, pid INT REFERENCES fkpar(id) ON UPDATE CASCADE); CREATE TABLE fkgrand (id INT PRIMARY KEY, cid INT REFERENCES fkchild(id) ON DELETE CASCADE); INSERT INTO fkpar VALUES (1); INSERT INTO fkchild VALUES (10, 1); INSERT INTO fkgrand VALUES (100, 10)")
+check "grandchild cascade chain setup" "(1 row inserted)" "$out"
+out=$(dd_ "UPDATE fkpar SET id = 5 WHERE id = 1; SELECT pid FROM fkchild")
+check "ON UPDATE CASCADE rewrites the child" "5" "$out"
+out=$(dd_ "SELECT cid FROM fkgrand")
+check "...and leaves the grandchild alone" "10" "$out"
+out=$(dd_ "DELETE FROM fkpar WHERE id = 5")
+check "a referenced parent row is still refused (NO ACTION)" "cannot delete" "$out"
+out=$(dd_ "INSERT INTO fkgrand VALUES (200, 10); DELETE FROM fkchild WHERE id = 10")
+check "ON DELETE CASCADE removes grandchildren too" "(1 row deleted)" "$out"
+out=$(dd_ "SELECT COUNT(*) FROM fkgrand")
+check "grandchildren are gone" "0" "$out"
+out=$(dd_ "CREATE TABLE fkself (id INT PRIMARY KEY, parent INT REFERENCES fkself(id) ON DELETE CASCADE); INSERT INTO fkself VALUES (1, NULL), (2, 1), (3, 2); DELETE FROM fkself WHERE id = 1; SELECT COUNT(*) FROM fkself")
+check "a self-referencing CASCADE chain terminates" "0" "$out"
+out=$(dd_ "CREATE TABLE fkselfu (id INT PRIMARY KEY, parent INT REFERENCES fkselfu(id) ON UPDATE CASCADE); INSERT INTO fkselfu VALUES (1, NULL), (2, 1), (3, 2); UPDATE fkselfu SET id = 10 WHERE id = 1; SELECT parent FROM fkselfu ORDER BY id")
+check "a self-referencing ON UPDATE CASCADE chain terminates" "10" "$out"
+
+echo
 echo "-- views are stored, expanded at query time, and survive a restart"
 out=$(run "CREATE TABLE base (id INT PRIMARY KEY, name NVARCHAR(20)); CREATE VIEW vw AS SELECT id, name FROM base")
 check "CREATE VIEW with a SELECT body" "created" "$out"
@@ -877,6 +901,8 @@ out=$(run "INSERT INTO base VALUES (1, 'a'), (2, 'b'); SELECT * FROM vw")
 check "a view sees rows inserted after it was created" "2 rows" "$out"
 out=$(run "SELECT id FROM vw WHERE id = 2")
 check "WHERE on a view" "2" "$out"
+out=$(run "SELECT * FROM vw JOIN other ON vw.id = other.id")
+check "a view cannot be a JOIN operand" "cannot be used as a JOIN operand" "$out"
 out=$(run "SELECT vw.name FROM vw ORDER BY id DESC")
 check "qualified references to a view" "b" "$out"
 out=$(run "SELECT COUNT(*) FROM (SELECT id FROM vw) AS x")
