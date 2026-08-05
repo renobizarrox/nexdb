@@ -144,6 +144,7 @@ int func_exists(const char *name)
         "ABS", "ROUND", "FLOOR", "CEILING", "CEIL", "SIGN", "SQRT", "POWER",
         "ISNULL", "COALESCE", "NULLIF", "IIF",
         "GETDATE", "CURRENT_TIMESTAMP", "SYSDATETIME", "NEWID",
+        "TO_TSVECTOR", "TO_TSQUERY", "PLAINTO_TSQUERY", "TS_RANK",
         NULL
     };
     for (int i = 0; known[i]; i++)
@@ -396,6 +397,36 @@ int func_call(const char *name, Value *a, int n, Value *out, char *err)
         if (!as_number(&a[0], &x) || !as_number(&a[1], &y))
             FN_ERR("POWER needs two numbers");
         *out = val_float(pow(x, y));
+        return 0;
+    }
+
+    /* full-text search: to_tsvector / to_tsquery / plainto_tsquery / ts_rank.
+     * NULL in, NULL out, like the rest of the functions below the NULL
+     * guard. */
+    if (!strcasecmp(name, "TO_TSVECTOR") || !strcasecmp(name, "TO_TSQUERY") ||
+        !strcasecmp(name, "PLAINTO_TSQUERY")) {
+        if (want_args(name, n, 1, 1, err) < 0) return -1;
+        char buf[512];
+        const char *s;
+        as_text(&a[0], buf, sizeof buf, &s);
+        char *res = NULL;
+        int rc = strcasecmp(name, "TO_TSVECTOR") == 0
+                     ? fulltext_to_tsvector(s, &res, err)
+                     : strcasecmp(name, "TO_TSQUERY") == 0
+                           ? fulltext_to_tsquery(s, &res, err)
+                           : fulltext_plainto_tsquery(s, &res, err);
+        if (rc < 0) return -1;
+        *out = val_text(res);
+        free(res);
+        return 0;
+    }
+    if (!strcasecmp(name, "TS_RANK")) {
+        if (want_args("TS_RANK", n, 2, 2, err) < 0) return -1;
+        char buf1[512], buf2[512];
+        const char *s1, *s2;
+        as_text(&a[0], buf1, sizeof buf1, &s1);
+        as_text(&a[1], buf2, sizeof buf2, &s2);
+        *out = val_float(fulltext_rank(s1, s2));
         return 0;
     }
 

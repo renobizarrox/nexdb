@@ -755,6 +755,19 @@ int eval_expr(const Expr *e, const Row *row, const Table *t, int64_t now,
             else *out = val_int(a.i % b.i);
             break;
         }
+        case OP_MATCHES: {
+            /* tsvector @@ tsquery */
+            if (a.tag == T_NULL || b.tag == T_NULL) { *out = val_null(); break; }
+            char abuf[512], bbuf[512];
+            const char *tsv = (a.tag == T_TEXT && a.s) ? a.s : abuf;
+            const char *tsq = (b.tag == T_TEXT && b.s) ? b.s : bbuf;
+            if (tsv == abuf) val_format(&a, abuf, sizeof abuf);
+            if (tsq == bbuf) val_format(&b, bbuf, sizeof bbuf);
+            int m = fulltext_match(tsv, tsq, err);
+            if (m < 0) { rc = -1; break; }
+            *out = val_bit(m);
+            break;
+        }
         case OP_ADD: case OP_SUB: case OP_MUL: case OP_DIV: {
             if (a.tag == T_NULL || b.tag == T_NULL) { *out = val_null(); break; }
             if (e->op == OP_ADD && (a.tag == T_TEXT || b.tag == T_TEXT)) {
@@ -1481,6 +1494,52 @@ int table_ensure_index(DB *db, Table *t, int col)
     return idx;
 }
 
+/* Insert one value into one index. A GIN index gets one posting-list entry
+ * per distinct lexeme of the value; a plain btree index gets one entry. */
+static int index_value_insert(DB *db, Index *ix, const Value *v, RowRef ref, char *err)
+{
+    if (ix->gin) {
+        char vbuf[512], lex[64];
+        const char *text = (v->tag == T_TEXT && v->s) ? v->s : vbuf;
+        if (text == vbuf) val_format(v, vbuf, sizeof vbuf);
+        FTIter it;
+        fulltext_iter_begin(&it, text);
+        while (fulltext_iter_next(&it, lex, sizeof lex)) {
+            Value key = val_text(lex);
+            int rc = btree_insert_dup(db, &ix->root, &key, ref, err);
+            val_clear(&key);
+            if (rc < 0) return -1;
+        }
+        return 0;
+    }
+    return btree_insert(db, &ix->root, v, ref, err);
+}
+
+/* Remove one value's entries from one index (btree: by key, GIN: the exact
+ * posting-list entry matching the row reference). */
+static int index_value_delete(DB *db, Index *ix, const Value *v, RowRef ref, char *err)
+{
+    if (ix->gin) {
+        char vbuf[512], lex[64];
+        const char *text = (v->tag == T_TEXT && v->s) ? v->s : vbuf;
+        if (text == vbuf) val_format(v, vbuf, sizeof vbuf);
+        FTIter it;
+        fulltext_iter_begin(&it, text);
+        while (fulltext_iter_next(&it, lex, sizeof lex)) {
+            Value key = val_text(lex);
+            int rc = btree_delete_ref(db, &ix->root, &key, ref, err);
+#ifdef DEBUG_DELETE
+            fprintf(stderr, "DBG ival_delete lex='%s' rc=%d root=%u err='%s' dberr='%s'\n",
+                    lex, rc, ix->root, err, db->err);
+#endif
+            val_clear(&key);
+            if (rc < 0) return -1;
+        }
+        return 0;
+    }
+    return btree_delete(db, &ix->root, v, err);
+}
+
 /* Insert a key+ref into every index that covers the given column. */
 static int index_insert_row(DB *db, Table *t, const Row *r, char *err)
 {
@@ -1489,10 +1548,23 @@ static int index_insert_row(DB *db, Table *t, const Row *r, char *err)
         int col = t->indexes[i].col;
         if (col < 0 || col >= r->ncols || r->v[col].tag == T_NULL) continue;
         uint32_t old_root = t->indexes[i].root;
-        if (btree_insert(db, &t->indexes[i].root, &r->v[col], r->ref, err) < 0)
+        if (index_value_insert(db, &t->indexes[i], &r->v[col], r->ref, err) < 0)
             return -1;
         if (t->indexes[i].root != old_root)
             db_flush_catalog(db);
+    }
+    return 0;
+}
+
+/* Remove a row's entries from every index that covers a column. */
+static int index_remove_row(DB *db, Table *t, const Row *r, char *err)
+{
+    for (int i = 0; i < t->nindexes; i++) {
+        if (!t->indexes[i].valid) continue;
+        int col = t->indexes[i].col;
+        if (col < 0 || col >= r->ncols || r->v[col].tag == T_NULL) continue;
+        if (index_value_delete(db, &t->indexes[i], &r->v[col], r->ref, err) < 0)
+            return -1;
     }
     return 0;
 }
@@ -1798,12 +1870,7 @@ static int row_delete(DB *db, Table *t, Row *row, char *err)
 {
     if (heap_delete(db, t, row->ref) != 0) return 0;
     mem_forget_row(db, row->rid);
-    for (int ki = 0; ki < t->nindexes; ki++) {
-        if (!t->indexes[ki].valid) continue;
-        int col = t->indexes[ki].col;
-        if (col < 0 || col >= row->ncols || row->v[col].tag == T_NULL) continue;
-        btree_delete(db, &t->indexes[ki].root, &row->v[col], err);
-    }
+    if (index_remove_row(db, t, row, err) < 0) return -1;
     return 1;
 }
 
@@ -2550,13 +2617,17 @@ static int exec_alter(DB *db, Stmt *s, char *err)
             if (!t->indexes[ki].valid) continue;
             int col = t->indexes[ki].col;
             if (col < 0) continue;
+            uint32_t old_root = t->indexes[ki].root;
             if (col < row->ncols && row->v[col].tag != T_NULL)
-                btree_delete(db, &t->indexes[ki].root, &row->v[col], err);
+                index_value_delete(db, &t->indexes[ki], &row->v[col], row->ref, err);
             if (col < out.ncols && out.v[col].tag != T_NULL) {
-                if (btree_insert(db, &t->indexes[ki].root, &out.v[col], out.ref, err) < 0) {
+                if (index_value_insert(db, &t->indexes[ki], &out.v[col],
+                                       out.ref, err) < 0) {
                     row_clear(&out); rs_free(&rs); return -1;
                 }
             }
+            if (t->indexes[ki].root != old_root)
+                db_flush_catalog(db);
         }
         row_clear(&out);
     }
@@ -2701,10 +2772,15 @@ static int exec_update(DB *db, Stmt *s, char *err)
             if (!t->indexes[ki].valid) continue;
             int col = t->indexes[ki].col;
             if (col < 0) continue;
+            uint32_t old_root = t->indexes[ki].root;
             if (old_idx_vals[ki].tag != T_NULL)
-                btree_delete(db, &t->indexes[ki].root, &old_idx_vals[ki], err);
+                index_value_delete(db, &t->indexes[ki], &old_idx_vals[ki],
+                                   row->ref, err);
             if (col < row->ncols && row->v[col].tag != T_NULL)
-                btree_insert(db, &t->indexes[ki].root, &row->v[col], row->ref, err);
+                index_value_insert(db, &t->indexes[ki], &row->v[col],
+                                   row->ref, err);
+            if (t->indexes[ki].root != old_root)
+                db_flush_catalog(db);
             val_clear(&old_idx_vals[ki]);
         }
         for (int c = 0; c < t->ncols; c++) val_clear(&old_v[c]);
@@ -2720,6 +2796,9 @@ static int exec_update(DB *db, Stmt *s, char *err)
 
 static int exec_delete(DB *db, Stmt *s, char *err)
 {
+#ifdef DEBUG_DELETE
+    fprintf(stderr, "DBG exec_delete entry\n");
+#endif
     Table *t = cat_find(db, s->table);
     if (!t) { snprintf(err, MAX_ERR, "unknown table '%s'", s->table); return -1; }
     int64_t now = mem_now();
@@ -2732,10 +2811,16 @@ static int exec_delete(DB *db, Stmt *s, char *err)
     while (scan_next(&sc, &r)) {
         int m;
         if (row_matches(s->where, &r, t, now, &m, err) < 0) {
+#ifdef DEBUG_DELETE
+            fprintf(stderr, "DBG row_matches fail err='%s'\n", err);
+#endif
             row_clear(&r); rs_free(&rs); return -1;
         }
         if (m) {
             if (rs_push(&rs, &r, 0) < 0) {
+#ifdef DEBUG_DELETE
+                fprintf(stderr, "DBG rs_push fail\n");
+#endif
                 row_clear(&r); rs_free(&rs);
                 snprintf(err, MAX_ERR, "out of memory");
                 return -1;
@@ -2746,6 +2831,9 @@ static int exec_delete(DB *db, Stmt *s, char *err)
     int deleted = 0;
     for (int i = 0; i < rs.n; i++) {
         if (fk_parent_delete(db, t, &rs.rows[i], err, 1) < 0) {
+#ifdef DEBUG_DELETE
+            fprintf(stderr, "DBG fk check_only fail i=%d err='%s'\n", i, err);
+#endif
             rs_free(&rs);
             return -1;
         }
@@ -2753,11 +2841,18 @@ static int exec_delete(DB *db, Stmt *s, char *err)
     for (int i = 0; i < rs.n; i++) {
         Row *row = &rs.rows[i];
         if (fk_parent_delete(db, t, row, err, 0) < 0) {
+#ifdef DEBUG_DELETE
+            fprintf(stderr, "DBG fk real fail i=%d err='%s'\n", i, err);
+#endif
             rs_free(&rs);
             return -1;
         }
         int del = row_delete(db, t, row, err);
         if (del < 0) {
+#ifdef DEBUG_DELETE
+            fprintf(stderr, "DBG row_delete fail: rid=%llu ref=(%u,%u) err='%s'\n",
+                    (unsigned long long)row->rid, row->ref.page, row->ref.slot, err);
+#endif
             rs_free(&rs);
             return -1;
         }
@@ -3023,8 +3118,14 @@ static int exec_vacuum(DB *db, char *err)
         }
         Table *nt = cat_find(ndb, ot->name);
         for (int ki = 0; ki < ot->nindexes; ki++) {
-            if (ot->indexes[ki].valid)
-                table_ensure_index(ndb, nt, ot->indexes[ki].col);
+            if (ot->indexes[ki].valid) {
+                int nki = table_ensure_index(ndb, nt, ot->indexes[ki].col);
+                if (nki >= 0) {
+                    nt->indexes[nki].gin = ot->indexes[ki].gin;
+                    snprintf(nt->indexes[nki].name, MAX_NAME, "%s",
+                             ot->indexes[ki].name);
+                }
+            }
         }
         snprintf(nt->check, sizeof nt->check, "%s", ot->check);
         nt->nfks = ot->nfks;
@@ -3449,6 +3550,9 @@ int exec_stmt(DB *db, Stmt *s, char *err)
 
 static int exec_stmt_inner(DB *db, Stmt *s, char *err)
 {
+#ifdef DEBUG_DELETE
+    fprintf(stderr, "DBG exec_stmt_inner kind=%d\n", (int)s->kind);
+#endif
     switch (s->kind) {
     case ST_NOOP:
         return 0;
@@ -3586,6 +3690,97 @@ static int exec_stmt_inner(DB *db, Stmt *s, char *err)
         }
         if (found) printf("procedure '%s' dropped\n", s->table);
         return 0;
+    }
+
+    case ST_CREATE_INDEX: {
+        Table *t = cat_find(db, s->table);
+        if (!t) { snprintf(err, MAX_ERR, "unknown table '%s'", s->table); return -1; }
+        if (!s->index_gin) {
+            snprintf(err, MAX_ERR,
+                     "only CREATE INDEX ... USING GIN is supported");
+            return -1;
+        }
+        int col = table_col_index(t, s->index_col);
+        if (col < 0) {
+            snprintf(err, MAX_ERR, "no column '%s' in table '%s'",
+                     s->index_col, t->name);
+            return -1;
+        }
+        for (int i = 0; i < t->nindexes; i++) {
+            if (!t->indexes[i].valid) continue;
+            if (strcasecmp(t->indexes[i].name, s->index_name) == 0) {
+                snprintf(err, MAX_ERR, "index '%s' already exists", s->index_name);
+                return -1;
+            }
+            if (t->indexes[i].gin && t->indexes[i].col == col) {
+                snprintf(err, MAX_ERR,
+                         "a full-text index already exists on column '%s'",
+                         s->index_col);
+                return -1;
+            }
+        }
+        if (t->nindexes >= MAX_INDEXES) {
+            snprintf(err, MAX_ERR, "too many indexes (max %d)", MAX_INDEXES);
+            return -1;
+        }
+        int idx = t->nindexes++;
+        Index *ix = &t->indexes[idx];
+        memset(ix, 0, sizeof *ix);
+        ix->col = col;
+        ix->gin = 1;
+        snprintf(ix->name, MAX_NAME, "%s", s->index_name);
+        btree_create(ix);
+        /* build the posting lists over the existing rows */
+        Scan sc;
+        Row r;
+        scan_init(&sc, db, t);
+        while (scan_next(&sc, &r)) {
+            if (col < r.ncols && r.v[col].tag != T_NULL) {
+                if (index_value_insert(db, ix, &r.v[col], r.ref, err) < 0) {
+                    row_clear(&r);
+                    btree_destroy(db, ix->root);
+                    t->nindexes--;
+                    return -1;
+                }
+            }
+            row_clear(&r);
+        }
+        if (db_flush_catalog(db) < 0) {
+            snprintf(err, MAX_ERR, "%s", db->err);
+            return -1;
+        }
+        printf("index '%s' created on %s (%s)\n", s->index_name, t->name,
+               s->index_col);
+        return 0;
+    }
+
+    case ST_DROP_INDEX: {
+        for (int ti = 0; ti < db->cat.ntables; ti++) {
+            Table *t = &db->cat.tables[ti];
+            for (int ki = 0; ki < t->nindexes; ki++) {
+                if (!t->indexes[ki].valid) continue;
+                if (strcasecmp(t->indexes[ki].name, s->index_name) != 0)
+                    continue;
+                if (s->table[0] && strcasecmp(t->name, s->table) != 0) {
+                    snprintf(err, MAX_ERR, "index '%s' is on table '%s', not '%s'",
+                             s->index_name, t->name, s->table);
+                    return -1;
+                }
+                btree_destroy(db, t->indexes[ki].root);
+                for (int j = ki; j < t->nindexes - 1; j++)
+                    t->indexes[j] = t->indexes[j + 1];
+                t->nindexes--;
+                if (db_flush_catalog(db) < 0) {
+                    snprintf(err, MAX_ERR, "%s", db->err);
+                    return -1;
+                }
+                printf("index '%s' dropped\n", s->index_name);
+                return 0;
+            }
+        }
+        if (s->if_exists) return 0;
+        snprintf(err, MAX_ERR, "unknown index '%s'", s->index_name);
+        return -1;
     }
 
     case ST_CALL: {

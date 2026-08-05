@@ -55,6 +55,65 @@ static int join_tab_idx(JoinTab *tabs, int ntabs, const char *name)
 
 /* ------------------------------------------------------- aggregate state */
 
+/* ---- full-text (GIN) candidate selection -------------------------------- */
+
+/* Growing list of row refs harvested from a GIN posting list. */
+typedef struct {
+    RowRef *refs;
+    int     n, cap;
+    int     oom;
+} RefSet;
+
+static int ref_push(void *ctx, RowRef ref)
+{
+    RefSet *rs = ctx;
+    if (rs->n == rs->cap) {
+        int cap = rs->cap ? rs->cap * 2 : 64;
+        RowRef *nr = realloc(rs->refs, sizeof(RowRef) * (size_t)cap);
+        if (!nr) { rs->oom = 1; return 1; }
+        rs->refs = nr;
+        rs->cap = cap;
+    }
+    rs->refs[rs->n++] = ref;
+    return 0;
+}
+
+/* Walk an AND chain looking for a full-text match conjunct over a GIN-
+ * indexed column: to_tsvector(col) @@ 'query'. When found, extracts the
+ * query's first positive lexeme into *term_out and the column into
+ * *col_out. Returns 1 if the index can narrow the scan, 0 otherwise. */
+static int gin_pick(DB *db, const Stmt *s, const Table *t, const Expr *e,
+                    int *col_out, Value *term_out)
+{
+    (void)db;
+    if (e->kind != EX_BIN) return 0;
+    if (e->op == OP_AND)
+        return gin_pick(db, s, t, e->l, col_out, term_out) ||
+               gin_pick(db, s, t, e->r, col_out, term_out);
+    if (e->op != OP_MATCHES) return 0;
+    const Expr *call = e->l, *lit = e->r;
+    if (call->kind != EX_FUNC || lit->kind != EX_LIT) return 0;
+    if (strcasecmp(call->fname, "TO_TSVECTOR") != 0 || call->nargs != 1 ||
+        call->args[0]->kind != EX_COL)
+        return 0;
+    if (lit->lit.tag != T_TEXT || !lit->lit.s) return 0;
+    const char *qt = call->args[0]->col_table;
+    if (qt[0] && strcasecmp(qt, t->name) != 0 &&
+        strcasecmp(qt, s->alias) != 0)
+        return 0;
+    int col = table_col_index(t, call->args[0]->col);
+    if (col < 0) return 0;
+    int idx = table_find_index(t, col);
+    if (idx < 0 || !t->indexes[idx].valid || !t->indexes[idx].gin) return 0;
+    char terms[16][64];
+    char err2[MAX_ERR];
+    int n = fulltext_query_terms(lit->lit.s, terms, 16, err2);
+    if (n <= 0) return 0;        /* nothing positive: the index cannot narrow */
+    *col_out = col;
+    *term_out = val_text(terms[0]);
+    return 1;
+}
+
 typedef struct {
     AggKind kind;
     int64_t n;          /* rows counted                */
@@ -1115,6 +1174,18 @@ static int exec_select_core(DB *db, Stmt *s, Capture *capture, char *err)
         }
     }
 
+    /* ---- try a GIN full-text lookup for "WHERE to_tsvector(col) @@ 'q'".
+     * Only the candidate row refs come from the index; the whole WHERE is
+     * still re-applied as the filter, so AND chains around the match are
+     * handled correctly and a lossy posting list can never drop a match. */
+    int gin_lookup = 0;
+    Value gin_key;
+    memset(&gin_key, 0, sizeof gin_key);
+    int gin_col = -1;
+    if (!grouped && s->has_from && njoin_tabs <= 1 && s->where) {
+        if (gin_pick(db, s, t, s->where, &gin_col, &gin_key)) gin_lookup = 1;
+    }
+
     /* ---- scan, filter, and either project directly or fold into groups */
     if (njoin_tabs > 1) {
         /* ---- nested-loop join execution */
@@ -1425,6 +1496,67 @@ join_cleanup:
         if (err[0]) return -1;
         goto emit;
     } else if (!grouped) {
+        if (gin_lookup) {
+            int idx = table_find_index(t, gin_col);
+            RefSet refs;
+            memset(&refs, 0, sizeof refs);
+            int rc = btree_run_foreach(db, t->indexes[idx].root, &gin_key,
+                                       ref_push, &refs, err);
+            val_clear(&gin_key);
+            if (rc < 0 || refs.oom) {
+                free(refs.refs);
+                res_free(&res);
+                if (!err[0]) snprintf(err, MAX_ERR, "out of memory");
+                return -1;
+            }
+            for (int ri = 0; ri < refs.n; ri++) {
+                Row r;
+                if (heap_read_row(db, refs.refs[ri], &r) != 0) continue;
+                /* re-apply the whole WHERE: the posting list is only a
+                 * candidate set (AND clauses, negations, and any other
+                 * conjuncts are checked here) */
+                int m;
+                if (row_matches(s->where, &r, t, now, &m, err) < 0) {
+                    row_clear(&r);
+                    free(refs.refs);
+                    res_free(&res);
+                    return -1;
+                }
+                if (!m) { row_clear(&r); continue; }
+                if (res_grow(&res) < 0) {
+                    row_clear(&r);
+                    free(refs.refs);
+                    res_free(&res);
+                    snprintf(err, MAX_ERR, "out of memory");
+                    return -1;
+                }
+                int failed = 0;
+                for (int c = 0; c < ncols && !failed; c++) {
+                    Value *dst = &res.cells[res.nrows * ncols + c];
+                    if (exprs[c]) {
+                        if (eval_expr(exprs[c], &r, t, now, dst, err) < 0) failed = 1;
+                    } else {
+                        int cm = colmap[c];
+                        *dst = (cm >= 0 && cm < r.ncols) ? val_copy(&r.v[cm])
+                                                         : val_null();
+                    }
+                }
+                for (int k = 0; k < s->norder && !failed; k++) {
+                    Value *dst = &res.keys[res.nrows * s->norder + k];
+                    if (order_from_col[k] >= 0)
+                        *dst = val_copy(&res.cells[res.nrows * ncols + order_from_col[k]]);
+                    else if (eval_expr(s->order[k].e, &r, t, now, dst, err) < 0)
+                        failed = 1;
+                }
+                res.refs[res.nrows] = r.ref;
+                res.rids[res.nrows] = r.rid;
+                res.nrows++;
+                row_clear(&r);
+                if (failed) { free(refs.refs); res_free(&res); return -1; }
+            }
+            free(refs.refs);
+            goto point_done;
+        }
         if (point_lookup) {
             int idx = table_find_index(t, point_col);
             RowRef ref;

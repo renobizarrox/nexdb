@@ -30,7 +30,7 @@ endif
 CFLAGS += $(TLS_CFLAGS)
 LDFLAGS += $(TLS_LDFLAGS)
 
-SRC := src/value.c src/pager.c src/memory.c src/btree.c src/lexer.c \
+SRC := src/value.c src/pager.c src/memory.c src/btree.c src/fulltext.c src/lexer.c \
        src/parser.c src/func.c src/select.c src/exec.c src/main.c src/wal.c src/server.c
 OBJ := $(SRC:src/%.c=build/%.o)
 BIN := build/nexdb

@@ -150,6 +150,20 @@ static int scan_token(Lexer *lx, Token *t)
         return 0;
     }
 
+    /* the full-text match operator must be checked before the @identifier
+     * rule, which would otherwise swallow '@@' as an identifier.  An '@@'
+     * immediately followed by an identifier letter is a T-SQL system
+     * variable (@@fetch_status), which falls through to the identifier rule. */
+    if (c == '@' && s[lx->pos + 1] == '@' &&
+        !isalpha((unsigned char)s[lx->pos + 2]) && s[lx->pos + 2] != '_') {
+        t->kind = TK_PUNCT;
+        t->text[0] = '@';
+        t->text[1] = '@';
+        t->text[2] = 0;
+        lx->pos += 2;
+        return 0;
+    }
+
     /* identifier / keyword / @variable / _pseudo_column */
     if (isalpha((unsigned char)c) || c == '_' || c == '@' || c == '#') {
         size_t n = 0;
@@ -164,7 +178,7 @@ static int scan_token(Lexer *lx, Token *t)
     }
 
     /* operators and punctuation */
-    static const char *two[] = { "<>", "!=", "<=", ">=", "||", NULL };
+    static const char *two[] = { "<>", "!=", "<=", ">=", "||", "@@", NULL };
     for (int i = 0; two[i]; i++) {
         if (s[lx->pos] == two[i][0] && s[lx->pos + 1] == two[i][1]) {
             t->kind = TK_PUNCT;

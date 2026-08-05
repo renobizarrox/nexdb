@@ -155,6 +155,46 @@ static int btree_search_pos(const uint8_t *pg, const Value *key, int *exact, cha
     return lo;
 }
 
+static uint32_t btree_child(const uint8_t *pg, int pos, const Value *key, int right_of_eq)
+{
+    int n = rd16(pg, BT_NKEYS);
+    if (right_of_eq && pos < n) {
+        size_t o = BT_HDR_SIZE + 4;
+        for (int i = 0; i < pos; i++)
+            o += entry_size(pg, o, 0);
+        Value sep;
+        size_t c;
+        if (key_decode(pg + o, PAGE_SIZE - o, &sep, &c) == 0) {
+            int ok;
+            int cmp = val_compare(&sep, key, &ok);
+            val_clear(&sep);
+            if (cmp == 0 && ok == 1) pos++;
+        }
+    }
+    if (pos == 0) return rd32(pg, BT_HDR_SIZE);
+    size_t o = BT_HDR_SIZE + 4;
+    for (int i = 0; i < pos - 1; i++)
+        o += entry_size(pg, o, 0);
+    o += entry_size(pg, o, 0);
+    return rd32(pg, o - 4);
+}
+
+/* Descend from root to the leaf that could hold `key`, choosing children
+ * left of equal separators (right_of_eq = 0) or right of them (= 1). */
+static uint32_t btree_descend(DB *db, uint32_t root, const Value *key, int right_of_eq, char *err)
+{
+    uint8_t pg[PAGE_SIZE];
+    uint32_t pno = root;
+    for (;;) {
+        if (pager_read(db, pno, pg) < 0) return 0;
+        if (pg[BT_FLAGS] & BT_LEAF) break;
+        int pos = btree_search_pos(pg, key, &(int){0}, err);
+        if (pos < 0) return 0;
+        pno = btree_child(pg, pos, key, right_of_eq);
+    }
+    return pno;
+}
+
 static void btree_insert_entry(uint8_t *pg, int pos, const Value *key, uint32_t child, RowRef ref, int leaf)
 {
     int n = rd16(pg, BT_NKEYS);
@@ -234,6 +274,10 @@ static int btree_split_child(DB *db, uint8_t *parent, int pos, uint32_t parent_p
 
     int n = rd16(child, BT_NKEYS);
     int cleft = child[BT_FLAGS] & BT_LEAF;
+#ifdef DEBUG_SPLIT
+    fprintf(stderr, "SPLIT child=%u n=%d cleft=%d pos=%d parent_pno=%u\n",
+            child_pno, n, cleft, pos, parent_pno);
+#endif
 
     int split = n / 2;
 
@@ -280,8 +324,7 @@ static int btree_split_child(DB *db, uint8_t *parent, int pos, uint32_t parent_p
     btree_insert_entry(parent, pos, &mid_key, right_pno, (RowRef){0,0}, 0);
     val_clear(&mid_key);
 
-    if (!cleft)
-        wr32(child, BT_NEXT, right_pno);
+    wr32(child, BT_NEXT, right_pno);
 
     if (pager_write(db, child_pno, child) < 0) return -1;
     if (pager_write(db, right_pno, right) < 0) return -1;
@@ -290,8 +333,11 @@ static int btree_split_child(DB *db, uint8_t *parent, int pos, uint32_t parent_p
     return 0;
 }
 
-static int btree_insert_nonfull(DB *db, uint32_t pno, const Value *key, RowRef ref, uint32_t *root, char *err)
+static int btree_insert_nonfull(DB *db, uint32_t pno, const Value *key, RowRef ref, int dup, uint32_t *root, char *err)
 {
+#ifdef DEBUG_SPLIT
+    fprintf(stderr, "IN pno=%u key=%s\n", pno, key->tag == T_TEXT ? key->s : "?");
+#endif
     uint8_t pg[PAGE_SIZE];
     if (pager_read(db, pno, pg) < 0) return -1;
 
@@ -299,7 +345,7 @@ static int btree_insert_nonfull(DB *db, uint32_t pno, const Value *key, RowRef r
         int exact;
         int pos = btree_search_pos(pg, key, &exact, err);
         if (pos < 0) return -1;
-        if (exact) {
+        if (!dup && exact) {
             snprintf(err, MAX_ERR, "duplicate key violates UNIQUE constraint");
             return -1;
         }
@@ -356,6 +402,7 @@ static int btree_insert_nonfull(DB *db, uint32_t pno, const Value *key, RowRef r
             }
 
             int half = n / 2;
+            uint32_t old_next = rd32(pg, BT_NEXT);
 
             memset(pg, 0, PAGE_SIZE);
             pg[BT_FLAGS] = BT_LEAF;
@@ -366,11 +413,12 @@ static int btree_insert_nonfull(DB *db, uint32_t pno, const Value *key, RowRef r
                 wr16(pg, off, all_refs[i].slot); off += 2;
             }
             wr16(pg, BT_NKEYS, (uint16_t)half);
+            wr32(pg, BT_NEXT, right_pno);
 
             uint8_t right_buf[PAGE_SIZE];
             memset(right_buf, 0, PAGE_SIZE);
             right_buf[BT_FLAGS] = BT_LEAF;
-            wr32(right_buf, BT_NEXT, rd32(pg, BT_NEXT));
+            wr32(right_buf, BT_NEXT, old_next);
             off = BT_HDR_SIZE;
             for (int i = half; i < n; i++) {
                 off += key_encode(&all_keys[i], right_buf + off, PAGE_SIZE - off);
@@ -410,17 +458,7 @@ static int btree_insert_nonfull(DB *db, uint32_t pno, const Value *key, RowRef r
     int pos = btree_search_pos(pg, key, &exact, err);
     if (pos < 0) return -1;
 
-    uint32_t child_pno;
-    if (pos == 0) {
-        child_pno = rd32(pg, BT_HDR_SIZE);
-    } else {
-        size_t co = BT_HDR_SIZE + 4;
-        for (int i = 0; i < pos - 1; i++)
-            co += entry_size(pg, co, 0);
-        co += entry_size(pg, co, 0);
-        co -= 4;
-        child_pno = rd32(pg, co);
-    }
+    uint32_t child_pno = btree_child(pg, pos, key, dup ? 0 : 1);
 
     uint8_t child[PAGE_SIZE];
     if (pager_read(db, child_pno, child) < 0) return -1;
@@ -436,19 +474,10 @@ static int btree_insert_nonfull(DB *db, uint32_t pno, const Value *key, RowRef r
         pos = btree_search_pos(pg, key, &e2, err);
         if (pos < 0) return -1;
 
-        if (pos == 0) {
-            child_pno = rd32(pg, BT_HDR_SIZE);
-        } else {
-            size_t co2 = BT_HDR_SIZE + 4;
-            for (int i = 0; i < pos - 1; i++)
-                co2 += entry_size(pg, co2, 0);
-            co2 += entry_size(pg, co2, 0);
-            co2 -= 4;
-            child_pno = rd32(pg, co2);
-        }
+        child_pno = btree_child(pg, pos, key, dup ? 0 : 1);
     }
 
-    return btree_insert_nonfull(db, child_pno, key, ref, root, err);
+    return btree_insert_nonfull(db, child_pno, key, ref, dup, root, err);
 }
 
 int btree_create(Index *idx)
@@ -488,16 +517,7 @@ int btree_find(DB *db, uint32_t root, const Value *key, RowRef *ref, char *err)
             return 0;
         }
 
-        if (pos == 0) {
-            pno = rd32(pg, BT_HDR_SIZE);
-        } else {
-            size_t off = BT_HDR_SIZE + 4;
-            for (int i = 0; i < pos - 1; i++)
-                off += entry_size(pg, off, 0);
-            off += entry_size(pg, off, 0);
-            off -= 4;
-            pno = rd32(pg, off);
-        }
+        pno = btree_child(pg, pos, key, 1);
     }
 }
 
@@ -514,7 +534,26 @@ int btree_insert(DB *db, uint32_t *root, const Value *key, RowRef ref, char *err
         return pager_write(db, *root, pg);
     }
 
-    return btree_insert_nonfull(db, *root, key, ref, root, err);
+    return btree_insert_nonfull(db, *root, key, ref, 0, root, err);
+}
+
+/* Like btree_insert but for non-unique keys (GIN posting lists): equal keys
+ * are allowed, and equal-key runs are always descended into leftmost and
+ * walked forward across sibling leaves, so a run may span split leaves. */
+int btree_insert_dup(DB *db, uint32_t *root, const Value *key, RowRef ref, char *err)
+{
+    if (*root == 0) {
+        uint8_t pg[PAGE_SIZE];
+        memset(pg, 0, PAGE_SIZE);
+        pg[BT_FLAGS] = BT_LEAF | BT_ROOT;
+        *root = pager_alloc(db);
+        if (*root == 0) return -1;
+        if (pager_write(db, *root, pg) < 0) return -1;
+        btree_insert_entry(pg, 0, key, 0, ref, 1);
+        return pager_write(db, *root, pg);
+    }
+
+    return btree_insert_nonfull(db, *root, key, ref, 1, root, err);
 }
 
 int btree_delete(DB *db, uint32_t *root, const Value *key, char *err)
@@ -530,17 +569,7 @@ int btree_delete(DB *db, uint32_t *root, const Value *key, char *err)
         int pos = btree_search_pos(pg, key, &exact, err);
         if (pos < 0) return -1;
 
-        uint32_t child_pno;
-        if (pos == 0) {
-            child_pno = rd32(pg, BT_HDR_SIZE);
-        } else {
-            size_t off = BT_HDR_SIZE + 4;
-            for (int i = 0; i < pos - 1; i++)
-                off += entry_size(pg, off, 0);
-            off += entry_size(pg, off, 0);
-            off -= 4;
-            child_pno = rd32(pg, off);
-        }
+        uint32_t child_pno = btree_child(pg, pos, key, 1);
 
         uint8_t child[PAGE_SIZE];
         if (pager_read(db, child_pno, child) < 0) return -1;
@@ -636,4 +665,167 @@ int btree_has_key(DB *db, uint32_t root, const Value *key, char *err)
 {
     RowRef dummy;
     return btree_find(db, root, key, &dummy, err) == 0;
+}
+
+/* Visit every entry whose key equals `key`, in ascending order, starting at
+ * the leftmost occurrence. Equal-key runs may span sibling leaves (a split
+ * may cut through a run); the walk follows the BT_NEXT chain while the next
+ * leaf still begins with the key. Returns 0 on success, -1 on error; the
+ * visit callback may return nonzero to stop the walk early. */
+int btree_run_foreach(DB *db, uint32_t root, const Value *key,
+                      int (*visit)(void *ctx, RowRef ref), void *ctx, char *err)
+{
+    if (root == 0) return 0;
+
+    uint32_t pno = btree_descend(db, root, key, 0, err);
+    if (pno == 0) return -1;
+
+    uint8_t pg[PAGE_SIZE];
+    if (pager_read(db, pno, pg) < 0) return -1;
+
+    for (;;) {
+        int n = rd16(pg, BT_NKEYS);
+        int exact;
+        int pos = btree_search_pos(pg, key, &exact, err);
+        if (pos < 0) return -1;
+
+        if (pos < n) {
+            Value k;
+            size_t c;
+            size_t off = BT_HDR_SIZE;
+            for (int i = 0; i < pos; i++)
+                off += entry_size(pg, off, 1);
+            if (key_decode(pg + off, PAGE_SIZE - off, &k, &c) == 0) {
+                int ok;
+                if (val_compare(&k, key, &ok) == 0 && ok == 1) {
+                    for (int i = pos; i < n; i++) {
+                        if (i > pos) {
+                            off += entry_size(pg, off, 1);
+                            if (key_decode(pg + off, PAGE_SIZE - off, &k, &c) < 0)
+                                { val_clear(&k); return -1; }
+                        }
+                        int ok2;
+                        if (val_compare(&k, key, &ok2) != 0 || ok2 != 1) break;
+                        RowRef ref = { rd32(pg, off + c), rd16(pg, off + c + 4) };
+                        if (visit && visit(ctx, ref) != 0) {
+                            val_clear(&k);
+                            return 0;
+                        }
+                    }
+                }
+                val_clear(&k);
+            }
+        }
+
+        uint32_t next = rd32(pg, BT_NEXT);
+        if (next == 0) return 0;
+        if (pager_read(db, next, pg) < 0) return -1;
+        if (rd16(pg, BT_NKEYS) == 0) continue;
+        Value k0;
+        size_t c0;
+        if (key_decode(pg + BT_HDR_SIZE, PAGE_SIZE - BT_HDR_SIZE, &k0, &c0) < 0)
+            return -1;
+        int ok0;
+        int cmp0 = val_compare(&k0, key, &ok0);
+        val_clear(&k0);
+        if (cmp0 != 0 || ok0 != 1) return 0;
+    }
+}
+
+/* Delete the entry with the given key and row reference (GIN posting-list
+ * removal). The reference distinguishes the entry within a run of equal
+ * keys, which may span sibling leaves. */
+int btree_delete_ref(DB *db, uint32_t *root, const Value *key, RowRef ref, char *err)
+{
+    if (*root == 0) {
+        snprintf(err, MAX_ERR, "index is empty");
+        return -1;
+    }
+
+    uint32_t pno = btree_descend(db, *root, key, 0, err);
+    if (pno == 0) {
+        snprintf(err, MAX_ERR, "descent failed while deleting from index");
+        return -1;
+    }
+
+#ifdef DEBUG_DELREF
+    fprintf(stderr, "DRF: descend root=%u -> %u key=%s ref=(%u,%u)\n",
+            *root, pno, key->tag == T_TEXT ? key->s : "?", ref.page, ref.slot);
+#endif
+    uint8_t pg[PAGE_SIZE];
+    if (pager_read(db, pno, pg) < 0) {
+#ifdef DEBUG_DELREF
+        fprintf(stderr, "DRF: pager_read %u failed: %s\n", pno, db->err);
+#endif
+        return -1;
+    }
+
+    for (;;) {
+        int n = rd16(pg, BT_NKEYS);
+        int exact;
+        int pos = btree_search_pos(pg, key, &exact, err);
+        if (pos < 0) {
+#ifdef DEBUG_DELREF
+            fprintf(stderr, "DRF: search_pos fail on leaf %u\n", pno);
+#endif
+            return -1;
+        }
+
+        if (pos < n) {
+            size_t off = BT_HDR_SIZE;
+            for (int i = 0; i < pos; i++)
+                off += entry_size(pg, off, 1);
+            for (int i = pos; i < n; i++) {
+                Value k;
+                size_t c;
+                if (key_decode(pg + off, PAGE_SIZE - off, &k, &c) < 0) {
+#ifdef DEBUG_DELREF
+                    fprintf(stderr, "DRF: scan decode fail leaf=%u i=%d off=%zu\n",
+                            pno, i, off);
+#endif
+                    return -1;
+                }
+                int ok;
+                int cmp = val_compare(&k, key, &ok);
+                val_clear(&k);
+                if (cmp != 0 || ok != 1) break;
+                if (rd32(pg, off + c) == ref.page && rd16(pg, off + c + 4) == ref.slot) {
+                    btree_remove_entry(pg, i);
+                    return pager_write(db, pno, pg);
+                }
+                off += entry_size(pg, off, 1);
+            }
+        }
+
+        uint32_t next = rd32(pg, BT_NEXT);
+        if (next == 0) {
+#ifdef DEBUG_DELREF
+            fprintf(stderr, "DRF MISS: key=%s ref=(%u,%u)\n",
+                    key->tag == T_TEXT ? key->s : "?", ref.page, ref.slot);
+#endif
+            snprintf(err, MAX_ERR, "index entry for row (page %u, slot %u) not found",
+                     ref.page, ref.slot);
+            return -1;
+        }
+        pno = next;
+        if (pager_read(db, next, pg) < 0) {
+#ifdef DEBUG_DELREF
+            fprintf(stderr, "DRF: pager_read next %u failed: %s\n", next, db->err);
+#endif
+            return -1;
+        }
+        if (rd16(pg, BT_NKEYS) == 0) continue;
+        Value k0;
+        size_t c0;
+        if (key_decode(pg + BT_HDR_SIZE, PAGE_SIZE - BT_HDR_SIZE, &k0, &c0) < 0) {
+#ifdef DEBUG_DELREF
+            fprintf(stderr, "DRF: first-key decode fail on leaf %u\n", next);
+#endif
+            return -1;
+        }
+        int ok0;
+        int cmp0 = val_compare(&k0, key, &ok0);
+        val_clear(&k0);
+        if (cmp0 != 0 || ok0 != 1) return -1;
+    }
 }

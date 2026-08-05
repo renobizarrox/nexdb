@@ -656,6 +656,7 @@ static Expr *parse_pred(Lexer *lx, char *err)
     else if (tok_is_punct(&lx->cur, ">=")) op = OP_GE;
     else if (tok_is_punct(&lx->cur, "<"))  op = OP_LT;
     else if (tok_is_punct(&lx->cur, ">"))  op = OP_GT;
+    else if (tok_is_punct(&lx->cur, "@@")) op = OP_MATCHES;
     else return l;
 
     if (adv(lx, err) < 0) { expr_free(l); return NULL; }
@@ -2238,6 +2239,21 @@ static int parse_stmt_nobound(Lexer *lx, Stmt *out, char *err)
         } else if (tok_is_kw(&lx->cur, "PROCEDURE")) {
             if (adv(lx, err) < 0) return -1;
             rc = parse_create_proc(lx, out, err);
+        } else if (tok_is_kw(&lx->cur, "INDEX")) {
+            if (adv(lx, err) < 0) return -1;
+            out->kind = ST_CREATE_INDEX;
+            if (take_ident(lx, out->index_name, MAX_NAME, err) < 0) return -1;
+            if (eat_kw(lx, "ON", err) < 0) return -1;
+            if (take_ident(lx, out->table, MAX_NAME, err) < 0) return -1;
+            if (eat_punct(lx, "(", err) < 0) return -1;
+            if (take_ident(lx, out->index_col, MAX_NAME, err) < 0) return -1;
+            if (eat_punct(lx, ")", err) < 0) return -1;
+            if (tok_is_kw(&lx->cur, "USING")) {
+                if (adv(lx, err) < 0) return -1;
+                if (eat_kw(lx, "GIN", err) < 0) return -1;
+                out->index_gin = 1;
+            }
+            rc = 0;
         } else {
             rc = parse_create(lx, out, err);
         }
@@ -2262,6 +2278,21 @@ static int parse_stmt_nobound(Lexer *lx, Stmt *out, char *err)
                 out->if_exists = 1;
             }
             rc = take_ident(lx, out->table, MAX_NAME, err);
+        } else if (tok_is_kw(&lx->cur, "INDEX")) {
+            if (adv(lx, err) < 0) return -1;
+            out->kind = ST_DROP_INDEX;
+            if (tok_is_kw(&lx->cur, "IF")) {
+                if (adv(lx, err) < 0) return -1;
+                if (eat_kw(lx, "EXISTS", err) < 0) return -1;
+                out->if_exists = 1;
+            }
+            rc = take_ident(lx, out->index_name, MAX_NAME, err);
+            if (rc < 0) return -1;
+            if (tok_is_kw(&lx->cur, "ON")) {
+                if (adv(lx, err) < 0) return -1;
+                if (take_ident(lx, out->table, MAX_NAME, err) < 0) return -1;
+            }
+            rc = 0;
         } else {
             if (eat_kw(lx, "TABLE", err) < 0) return -1;
             out->kind = ST_DROP;

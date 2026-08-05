@@ -290,7 +290,14 @@ static size_t catalog_serialize(const Catalog *c, uint8_t **out)
             wr32(b, o, t->indexes[k].root); o += 4;
             b[o++] = (uint8_t)t->indexes[k].col;
             b[o++] = t->indexes[k].valid;
-            b[o++] = 0; b[o++] = 0;
+            b[o++] = t->indexes[k].gin;
+            b[o++] = 0;
+            /* explicit index name (variable length, 2-byte length prefix);
+             * absent in files written by older versions */
+            size_t nl = strlen(t->indexes[k].name);
+            if (nl > 0xFFFF) nl = 0xFFFF;
+            wr16(b, o, (uint16_t)nl); o += 2;
+            memcpy(b + o, t->indexes[k].name, nl); o += nl;
         }
         /* CHECK constraint text (variable length, 2-byte length prefix) */
         size_t clen = strlen(t->check);
@@ -418,7 +425,22 @@ static void catalog_deserialize(Catalog *c, const uint8_t *b, size_t len)
             if (o + 8 > len) { t->nindexes = k; break; }
             t->indexes[k].root  = rd32(b, o); o += 4;
             t->indexes[k].col   = (int8_t)b[o++];
-            t->indexes[k].valid = b[o++]; o += 2;
+            t->indexes[k].valid = b[o++];
+            if (o < len) t->indexes[k].gin = b[o++];
+            if (o < len) o++; /* padding */
+            t->indexes[k].name[0] = 0;
+            /* index name; absent in files written by older versions */
+            if (o + 2 <= len) {
+                uint16_t nl = rd16(b, o); o += 2;
+                if (nl > 0) {
+                    if (o + nl > len) nl = (uint16_t)(len - o);
+                    size_t copy = nl < sizeof t->indexes[k].name
+                                  ? nl : sizeof t->indexes[k].name - 1;
+                    memcpy(t->indexes[k].name, b + o, copy);
+                    t->indexes[k].name[copy] = 0;
+                    o += nl;
+                }
+            }
         }
         /* CHECK constraint text; absent in files written by older versions */
         if (o + 2 <= len) {

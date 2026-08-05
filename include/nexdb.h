@@ -144,7 +144,9 @@ typedef struct {
     uint32_t root;
     int8_t   col;
     uint8_t  valid;
-    uint8_t  _pad[2];
+    uint8_t  gin;         /* 1 = full-text GIN index over the column */
+    uint8_t  _pad[1];
+    char     name[MAX_NAME];  /* explicit CREATE INDEX name, "" if unnamed */
 } Index;
 
 #define MAX_FKS      8
@@ -344,10 +346,29 @@ int  btree_insert(DB *db, uint32_t *root, const Value *key, RowRef ref, char *er
 int  btree_delete(DB *db, uint32_t *root, const Value *key, char *err);
 int  btree_destroy(DB *db, uint32_t root);
 int  btree_has_key(DB *db, uint32_t root, const Value *key, char *err);
+int  btree_insert_dup(DB *db, uint32_t *root, const Value *key, RowRef ref, char *err);
+int  btree_delete_ref(DB *db, uint32_t *root, const Value *key, RowRef ref, char *err);
+int  btree_run_foreach(DB *db, uint32_t root, const Value *key,
+                       int (*visit)(void *ctx, RowRef ref), void *ctx, char *err);
 
 /* index helpers in exec.c */
 int  table_ensure_index(DB *db, Table *t, int col);
 int  table_find_index(const Table *t, int col);
+
+/* fulltext.c - PostgreSQL-style full-text search support */
+typedef struct {
+    const char *p;
+} FTIter;
+
+void   fulltext_iter_begin(FTIter *it, const char *text);
+int    fulltext_iter_next(FTIter *it, char *lex, size_t cap);
+int    fulltext_terms(const char *text, char terms[][64], int max);
+int    fulltext_to_tsvector(const char *text, char **out, char *err);
+int    fulltext_to_tsquery(const char *text, char **out, char *err);
+int    fulltext_plainto_tsquery(const char *text, char **out, char *err);
+int    fulltext_match(const char *tsv, const char *tsq, char *err);
+double fulltext_rank(const char *tsv, const char *tsq);
+int    fulltext_query_terms(const char *tsq, char terms[][64], int max, char *err);
 
 /* ----------------------------------------------------------------- lexer */
 
@@ -395,6 +416,7 @@ int  tok_is_punct(const Token *t, const char *p);
 
 typedef enum {
     OP_EQ, OP_NE, OP_LT, OP_LE, OP_GT, OP_GE,
+    OP_MATCHES,              /* tsvector @@ tsquery (full-text match) */
     OP_AND, OP_OR,
     OP_LIKE, OP_NOT_LIKE,
     OP_ADD, OP_SUB, OP_MUL, OP_DIV, OP_MOD
@@ -519,9 +541,11 @@ typedef enum {
     ST_CREATE,
     ST_CREATE_VIEW,
     ST_CREATE_PROC,
+    ST_CREATE_INDEX,
     ST_DROP,
     ST_DROP_VIEW,
     ST_DROP_PROC,
+    ST_DROP_INDEX,
     ST_CALL,
     ST_ALTER_ADD,
     ST_ALTER_DROP,
@@ -574,6 +598,11 @@ typedef struct Stmt {
     StKind kind;
     char   table[MAX_NAME];
     int    if_exists;         /* DROP TABLE IF EXISTS */
+
+    /* CREATE / DROP INDEX */
+    char   index_name[MAX_NAME];
+    char   index_col[MAX_NAME];
+    int    index_gin;
 
     /* CREATE */
     Column cols[MAX_COLS];
