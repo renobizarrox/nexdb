@@ -348,6 +348,53 @@ static int check_grouped(const Expr *e, Stmt *s, char *err)
     return 0;
 }
 
+/* Every column a GROUP BY key names must exist in the FROM table.  Column refs
+ * are checked up front so that "GROUP BY nosuchcol" is reported as an unknown
+ * column instead of surfacing later (or being masked by a "must appear in
+ * GROUP BY" error that mentions the select list instead).  Returns 1 if a
+ * subquery is encountered (its columns belong to a different scope and are
+ * left for runtime evaluation), -1 on an unknown column, else 0. */
+static int group_cols_exist(const Expr *e, const Table *t, char *err)
+{
+    if (!e) return 0;
+    if (e->kind == EX_SUBQUERY) return 1;
+    if (e->kind == EX_COL) {
+        if (e->col_table[0]) {
+            if (strcasecmp(e->col_table, t->name) != 0 ||
+                table_col_index(t, e->col) < 0) {
+                snprintf(err, MAX_ERR, "no column '%s' in table '%s'",
+                         e->col, e->col_table[0] ? e->col_table : t->name);
+                return -1;
+            }
+            return 0;
+        }
+        if (pseudo_col_index(e->col) != -1) return 0;
+        if (table_col_index(t, e->col) < 0) {
+            snprintf(err, MAX_ERR, "no column '%s' in table '%s'",
+                     e->col, t->name);
+            return -1;
+        }
+        return 0;
+    }
+    if (e->l) {
+        int rc = group_cols_exist(e->l, t, err);
+        if (rc) return rc;
+    }
+    if (e->r) {
+        int rc = group_cols_exist(e->r, t, err);
+        if (rc) return rc;
+    }
+    for (int i = 0; i < e->nitems; i++) {
+        int rc = group_cols_exist(e->items[i], t, err);
+        if (rc) return rc;
+    }
+    for (int i = 0; i < e->nargs; i++) {
+        int rc = group_cols_exist(e->args[i], t, err);
+        if (rc) return rc;
+    }
+    return 0;
+}
+
 /* ------------------------------------------------------------ result set */
 
 typedef struct {
@@ -974,6 +1021,13 @@ static int exec_select_core(DB *db, Stmt *s, Capture *capture, char *err)
         return -1;
     }
     if (grouped) {
+        if (t) {
+            for (int gi = 0; gi < s->ngroup; gi++) {
+                int rc = group_cols_exist(s->group[gi], t, err);
+                if (rc < 0) return -1;
+                if (rc == 1) break;   /* subquery: leave for the row loop */
+            }
+        }
         for (int i = 0; i < s->nitems; i++) {
             if (s->items[i].is_star) {
                 snprintf(err, MAX_ERR,

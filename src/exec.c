@@ -1318,6 +1318,7 @@ static const char *type_decl(const Column *c)
         snprintf(buf, sizeof buf, "%s", int_sub_name(c->sub));
     } else if (c->type == T_TEXT) {
         if (c->is_datetime) snprintf(buf, sizeof buf, "DATETIME");
+        else if (c->is_uuid) snprintf(buf, sizeof buf, "UNIQUEIDENTIFIER");
         else if (c->maxlen) snprintf(buf, sizeof buf, "NVARCHAR(%u)", c->maxlen);
         else snprintf(buf, sizeof buf, "NVARCHAR(MAX)");
     } else {
@@ -1457,6 +1458,15 @@ static int coerce_to_column(const Column *c, Value *v, char *err)
                      "optionally followed by HH:MM[:SS]", v->s ? v->s : "",
                      c->name);
             return -1;
+        }
+        if (c->is_uuid) {
+            uint8_t bytes[16];
+            if (!uuid_parse(v->s, bytes)) {
+                snprintf(err, MAX_ERR,
+                         "'%s' is not a UUID for '%s': expected 8-4-4-4-12 "
+                         "hex digits", v->s ? v->s : "", c->name);
+                return -1;
+            }
         }
         if (c->maxlen && v->slen > c->maxlen) {
             snprintf(err, MAX_ERR,
@@ -2545,7 +2555,10 @@ static int exec_alter(DB *db, Stmt *s, char *err)
         /* The target definition, with the same normalization the catalog
          * change below applies (DATETIME only survives on TEXT columns). */
         Column newc = s->cols[0];
-        if (newc.type != T_TEXT) newc.is_datetime = 0;
+        if (newc.type != T_TEXT) {
+            newc.is_datetime = 0;
+            newc.is_uuid = 0;
+        }
 
         /* Validate every stored value against the new type before touching
          * anything.  Narrowing conversions (BIGINT→INT, NVARCHAR(MAX)→
@@ -2592,6 +2605,7 @@ static int exec_alter(DB *db, Stmt *s, char *err)
         c->sub    = newc.sub;
         c->maxlen = newc.maxlen;
         c->is_datetime = newc.is_datetime;
+        c->is_uuid     = newc.is_uuid;
         if (db_flush_catalog(db) < 0) {
             snprintf(err, MAX_ERR, "%s", db->err);
             return -1;

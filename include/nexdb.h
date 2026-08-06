@@ -123,6 +123,7 @@ typedef struct {
     uint8_t  unique;
     uint8_t  sub;          /* IntSub, for T_INT columns                   */
     uint8_t  is_datetime;  /* declared DATETIME: validate the text format */
+    uint8_t  is_uuid;      /* declared UNIQUEIDENTIFIER: validate UUIDs   */
     uint32_t maxlen;       /* declared character limit, 0 = unlimited     */
 
     uint8_t  dflt;         /* DefaultKind                                 */

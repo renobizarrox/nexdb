@@ -282,6 +282,7 @@ static size_t catalog_serialize(const Catalog *c, uint8_t **out)
             memcpy(b + o, cl->refs_col, rcl); o += rcl;
             b[o++] = cl->on_delete;
             b[o++] = cl->on_update;
+            b[o++] = cl->is_uuid;
         }
         wr32(b, o, t->first_page); o += 4;
         wr32(b, o, t->last_page);  o += 4;
@@ -416,6 +417,7 @@ static void catalog_deserialize(Catalog *c, const uint8_t *b, size_t len)
                 }
                 if (o < len) cl->on_delete = b[o++];
                 if (o < len) cl->on_update = b[o++];
+                if (o < len) cl->is_uuid = b[o++];
             }
         }
         if (o + 20 > len) return;

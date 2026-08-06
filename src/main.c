@@ -88,6 +88,8 @@ static void schema_of(DB *db, const char *name)
             snprintf(decl, sizeof decl, "%s", int_sub_name(c->sub));
         } else if (c->type == T_TEXT && c->is_datetime) {
             snprintf(decl, sizeof decl, "DATETIME");
+        } else if (c->type == T_TEXT && c->is_uuid) {
+            snprintf(decl, sizeof decl, "UNIQUEIDENTIFIER");
         } else if (c->type == T_TEXT && c->maxlen) {
             snprintf(decl, sizeof decl, "NVARCHAR(%u)", c->maxlen);
         } else if (c->type == T_TEXT) {

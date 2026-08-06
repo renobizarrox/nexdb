@@ -837,6 +837,7 @@ static int parse_type(Lexer *lx, Column *c, char *err)
     }
 
     c->is_datetime = (uint8_t)is_datetime;
+    c->is_uuid = (uint8_t)is_uuid;
     if (is_datetime) c->maxlen = 19;          /* YYYY-MM-DD HH:MM:SS */
     if (is_uuid)     c->maxlen = 36;          /* canonical UUID text */
 
